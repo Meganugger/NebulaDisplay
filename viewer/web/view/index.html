@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0b0f19" />
+  <title>NebulaDisplay Viewer</title>
+  <link rel="stylesheet" href="../src/style.css" />
+</head>
+<body class="viewer-body">
+  <!-- Connect overlay -->
+  <div id="connect-overlay" class="overlay">
+    <div class="card">
+      <h1>🌌 NebulaDisplay</h1>
+      <p id="connect-status" class="muted">Connect to a host on your network.</p>
+
+      <div id="connect-form">
+        <label for="host-input">Host address</label>
+        <input id="host-input" type="text" placeholder="192.168.1.20:38470" autocomplete="off" />
+        <div class="row">
+          <label class="inline"><input type="checkbox" id="audio-check" /> Audio</label>
+          <select id="profile-select" title="Performance profile">
+            <option value="balanced">Balanced</option>
+            <option value="office">Office / battery saver</option>
+            <option value="video">Video playback</option>
+            <option value="drawing">Drawing / tablet</option>
+            <option value="gaming">Gaming (ultra-low latency)</option>
+          </select>
+        </div>
+        <button id="connect-btn" class="primary">Connect</button>
+      </div>
+
+      <div id="pin-form" hidden>
+        <p>This device is not paired yet. On the host's control panel, click
+           <strong>Pair a device</strong> and enter the 6-digit PIN:</p>
+        <input id="pin-input" type="text" inputmode="numeric" pattern="[0-9]*"
+               maxlength="6" placeholder="000000" class="pin" autocomplete="one-time-code" />
+        <button id="pin-btn" class="primary">Pair</button>
+        <p id="pin-error" class="error" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stream surface -->
+  <canvas id="screen" tabindex="0"></canvas>
+
+  <!-- Toolbar -->
+  <div id="toolbar" hidden>
+    <span id="host-label" class="muted"></span>
+    <select id="input-mode" title="Input mode">
+      <option value="view">View only</option>
+      <option value="direct" selected>Direct touch / mouse</option>
+      <option value="touchpad">Touchpad</option>
+      <option value="draw">Drawing tablet</option>
+    </select>
+    <select id="profile-live" title="Performance profile">
+      <option value="balanced">Balanced</option>
+      <option value="office">Office</option>
+      <option value="video">Video</option>
+      <option value="drawing">Drawing</option>
+      <option value="gaming">Gaming</option>
+    </select>
+    <button id="stats-btn" title="Toggle stats overlay">📊</button>
+    <button id="fullscreen-btn" title="Fullscreen">⛶</button>
+    <button id="disconnect-btn" title="Disconnect">✕</button>
+  </div>
+
+  <!-- Stats overlay -->
+  <pre id="stats-overlay" hidden></pre>
+
+  <div id="input-banner" hidden>
+    🖱️ Input is disabled for this device. Allow it on the host's control panel
+    (Devices → toggle Input).
+  </div>
+
+  <script type="module" src="../src/viewer.ts"></script>
+</body>
+</html>
