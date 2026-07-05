@@ -1,0 +1,74 @@
+; NebulaDisplay Virtual Display Driver (IddCx / UMDF2)
+; Installs as a root-enumerated software device:
+;   pnputil /add-driver NebulaDisplay.inf /install
+;   (device creation handled by installer/windows/install-driver.ps1)
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = NebulaDisplay.cat
+DriverVer   = 01/01/2026,0.1.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...17763
+
+[Standard.NT$ARCH$.10.0...17763]
+%DeviceName% = NebulaDisplay_Install, Root\NebulaDisplay
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+NebulaDisplay.dll = 1
+
+[NebulaDisplay_Install.NT]
+CopyFiles = UMDriverCopy
+
+[NebulaDisplay_Install.NT.hw]
+AddReg = NebulaDisplay_HardwareDeviceSettings
+
+[NebulaDisplay_HardwareDeviceSettings]
+; Restrict device access to SYSTEM and Administrators.
+HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[NebulaDisplay_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[NebulaDisplay_Install.NT.CoInstallers]
+AddReg = CoInstallers_AddReg
+
+[CoInstallers_AddReg]
+HKR,, CoInstallers32, 0x00010000, "WudfCoinstaller.dll"
+
+[NebulaDisplay_Install.NT.Wdf]
+UmdfService              = NebulaDisplay, NebulaDisplay_Install_UmdfService
+UmdfServiceOrder         = NebulaDisplay
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing   = ProcessSharingDisabled
+
+[NebulaDisplay_Install_UmdfService]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\NebulaDisplay.dll
+UmdfExtensions     = IddCx0102
+
+[UMDriverCopy]
+NebulaDisplay.dll
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[Strings]
+ManufacturerName  = "NebulaDisplay Project"
+DiskName          = "NebulaDisplay Installation Disk"
+DeviceName        = "NebulaDisplay Virtual Display Adapter"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"

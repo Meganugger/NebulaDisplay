@@ -1,0 +1,20 @@
+[package]
+name = "nebuladisplay-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "NebulaDisplay desktop viewer (Windows/macOS/Linux) — Tauri shell around the web viewer"
+
+# Not part of the root workspace: Tauri pulls large platform-specific
+# dependency trees (webkit2gtk on Linux, WebView2 on Windows) that are not
+# available in every dev environment. Build this crate standalone.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

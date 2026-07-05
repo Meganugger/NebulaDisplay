@@ -1,0 +1,15 @@
+/target
+**/node_modules
+viewer/web/dist
+tests/artifacts
+viewer/android/.gradle
+viewer/android/app/build
+viewer/android/local.properties
+viewer/desktop/src-tauri/target
+host/windows-driver/x64
+host/windows-driver/ARM64
+host/tray-ui/*.exe
+host/tray-ui/*.obj
+installer/windows/Output
+*.log
+.DS_Store

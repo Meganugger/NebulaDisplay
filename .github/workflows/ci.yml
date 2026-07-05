@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (Linux) — fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  windows-cross-check:
+    name: Rust — Windows API surface check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --target x86_64-pc-windows-msvc --no-default-features
+
+  rust-windows:
+    name: Rust (Windows) — native build & tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Full native build including TLS, DXGI, SendInput, WASAPI, service.
+      - run: cargo build --workspace --release
+      - run: cargo test --workspace
+
+  web:
+    name: Web viewer — typecheck & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: viewer/web/package-lock.json
+      - run: npm ci
+        working-directory: viewer/web
+      - run: npm run build
+        working-directory: viewer/web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: viewer/web/dist
+
+  browser-smoke:
+    name: Browser E2E smoke (host + viewer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build -p nebula-host
+      - run: npm ci
+        working-directory: viewer/web
+      - run: npm run build
+        working-directory: viewer/web
+      - run: npx --yes playwright@1.55 install --with-deps chromium
+      - run: node tests/browser-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-screenshots
+          path: tests/artifacts
+
+  # The IddCx driver needs the WDK; GitHub-hosted runners don't ship it.
+  # This job documents the exact build and stays optional until a
+  # WDK-provisioned runner (or EWDK download step) is added.
+  driver-windows:
+    name: IddCx driver (best effort)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try building the driver (requires WDK)
+        shell: pwsh
+        run: |
+          $vcx = "host/windows-driver/NebulaDisplay.vcxproj"
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe
+          if (-not $msbuild) { Write-Host "msbuild not found"; exit 1 }
+          & $msbuild $vcx /p:Configuration=Release /p:Platform=x64

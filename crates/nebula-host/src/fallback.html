@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NebulaDisplay — web UI not built</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3;
+         display: grid; place-items: center; min-height: 100vh; margin: 0; }
+  main { max-width: 40rem; padding: 2rem; }
+  code { background: #161b22; padding: .15rem .4rem; border-radius: 4px; }
+  h1 { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🌌 NebulaDisplay host is running</h1>
+  <p>The host service is up, but the web UI bundle was not found.</p>
+  <p>Build it once with:</p>
+  <p><code>cd viewer/web &amp;&amp; npm install &amp;&amp; npm run build</code></p>
+  <p>then restart <code>nebula-host</code> (or pass <code>--web-dir path/to/dist</code>).</p>
+  <p>The WebSocket streaming endpoint at <code>/ws</code> is fully functional for
+     native viewers regardless of this page.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NebulaDisplay — Control Panel</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body class="panel-body">
+  <header class="panel-header">
+    <h1>🌌 NebulaDisplay <span class="muted" style="font-size:.9rem">host control panel</span></h1>
+    <span id="host-title" class="muted"></span>
+  </header>
+
+  <div id="not-local" class="panel-card" hidden style="border-color: var(--warn); margin-top:1rem">
+    ⚠️ The control panel only works on the host machine itself
+    (open <code>http(s)://localhost:38470/</code> on the PC running NebulaDisplay).
+    To view this host's screen from here, open the <a href="/view/">viewer</a>.
+  </div>
+
+  <div class="panel-grid">
+    <section class="panel-card">
+      <h2>📡 Status</h2>
+      <dl class="kv" id="status-kv"></dl>
+    </section>
+
+    <section class="panel-card">
+      <h2>🔗 Pair a device</h2>
+      <p class="muted" style="font-size:.85rem">
+        On the new device, open the viewer URL and enter this PIN — or scan the QR code.
+      </p>
+      <button id="pin-btn" class="primary">Generate pairing PIN</button>
+      <div id="pin-area" hidden>
+        <div class="pin-display" id="pin-value"></div>
+        <p class="muted" style="text-align:center; font-size:.8rem">
+          expires in <span id="pin-ttl"></span>s · viewer URL:
+          <code id="viewer-url"></code>
+        </p>
+        <canvas id="qr-canvas"></canvas>
+      </div>
+    </section>
+
+    <section class="panel-card" style="grid-column: 1 / -1">
+      <h2>📱 Devices</h2>
+      <table class="devices">
+        <thead>
+          <tr><th>Name</th><th>Status</th><th>Input</th><th>Live</th><th></th></tr>
+        </thead>
+        <tbody id="devices-body"></tbody>
+      </table>
+      <p id="no-devices" class="muted" style="font-size:.85rem">No paired devices yet.</p>
+    </section>
+
+    <section class="panel-card">
+      <h2>⚙️ Settings</h2>
+      <label class="inline toggle"><input type="checkbox" id="set-audio" /> Stream system audio (off = private)</label><br /><br />
+      <label class="inline toggle"><input type="checkbox" id="set-clipboard" /> Allow clipboard sync</label><br /><br />
+      <label class="inline toggle"><input type="checkbox" id="set-discovery" /> Answer LAN discovery probes</label>
+    </section>
+
+    <section class="panel-card">
+      <h2>🩺 Fix connection</h2>
+      <ul class="diag-list" id="diag-list"></ul>
+    </section>
+  </div>
+
+  <footer>
+    NebulaDisplay · local-only by design · no account, no cloud, no telemetry
+  </footer>
+
+  <script type="module" src="./src/panel.ts"></script>
+</body>
+</html>
