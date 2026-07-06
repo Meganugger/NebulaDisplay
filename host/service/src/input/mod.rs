@@ -12,18 +12,22 @@
 mod windows_inject;
 
 use ndsp_protocol::messages::InputEvent;
+use std::sync::Arc;
+
+use crate::state::AppState;
 
 pub trait InputSink: Send + Sync {
     fn apply(&self, events: &[InputEvent]);
 }
 
-pub fn create_sink() -> Box<dyn InputSink> {
+pub fn create_sink(state: Arc<AppState>) -> Box<dyn InputSink> {
     #[cfg(windows)]
     {
-        Box::new(windows_inject::WindowsInputSink::new())
+        Box::new(windows_inject::WindowsInputSink::new(state))
     }
     #[cfg(not(windows))]
     {
+        let _ = state;
         Box::new(LogSink)
     }
 }

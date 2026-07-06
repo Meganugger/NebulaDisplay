@@ -53,6 +53,9 @@ pub struct AppState {
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
+    /// Desktop-space rect (left, top, right, bottom) of the captured surface,
+    /// when the platform exposes one — used for multi-monitor input mapping.
+    pub capture_rect: Mutex<Option<(i32, i32, i32, i32)>>,
     pub clients: Mutex<HashMap<u64, Arc<ClientHandle>>>,
     next_client_id: AtomicU64,
     serving_port: AtomicU64,
@@ -82,6 +85,7 @@ impl AppState {
                 height: 720,
                 refresh_hz: 60,
             }),
+            capture_rect: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
             serving_port: AtomicU64::new(ndsp_protocol::DEFAULT_PORT as u64),

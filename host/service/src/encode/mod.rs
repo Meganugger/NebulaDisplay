@@ -94,12 +94,30 @@ mod tests {
 
     #[cfg(feature = "h264")]
     #[test]
-    fn h264_bitrate_reconfigure_survives() {
+    fn h264_bitrate_change_does_not_reset_stream() {
         let mut enc = create(Codec::H264).unwrap();
-        enc.encode(&frame(320, 240), false, 8000, 60).unwrap();
-        // Big bitrate drop triggers encoder re-init; must keep working and
-        // emit a keyframe so decoders can resync.
+        let first = enc.encode(&frame(320, 240), false, 8000, 60).unwrap();
+        assert!(first.keyframe, "first frame is IDR");
+        // Big bitrate + fps changes are applied at runtime via SetOption —
+        // the stream must continue with delta frames (no IDR storm).
         let out = enc.encode(&frame(320, 240), false, 500, 30).unwrap();
-        assert!(out.keyframe, "re-init must produce a keyframe");
+        assert!(
+            !out.keyframe,
+            "runtime rate change must not force a keyframe"
+        );
+        // And encoding continues to work at the new rate.
+        let out2 = enc.encode(&frame(320, 240), false, 500, 30).unwrap();
+        assert!(!out2.keyframe);
+    }
+
+    #[cfg(feature = "h264")]
+    #[test]
+    fn h264_resolution_change_rebuilds_with_keyframe() {
+        let mut enc = create(Codec::H264).unwrap();
+        enc.encode(&frame(320, 240), false, 4000, 30).unwrap();
+        enc.encode(&frame(320, 240), false, 4000, 30).unwrap();
+        // Resolution change is the one case that must re-init + IDR.
+        let out = enc.encode(&frame(640, 480), false, 4000, 30).unwrap();
+        assert!(out.keyframe, "resolution change must produce a keyframe");
     }
 }

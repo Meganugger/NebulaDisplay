@@ -1,34 +1,87 @@
 //! Windows input injection via `SendInput`.
 //!
-//! Coordinates arrive normalized (0..1) relative to the streamed monitor and
-//! are mapped to the absolute virtual-desktop coordinate space SendInput
-//! expects (0..65535 across the primary monitor for MOUSEEVENTF_ABSOLUTE).
+//! Coordinates arrive normalized (0..1) relative to the *streamed monitor*.
+//! They are mapped through the captured output's desktop rectangle into the
+//! full virtual-desktop space (`MOUSEEVENTF_VIRTUALDESK`), so taps land on
+//! the correct pixel even when the captured monitor is not the primary one
+//! or sits at a non-zero desktop offset in a multi-monitor layout.
 
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    VIRTUAL_KEY,
 };
-// windows 0.62 moved the XBUTTON* constants from Input::KeyboardAndMouse to
-// WindowsAndMessaging.
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    XBUTTON1, XBUTTON2,
+};
 
 use super::InputSink;
+use crate::state::AppState;
 
 pub struct WindowsInputSink {
+    state: Arc<AppState>,
     /// Touch state so single-finger touch maps to press-drag-release.
     touch_down: Mutex<bool>,
 }
 
 impl WindowsInputSink {
-    pub fn new() -> Self {
+    pub fn new(state: Arc<AppState>) -> Self {
         Self {
+            state,
             touch_down: Mutex::new(false),
         }
+    }
+
+    /// Map a normalized (0..1) point on the streamed monitor to the 0..65535
+    /// absolute space SendInput expects. Uses the captured output's desktop
+    /// rect + the virtual-screen metrics when available (multi-monitor
+    /// correct); falls back to primary-monitor mapping otherwise.
+    fn map_coords(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> (
+        i32,
+        i32,
+        windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+    ) {
+        let x = x.clamp(0.0, 1.0) as f64;
+        let y = y.clamp(0.0, 1.0) as f64;
+        if let Some((l, t, r, b)) = *self.state.capture_rect.lock().unwrap() {
+            // SAFETY: GetSystemMetrics is always safe to call.
+            let (vx, vy, vw, vh) = unsafe {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                )
+            };
+            if vw > 0 && vh > 0 && r > l && b > t {
+                // Pixel on the captured monitor (desktop coordinates)...
+                let px = l as f64 + x * (r - l - 1) as f64;
+                let py = t as f64 + y * (b - t - 1) as f64;
+                // ...normalized over the whole virtual desktop.
+                let ax = ((px - vx as f64) * 65535.0 / (vw - 1).max(1) as f64).round() as i32;
+                let ay = ((py - vy as f64) * 65535.0 / (vh - 1).max(1) as f64).round() as i32;
+                return (
+                    ax.clamp(0, 65535),
+                    ay.clamp(0, 65535),
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                );
+            }
+        }
+        (
+            (x * 65535.0).round() as i32,
+            (y * 65535.0).round() as i32,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+        )
     }
 
     fn send(&self, inputs: &[INPUT]) {
@@ -62,13 +115,6 @@ fn mouse_input(
             },
         },
     }
-}
-
-fn abs_coords(x: f32, y: f32) -> (i32, i32) {
-    (
-        (x.clamp(0.0, 1.0) * 65535.0) as i32,
-        (y.clamp(0.0, 1.0) * 65535.0) as i32,
-    )
 }
 
 /// Map W3C `KeyboardEvent.code` values to Windows scan codes (set 1).
@@ -216,13 +262,8 @@ impl InputSink for WindowsInputSink {
         for e in events {
             match e {
                 InputEvent::MouseMove { x, y } => {
-                    let (ax, ay) = abs_coords(*x, *y);
-                    batch.push(mouse_input(
-                        ax,
-                        ay,
-                        0,
-                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    ));
+                    let (ax, ay, flags) = self.map_coords(*x, *y);
+                    batch.push(mouse_input(ax, ay, 0, flags));
                 }
                 InputEvent::MouseButton { button, pressed } => {
                     let flags = match (button, pressed) {
@@ -283,13 +324,8 @@ impl InputSink for WindowsInputSink {
                 InputEvent::Touch { phase, x, y, .. } | InputEvent::Pen { phase, x, y, .. } => {
                     // Single-pointer mapping to mouse until InjectTouchInput
                     // integration (see docs/ROADMAP.md).
-                    let (ax, ay) = abs_coords(*x, *y);
-                    batch.push(mouse_input(
-                        ax,
-                        ay,
-                        0,
-                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    ));
+                    let (ax, ay, flags) = self.map_coords(*x, *y);
+                    batch.push(mouse_input(ax, ay, 0, flags));
                     let mut down = self.touch_down.lock().unwrap();
                     match phase {
                         TouchPhase::Start if !*down => {

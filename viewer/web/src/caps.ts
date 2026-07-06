@@ -36,6 +36,12 @@ export const caps = {
   createImageBitmap: detect(() => typeof createImageBitmap === "function"),
   /** Unified pointer events; older iOS Safari/WebViews need touch+mouse. */
   pointerEvents: detect(() => typeof PointerEvent === "function"),
+  /** pointerrawupdate: input samples at device rate, not display rate. */
+  pointerRawUpdate: detect(() => "onpointerrawupdate" in globalThis),
+  /** Coalesced pointer samples (full touch sampling inside one event). */
+  coalescedEvents: detect(
+    () => typeof PointerEvent === "function" && "getCoalescedEvents" in PointerEvent.prototype,
+  ),
   /** DataView 64-bit accessors (Safari ≥ 15); we fall back to u32 pairs. */
   bigInt64DataView: detect(() => typeof DataView.prototype.getBigUint64 === "function"),
   /** performance.timeOrigin (older Safari lacks it). */

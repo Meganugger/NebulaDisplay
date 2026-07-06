@@ -37,7 +37,7 @@ pub async fn serve_on(
 ) -> anyhow::Result<()> {
     let local = listener.local_addr()?;
     state.set_serving_port(local.port());
-    let input_sink: Arc<dyn crate::input::InputSink> = Arc::from(create_sink());
+    let input_sink: Arc<dyn crate::input::InputSink> = Arc::from(create_sink(state.clone()));
 
     let mut app = Router::new()
         .route(ndsp_protocol::WS_PATH, any(ws_handler))
@@ -56,6 +56,14 @@ pub async fn serve_on(
 
     let app = app.with_state((state, input_sink));
     info!("viewer endpoint listening on {local}");
+    // TCP_NODELAY: Nagle would coalesce small control/video writes with up
+    // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("set_nodelay failed: {e}");
+        }
+    });
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

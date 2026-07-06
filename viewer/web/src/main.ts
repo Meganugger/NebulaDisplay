@@ -157,13 +157,21 @@ function enterViewer(s: Session): void {
   $("server-name").textContent = `${s.info.serverName} · ${s.info.codec.toUpperCase()}`;
   if (s.info.newlyPaired) showToast("Paired ✓ — this device is now trusted by the host");
 
-  input = new InputCapture(canvas, (events) => void s.send({ type: "input", events }));
+  input = new InputCapture(
+    canvas,
+    (events) => void s.send({ type: "input", events }),
+    // Canvas backing-store size == native video size (the renderer keeps
+    // them in sync), which is what letterbox mapping needs.
+    () => ({ w: canvas.width, h: canvas.height }),
+  );
   input.attach();
   refreshInputBadge();
 
+  // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
+  // measurable cost.
   pingTimer = window.setInterval(() => {
     void s.send({ type: "ping", t0_us: Math.round(clock.nowUs()) });
-  }, 1000);
+  }, 500);
 
   statsTimer = window.setInterval(() => {
     if (!renderer) return;

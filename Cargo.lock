@@ -1380,6 +1380,7 @@ dependencies = [
  "ndsp-client",
  "ndsp-protocol",
  "openh264",
+ "openh264-sys2",
  "qrcode",
  "rand 0.8.6",
  "serde",

@@ -315,3 +315,92 @@ async fn discovery_answers_probes_with_beacon() {
     assert!(r.is_err(), "garbage must not be answered");
     host.shutdown().await;
 }
+
+/// Regression test for the v0.2 pacing bug: the session loop re-armed its
+/// pacing sleep on *every* inbound message, so continuous touch input
+/// (60–240 Hz) starved the video path completely — the "video freezes and
+/// input lags seconds behind while dragging" failure. Video and input are
+/// now independent pipelines; a sustained input flood must not stop frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn video_keeps_flowing_under_input_flood() {
+    let host = start_host("flood").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Flood phone");
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::H264, Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+
+    // Grant input + switch out of view-only so events actually hit the sink.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(host.state.set_input_grant(&info.device_id, true).unwrap());
+    session
+        .send(&ControlMsg::SetInputMode {
+            mode: ndsp_protocol::messages::InputMode::DirectTouch,
+        })
+        .await
+        .unwrap();
+
+    // Flood: ~240 Hz touch-move batches for 3 seconds while receiving.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut frames: u32 = 0;
+    let mut i: u32 = 0;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let t = (i as f32 / 240.0).fract();
+        session
+            .send(&ControlMsg::Input {
+                events: vec![InputEvent::Touch {
+                    id: 1,
+                    phase: ndsp_protocol::messages::TouchPhase::Move,
+                    x: t,
+                    y: 1.0 - t,
+                    pressure: 1.0,
+                }],
+            })
+            .await
+            .unwrap();
+        i += 1;
+        // Drain anything pending without blocking the flood cadence.
+        loop {
+            match tokio::time::timeout(Duration::from_micros(100), session.recv()).await {
+                Ok(Ok(Incoming::Video(_))) => frames += 1,
+                Ok(Ok(Incoming::Control(_))) => {}
+                Ok(Ok(Incoming::Closed)) => panic!("server closed during input flood"),
+                Ok(Err(e)) => panic!("recv error during flood: {e:#}"),
+                Err(_) => break, // nothing pending
+            }
+        }
+        tokio::time::sleep(Duration::from_micros(4_000)).await; // ≈240 Hz
+    }
+    // Collect stragglers.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while frames < 30 {
+        match tokio::time::timeout_at(drain_deadline, session.recv()).await {
+            Ok(Ok(Incoming::Video(_))) => frames += 1,
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    // At the host's 30 fps cap, 3 s of streaming should deliver ~90 frames.
+    // Require at least a third — anything near zero means input starved video.
+    // Measured on this harness: the v0.2 shared-loop design delivered 30
+    // frames here (input kept resetting the pacing sleep); the split
+    // pipeline delivers ~94. Require 60 so a pacing regression fails loudly.
+    eprintln!("input-flood test: {frames} frames in 3s");
+    assert!(
+        frames >= 60,
+        "video starved under input flood: only {frames} frames in 3s (expect ~90)"
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}

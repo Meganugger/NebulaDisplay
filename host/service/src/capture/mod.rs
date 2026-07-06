@@ -12,6 +12,7 @@ mod windows_dxgi;
 mod windows_idd;
 
 use ndsp_protocol::messages::DisplayMode;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -27,6 +28,12 @@ pub trait FrameSource: Send {
     /// Produce the next frame into `out` (tightly packed BGRA). Returns
     /// `Ok(false)` if nothing changed / timed out (caller just retries).
     fn next_frame(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool>;
+    /// Desktop-space rectangle of the captured surface (left, top, right,
+    /// bottom) when the platform has one — used to map viewer input onto the
+    /// correct monitor of a multi-monitor virtual desktop.
+    fn desktop_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
 }
 
 /// Test helper: expose the synthetic source to other modules' unit tests.
@@ -78,12 +85,22 @@ pub fn create_source(force_test_pattern: bool, width: u32, height: u32) -> Box<d
     Box::new(test_pattern::TestPatternSource::new(width, height))
 }
 
+/// How many recent frames to keep for buffer recycling. The watch channel
+/// holds one and sessions borrow clones briefly during encode, so a small
+/// ring recovers nearly every allocation in steady state.
+const RECYCLE_RING: usize = 4;
+
 /// Capture loop: pull frames from the source at the configured cadence and
 /// publish them on the frame watch channel. Runs the blocking source on a
 /// dedicated thread via `spawn_blocking`.
+///
+/// Frame buffers are recycled through a small ring of previously published
+/// frames — once every consumer has dropped its `Arc`, the (multi-megabyte)
+/// BGRA allocation is reused instead of hitting the allocator per frame.
 pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSource>) {
     let mode = source.mode();
     *state.mode.lock().unwrap() = mode;
+    *state.capture_rect.lock().unwrap() = source.desktop_rect();
     let max_fps = state.cfg.file.max_fps.clamp(1, 240);
     let tick = Duration::from_secs_f64(1.0 / max_fps as f64);
     info!(source = source.name(), max_fps, "capture loop started");
@@ -92,6 +109,7 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
     let handle = tokio::task::spawn_blocking(move || {
         let mut seq: u64 = 0;
         let mut buf: Vec<u8> = Vec::new();
+        let mut recycle: VecDeque<Arc<CapturedFrame>> = VecDeque::new();
         let mut fps_window_start = Instant::now();
         let mut fps_frames: u32 = 0;
         loop {
@@ -102,9 +120,10 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
             let loop_start = Instant::now();
             let has_clients = !state2.clients.lock().unwrap().is_empty();
             if !has_clients {
-                // Idle: capture at 2 fps to keep the "latest frame" warm
-                // without burning CPU.
-                std::thread::sleep(Duration::from_millis(500));
+                // Idle: skip capture entirely (zero CPU/GPU) but poll often
+                // enough that a connecting client sees a frame within ~50 ms.
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
             }
             match source.next_frame(&mut buf) {
                 Ok(true) => {
@@ -118,9 +137,29 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
                         height: m.height,
                         bgra: std::mem::take(&mut buf),
                     });
-                    // Reuse allocation next round.
-                    buf = Vec::with_capacity((m.width * m.height * 4) as usize);
+                    recycle.push_back(frame.clone());
                     let _ = state2.frame_tx.send(Some(frame));
+                    // Reclaim the oldest ring entry nobody references anymore.
+                    if recycle.len() > RECYCLE_RING {
+                        if let Some(old) = recycle.pop_front() {
+                            match Arc::try_unwrap(old) {
+                                Ok(inner) => {
+                                    buf = inner.bgra;
+                                    buf.clear();
+                                }
+                                // Still referenced by a slow session: put it
+                                // back unless the ring is ballooning (then
+                                // just let the consumer's drop free it).
+                                Err(still_shared) if recycle.len() < RECYCLE_RING * 2 => {
+                                    recycle.push_front(still_shared)
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    if buf.capacity() == 0 {
+                        buf.reserve((m.width * m.height * 4) as usize);
+                    }
                 }
                 Ok(false) => {}
                 Err(e) => {

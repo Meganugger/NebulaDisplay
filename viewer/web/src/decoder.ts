@@ -1,6 +1,15 @@
 // Video decoding: WebCodecs H.264 (Annex B) with JPEG fallback.
 // Renders into a canvas; tracks decode timing + queue depth for stats.
 //
+// Presentation model — "latest frame wins":
+// * Decoded frames land in a single `latest` slot (replacing — and closing —
+//   any undisplayed predecessor) and are painted once per animation frame.
+//   The viewer therefore never shows an outdated frame, never paints more
+//   than the display can show, and a hidden tab simply parks one frame.
+// * H.264 overload never drops *delta* frames silently (that corrupts every
+//   frame until the next IDR — a v0.2 bug). Instead the feeder enters a
+//   skip-until-keyframe state and asks the host for a fresh IDR.
+//
 // Capability notes: WebCodecs only exists in secure contexts, so the
 // plain-HTTP LAN deployment always streams JPEG; older iOS Safari lacks
 // createImageBitmap, for which we decode through an <img> element instead.
@@ -18,6 +27,14 @@ export interface DecoderStats {
   lastPresentedAtMs: number;
 }
 
+/** Decoder queue depth beyond which we resync via keyframe instead of queueing. */
+const MAX_DECODE_QUEUE = 8;
+
+type Presentable =
+  | { kind: "vf"; frame: VideoFrame; tsUs: bigint }
+  | { kind: "bmp"; frame: ImageBitmap; tsUs: bigint }
+  | { kind: "img"; frame: HTMLImageElement; tsUs: bigint };
+
 export class Renderer {
   private ctx: CanvasRenderingContext2D;
   private h264: VideoDecoder | null = null;
@@ -27,7 +44,11 @@ export class Renderer {
   private windowStart = performance.now();
   private pendingTs: { tsUs: bigint; submittedAt: number }[] = [];
   private jpegBusy = false;
-  private jpegDropped = 0;
+  private jpegPending: NdspFrame | null = null;
+  // --- latest-frame presentation ---
+  private latest: Presentable | null = null;
+  private rafId = 0;
+  private destroyed = false;
   stats: DecoderStats = {
     fpsDecoded: 0,
     decodeMsAvg: 0,
@@ -40,11 +61,19 @@ export class Renderer {
   /** Ask the host for a keyframe (set by the app; called on decode errors). */
   requestKeyframe: (() => void) | null = null;
   private sawKeyframe = false;
+  /** Overload resync: drop everything until the next keyframe arrives. */
+  private skipUntilKeyframe = false;
 
   constructor(private canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext("2d", { desynchronized: true });
     if (!ctx) throw new Error("2d canvas context unavailable");
     this.ctx = ctx;
+    const paint = () => {
+      if (this.destroyed) return;
+      this.paintLatest();
+      this.rafId = requestAnimationFrame(paint);
+    };
+    this.rafId = requestAnimationFrame(paint);
   }
 
   async push(frame: NdspFrame): Promise<void> {
@@ -57,12 +86,49 @@ export class Renderer {
     }
   }
 
+  /** Replace the undisplayed frame (if any) with a newer one. */
+  private setLatest(p: Presentable): void {
+    if (this.latest) {
+      this.closePresentable(this.latest);
+      this.stats.framesDropped++;
+    }
+    this.latest = p;
+  }
+
+  private closePresentable(p: Presentable): void {
+    if (p.kind === "vf") p.frame.close();
+    else if (p.kind === "bmp") p.frame.close();
+  }
+
+  private paintLatest(): void {
+    const p = this.latest;
+    if (!p) return;
+    this.latest = null;
+    let w: number;
+    let h: number;
+    if (p.kind === "vf") {
+      w = p.frame.displayWidth;
+      h = p.frame.displayHeight;
+    } else if (p.kind === "bmp") {
+      w = p.frame.width;
+      h = p.frame.height;
+    } else {
+      w = p.frame.naturalWidth;
+      h = p.frame.naturalHeight;
+    }
+    this.fit(w, h);
+    this.ctx.drawImage(p.frame, 0, 0, this.canvas.width, this.canvas.height);
+    this.closePresentable(p);
+    this.stats.lastPresentedTsUs = p.tsUs;
+    this.tickFps();
+  }
+
   private h264ErrorStreak = 0;
 
   private ensureH264(): VideoDecoder {
     if (this.h264 && this.h264.state !== "closed") return this.h264;
     this.h264 = new VideoDecoder({
-      output: (vf: VideoFrame) => this.present(vf),
+      output: (vf: VideoFrame) => this.onDecoded(vf),
       error: (e: DOMException) => {
         console.warn("VideoDecoder error; requesting keyframe", e);
         this.h264Configured = false;
@@ -95,7 +161,10 @@ export class Renderer {
       dec.configure({ codec: "avc1.42E01F", optimizeForLatency: true });
       this.h264Configured = true;
     }
-    if (!this.sawKeyframe) {
+    if (this.skipUntilKeyframe && frame.keyframe) {
+      this.skipUntilKeyframe = false;
+    }
+    if (!this.sawKeyframe || this.skipUntilKeyframe) {
       if (!frame.keyframe) {
         this.stats.framesDropped++;
         this.requestKeyframe?.();
@@ -103,9 +172,12 @@ export class Renderer {
       }
       this.sawKeyframe = true;
     }
-    // Shed latency: if the decoder is falling behind, skip delta frames.
-    if (dec.decodeQueueSize > 6 && !frame.keyframe) {
+    // Overloaded decoder: dropping deltas would corrupt every later frame,
+    // so instead resynchronize on a fresh keyframe.
+    if (dec.decodeQueueSize > MAX_DECODE_QUEUE && !frame.keyframe) {
+      this.skipUntilKeyframe = true;
       this.stats.framesDropped++;
+      this.requestKeyframe?.();
       return;
     }
     this.pendingTs.push({ tsUs: frame.timestampUs, submittedAt: performance.now() });
@@ -122,25 +194,25 @@ export class Renderer {
     this.stats.queueDepth = dec.decodeQueueSize;
   }
 
-  private present(vf: VideoFrame): void {
+  private onDecoded(vf: VideoFrame): void {
     this.h264ErrorStreak = 0;
+    let tsUs = 0n;
     const match = this.pendingTs.find((p) => Number(p.tsUs & 0x7fffffffffffn) === vf.timestamp);
     if (match) {
       this.decodeSample(performance.now() - match.submittedAt);
-      this.stats.lastPresentedTsUs = match.tsUs;
+      tsUs = match.tsUs;
       this.pendingTs = this.pendingTs.filter((p) => p !== match);
     }
-    this.fit(vf.displayWidth, vf.displayHeight);
-    this.ctx.drawImage(vf, 0, 0, this.canvas.width, this.canvas.height);
-    vf.close();
-    this.tickFps();
+    if (this.h264) this.stats.queueDepth = this.h264.decodeQueueSize;
+    this.setLatest({ kind: "vf", frame: vf, tsUs });
   }
 
   private async pushJpeg(frame: NdspFrame): Promise<void> {
-    // Drop frames while a decode is in flight — always show the newest.
+    // Latest-frame semantics while a decode is in flight: remember the
+    // newest arrival (replacing older pendings) and decode it right after.
     if (this.jpegBusy) {
-      this.jpegDropped++;
-      this.stats.framesDropped++;
+      if (this.jpegPending) this.stats.framesDropped++;
+      this.jpegPending = frame;
       return;
     }
     this.jpegBusy = true;
@@ -151,24 +223,24 @@ export class Renderer {
       if (caps.createImageBitmap) {
         const bmp = await createImageBitmap(blob);
         this.decodeSample(performance.now() - t0);
-        this.fit(bmp.width, bmp.height);
-        this.ctx.drawImage(bmp, 0, 0, this.canvas.width, this.canvas.height);
-        bmp.close();
+        this.setLatest({ kind: "bmp", frame: bmp, tsUs: frame.timestampUs });
       } else {
         // Older iOS Safari / WebViews: decode through an <img> element.
-        await this.drawViaImage(blob);
+        const img = await this.decodeViaImage(blob);
         this.decodeSample(performance.now() - t0);
+        this.setLatest({ kind: "img", frame: img, tsUs: frame.timestampUs });
       }
-      this.stats.lastPresentedTsUs = frame.timestampUs;
-      this.tickFps();
     } catch (e) {
       this.onError?.(e as Error);
     } finally {
       this.jpegBusy = false;
+      const pending = this.jpegPending;
+      this.jpegPending = null;
+      if (pending) void this.pushJpeg(pending);
     }
   }
 
-  private async drawViaImage(blob: Blob): Promise<void> {
+  private async decodeViaImage(blob: Blob): Promise<HTMLImageElement> {
     const url = URL.createObjectURL(blob);
     try {
       const img = new Image();
@@ -177,9 +249,9 @@ export class Renderer {
         img.onerror = () => reject(new Error("jpeg decode failed (<img> fallback)"));
         img.src = url;
       });
-      this.fit(img.naturalWidth, img.naturalHeight);
-      this.ctx.drawImage(img, 0, 0, this.canvas.width, this.canvas.height);
+      return img;
     } finally {
+      // Safe to revoke once decode completed; the element keeps its bitmap.
       URL.revokeObjectURL(url);
     }
   }
@@ -205,11 +277,16 @@ export class Renderer {
       this.stats.fpsDecoded = (this.framesInWindow * 1000) / elapsed;
       this.framesInWindow = 0;
       this.windowStart = performance.now();
-      this.stats.framesDropped = this.jpegDropped;
     }
   }
 
   destroy(): void {
+    this.destroyed = true;
+    cancelAnimationFrame(this.rafId);
+    if (this.latest) {
+      this.closePresentable(this.latest);
+      this.latest = null;
+    }
     if (this.h264 && this.h264.state !== "closed") this.h264.close();
   }
 }

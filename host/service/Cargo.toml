@@ -10,7 +10,7 @@ repository.workspace = true
 default = ["h264"]
 # OpenH264 software encoder (built from source; BSD-2-Clause). Disable to fall
 # back to JPEG-only streaming: `cargo build --no-default-features`.
-h264 = ["dep:openh264"]
+h264 = ["dep:openh264", "dep:openh264-sys2"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
@@ -35,6 +35,8 @@ uuid = { version = "1", features = ["v4"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 openh264 = { version = "0.9", optional = true }
+# Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
+openh264-sys2 = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

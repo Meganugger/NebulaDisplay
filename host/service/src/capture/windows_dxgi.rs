@@ -19,8 +19,21 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC,
 };
+
+/// Last known mouse-pointer state; duplication frames never include the
+/// cursor, so we composite it into the BGRA buffer ourselves.
+#[derive(Default)]
+struct PointerState {
+    visible: bool,
+    x: i32,
+    y: i32,
+    shape: Vec<u8>,
+    shape_info: Option<DXGI_OUTDUPL_POINTER_SHAPE_INFO>,
+}
 
 use super::FrameSource;
 
@@ -32,6 +45,9 @@ pub struct DxgiDuplicationSource {
     staging: Option<ID3D11Texture2D>,
     width: u32,
     height: u32,
+    /// Captured output's rect in desktop coordinates (multi-monitor input mapping).
+    desktop_rect: (i32, i32, i32, i32),
+    pointer: PointerState,
 }
 
 // SAFETY: the source is owned by a single capture thread for its entire
@@ -79,6 +95,13 @@ impl DxgiDuplicationSource {
                 staging: None,
                 width,
                 height,
+                desktop_rect: (
+                    desc.DesktopCoordinates.left,
+                    desc.DesktopCoordinates.top,
+                    desc.DesktopCoordinates.right,
+                    desc.DesktopCoordinates.bottom,
+                ),
+                pointer: PointerState::default(),
             };
             src.recreate_duplication()?;
             Ok(src)
@@ -148,6 +171,10 @@ impl FrameSource for DxgiDuplicationSource {
         }
     }
 
+    fn desktop_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        Some(self.desktop_rect)
+    }
+
     fn next_frame(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool> {
         let Some(dup) = self.duplication.clone() else {
             self.recreate_duplication()?;
@@ -167,6 +194,31 @@ impl FrameSource for DxgiDuplicationSource {
                     return Ok(false);
                 }
                 Err(e) => bail!("AcquireNextFrame: {e}"),
+            }
+            // Track the pointer (position updates + shape changes) so we can
+            // composite it — duplication frames don't include the cursor.
+            if info.LastMouseUpdateTime != 0 {
+                self.pointer.visible = info.PointerPosition.Visible.as_bool();
+                self.pointer.x = info.PointerPosition.Position.x;
+                self.pointer.y = info.PointerPosition.Position.y;
+            }
+            if info.PointerShapeBufferSize > 0 {
+                self.pointer
+                    .shape
+                    .resize(info.PointerShapeBufferSize as usize, 0);
+                let mut required = 0u32;
+                let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                if dup
+                    .GetFramePointerShape(
+                        info.PointerShapeBufferSize,
+                        self.pointer.shape.as_mut_ptr() as *mut _,
+                        &mut required,
+                        &mut shape_info,
+                    )
+                    .is_ok()
+                {
+                    self.pointer.shape_info = Some(shape_info);
+                }
             }
             let result = (|| -> anyhow::Result<bool> {
                 let resource = resource.as_ref().context("no frame resource")?;
@@ -195,7 +247,94 @@ impl FrameSource for DxgiDuplicationSource {
                 Ok(true)
             })();
             let _ = dup.ReleaseFrame();
+            if matches!(result, Ok(true)) {
+                self.composite_pointer(out);
+            }
             result
+        }
+    }
+}
+
+impl DxgiDuplicationSource {
+    /// Blend the last known cursor shape into the BGRA frame at its current
+    /// position. Handles the three DXGI shape types.
+    fn composite_pointer(&self, out: &mut [u8]) {
+        let Some(si) = self.pointer.shape_info else {
+            return;
+        };
+        if !self.pointer.visible {
+            return;
+        }
+        let (fw, fh) = (self.width as i32, self.height as i32);
+        let (px, py) = (self.pointer.x, self.pointer.y);
+        let pitch = si.Pitch as usize;
+        let sw = si.Width as i32;
+        // Monochrome shapes pack AND+XOR masks stacked vertically.
+        let mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32;
+        let sh = if mono {
+            si.Height as i32 / 2
+        } else {
+            si.Height as i32
+        };
+        let shape = &self.pointer.shape;
+
+        for sy in 0..sh {
+            let dy = py + sy;
+            if dy < 0 || dy >= fh {
+                continue;
+            }
+            for sx in 0..sw {
+                let dx = px + sx;
+                if dx < 0 || dx >= fw {
+                    continue;
+                }
+                let di = ((dy * fw + dx) * 4) as usize;
+                if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+                    let s = (sy as usize) * pitch + (sx as usize) * 4;
+                    if s + 4 > shape.len() {
+                        continue;
+                    }
+                    let a = shape[s + 3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        let src = shape[s + c] as u32;
+                        let dst = out[di + c] as u32;
+                        out[di + c] = ((src * a + dst * (255 - a)) / 255) as u8;
+                    }
+                } else if mono {
+                    let byte = (sy as usize) * pitch + (sx / 8) as usize;
+                    let bit = 7 - (sx % 8) as usize;
+                    let and_b = shape.get(byte).map_or(1, |b| (b >> bit) & 1);
+                    let xor_b = shape
+                        .get(byte + sh as usize * pitch)
+                        .map_or(0, |b| (b >> bit) & 1);
+                    for c in 0..3 {
+                        let mut v = out[di + c];
+                        if and_b == 0 {
+                            v = 0;
+                        }
+                        if xor_b == 1 {
+                            v = !v;
+                        }
+                        out[di + c] = v;
+                    }
+                } else if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
+                    let s = (sy as usize) * pitch + (sx as usize) * 4;
+                    if s + 4 > shape.len() {
+                        continue;
+                    }
+                    let mask = shape[s + 3];
+                    for c in 0..3 {
+                        if mask == 0 {
+                            out[di + c] = shape[s + c];
+                        } else {
+                            out[di + c] ^= shape[s + c];
+                        }
+                    }
+                }
+            }
         }
     }
 }
