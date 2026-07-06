@@ -285,3 +285,33 @@ async fn fingerprint_mismatch_blocks_token_send() {
     assert!(format!("{err:#}").contains("fingerprint"));
     host.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_answers_probes_with_beacon() {
+    use ndsp_protocol::discovery::{Beacon, PROBE};
+    let host = start_host("disco").await;
+    // Bind the responder on an ephemeral UDP port.
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let disco_addr = sock.local_addr().unwrap();
+    let state = host.state.clone();
+    tokio::spawn(nebulad::discovery::serve(state, sock));
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(PROBE, disco_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("beacon timeout")
+        .unwrap();
+    let beacon = Beacon::from_bytes(&buf[..n]).expect("valid beacon");
+    assert_eq!(beacon.service, "ndsp");
+    assert_eq!(beacon.port, host.port);
+    assert_eq!(beacon.fingerprint.len(), 64);
+    assert!(beacon.name.contains("e2e-host-disco"));
+
+    // Garbage probes are ignored (no reply).
+    client.send_to(b"NOT-A-PROBE", disco_addr).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await;
+    assert!(r.is_err(), "garbage must not be answered");
+    host.shutdown().await;
+}

@@ -17,6 +17,11 @@ pub async fn run(state: Arc<AppState>, port: u16) {
         }
     };
     info!("discovery listening on udp/{port}");
+    serve(state, sock).await;
+}
+
+/// Serve on an already-bound socket (tests use an ephemeral port).
+pub async fn serve(state: Arc<AppState>, sock: UdpSocket) {
     let mut buf = [0u8; 512];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else {
