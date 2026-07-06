@@ -86,7 +86,10 @@ mod tests {
         assert!(!out.payload.is_empty());
         // Identical frame again → elided entirely.
         let out2 = enc.encode(&f, false, 4000, 30).unwrap();
-        assert!(out2.payload.is_empty(), "static frame must not be re-encoded");
+        assert!(
+            out2.payload.is_empty(),
+            "static frame must not be re-encoded"
+        );
         // A changed frame resumes the stream.
         let mut f3 = frame(320, 240);
         f3.bgra[0] ^= 0xFF;
@@ -101,7 +104,7 @@ mod tests {
         let f = frame(320, 240);
         enc.encode(&f, false, 4000, 30).unwrap(); // IDR
         enc.encode(&f, false, 4000, 30).unwrap(); // post-init tune IDR
-        // Static frames elided.
+                                                  // Static frames elided.
         for _ in 0..3 {
             let out = enc.encode(&f, false, 4000, 30).unwrap();
             assert!(out.payload.is_empty(), "static frames must be elided");

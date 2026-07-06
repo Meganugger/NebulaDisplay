@@ -24,6 +24,9 @@
 //! against *that encoder's* last-seen frame.
 
 /// Diff of the current frame against the previous one, in row pairs.
+// `pairs` drives the H.264 partial conversion; the JPEG-only build (no
+// `h264` feature) uses just `is_static`.
+#[cfg_attr(not(feature = "h264"), allow(dead_code))]
 pub struct DirtyMap {
     /// `pairs[i]` == true → rows `2i` and `2i+1` changed.
     pub pairs: Vec<bool>,
@@ -32,6 +35,8 @@ pub struct DirtyMap {
 }
 
 impl DirtyMap {
+    /// Test/diagnostic helper.
+    #[allow(dead_code)]
     pub fn all_dirty(&self) -> bool {
         self.dirty_pairs == self.total_pairs
     }

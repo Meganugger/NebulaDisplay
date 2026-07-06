@@ -213,6 +213,9 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
                 state2.host_stats.lock().unwrap().capture_fps = fps;
                 fps_window_start = Instant::now();
                 fps_frames = 0;
+                // Refresh the input-mapping rect: display layout can change
+                // at runtime (user rearranges monitors, mode switches).
+                *state2.capture_rect.lock().unwrap() = source.desktop_rect();
             }
             if let Some(rem) = tick.checked_sub(loop_start.elapsed()) {
                 std::thread::sleep(rem);

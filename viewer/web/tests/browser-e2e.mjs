@@ -181,6 +181,22 @@ const p4 = await probe();
 if (p3.hash === p4.hash) await fail("stream stalled after profile switch");
 console.log("profile switch to gaming OK, stream continues");
 
+// ---- cursor channel: the host cursor renders as a moving overlay -----------
+// The test-pattern source emits a synthetic cursor circling the center, so a
+// cursor-capable viewer must show #remote-cursor with a changing transform.
+const cur1 = await page.evaluate(() => {
+  const el = document.getElementById("remote-cursor");
+  return el ? { display: getComputedStyle(el).display, t: el.style.transform, src: !!el.src } : null;
+});
+await sleep(700);
+const cur2 = await page.evaluate(() => {
+  const el = document.getElementById("remote-cursor");
+  return el ? { display: getComputedStyle(el).display, t: el.style.transform, src: !!el.src } : null;
+});
+if (!cur1 || cur1.display === "none" || !cur1.src) await fail("remote cursor overlay not visible");
+if (cur1.t === cur2.t) await fail("remote cursor is not moving (cursor channel stalled)");
+console.log("cursor channel verified (shape delivered, position updating)");
+
 await browser.close();
 host.kill();
 rmSync(dataDir, { recursive: true, force: true });

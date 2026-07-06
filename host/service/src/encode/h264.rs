@@ -454,10 +454,14 @@ mod conv_tests {
         let mut enc = H264Encoder::new().unwrap();
         // Prime: frame 1 is the natural IDR; frame 2 is the one-time IDR from
         // the post-init tune (slice/thread + ceiling params restart).
-        let out = enc.encode(&test_frame(320, 240, 1), false, 2_000, 30).unwrap();
+        let out = enc
+            .encode(&test_frame(320, 240, 1), false, 2_000, 30)
+            .unwrap();
         assert!(out.keyframe);
         assert!(enc.ceiling_lifted, "tuning must run after first frame");
-        let out = enc.encode(&test_frame(320, 240, 2), false, 2_000, 30).unwrap();
+        let out = enc
+            .encode(&test_frame(320, 240, 2), false, 2_000, 30)
+            .unwrap();
         assert!(out.keyframe, "post-init tune restarts the stream once");
         // Sweep: strong raises and cuts, including fps changes.
         let targets: &[(u32, u32)] = &[
