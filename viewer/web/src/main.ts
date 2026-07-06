@@ -1,8 +1,10 @@
 // Viewer application: connect card → streaming canvas with toolbar/stats.
 
 import "./style.css";
+import { capabilityReport, caps, fullscreen, storage } from "./caps";
 import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
+import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
 import { InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
@@ -46,7 +48,7 @@ function prefill(): void {
   const params = new URLSearchParams(location.search);
   hostInput.value = params.get("host") ?? defaultHost();
   pinInput.value = params.get("pin") ?? "";
-  nameInput.value = localStorage.getItem("ndsp.clientName") ?? defaultDeviceName();
+  nameInput.value = storage.get("ndsp.clientName") ?? defaultDeviceName();
   updatePairedHint();
 }
 
@@ -89,7 +91,7 @@ async function connect(): Promise<void> {
   if (!paired && !/^\d{4,10}$/.test(pin)) {
     return setStatus("Enter the PIN shown in the host's control panel.", "err");
   }
-  localStorage.setItem("ndsp.clientName", nameInput.value.trim() || defaultDeviceName());
+  storage.set("ndsp.clientName", nameInput.value.trim() || defaultDeviceName());
 
   connectBtn.disabled = true;
   setStatus(paired ? "Reconnecting with stored trust…" : "Pairing…");
@@ -102,6 +104,10 @@ async function connect(): Promise<void> {
     });
     session = s;
     renderer.requestKeyframe = () => void s.send({ type: "request_keyframe" });
+    renderer.onError = (e) => {
+      console.error("render error", e);
+      showToast(`Video error: ${e.message}`, 8000);
+    };
     inputAllowed = s.info.inputAllowed;
     enterViewer(s);
     setStatus("");
@@ -212,10 +218,15 @@ function round1(n: number): number {
 
 // --- toolbar wiring -------------------------------------------------------
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
-$("fullscreen-btn").onclick = () => {
-  if (document.fullscreenElement) void document.exitFullscreen();
-  else void viewerScreen.requestFullscreen();
-};
+if (fullscreen.supported) {
+  $("fullscreen-btn").onclick = () => {
+    if (fullscreen.element()) void fullscreen.exit();
+    else void fullscreen.enter(viewerScreen);
+  };
+} else {
+  // iPhone Safari has no element fullscreen at all — hide the control.
+  $("fullscreen-btn").style.display = "none";
+}
 $("disconnect-btn").onclick = () => {
   session?.close();
   endSession("Disconnected.");
@@ -236,6 +247,20 @@ hostInput.oninput = updatePairedHint;
 pinInput.onkeydown = (ev) => {
   if (ev.key === "Enter") void connect();
 };
+
+// Capability diagnostics: always in the console, and surfaced in the UI when
+// running with fallbacks (the normal case for plain-HTTP LAN serving).
+console.info(capabilityReport());
+if (!usingNativeCrypto || !caps.persistentStorage) {
+  const notes: string[] = [];
+  if (!usingNativeCrypto) notes.push("built-in crypto (non-secure page context)");
+  if (!caps.persistentStorage) notes.push("no persistent storage — pairing forgotten on reload");
+  const el = document.getElementById("compat-note");
+  if (el) {
+    el.textContent = `Compatibility mode: ${notes.join(" · ")}`;
+    el.style.display = "";
+  }
+}
 
 prefill();
 // QR deep link: auto-connect when both host and pin arrived via URL.

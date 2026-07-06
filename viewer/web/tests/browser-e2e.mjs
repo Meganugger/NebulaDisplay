@@ -62,9 +62,11 @@ if (!pin) await fail("no PIN from host");
 console.log(`host up on :${port}, pin=${pin}`);
 
 const browser = await chromium.launch({
-  // WebCodecs H.264 needs proprietary codecs — the full chromium build has
-  // them; also allow insecure ws from http origin on localhost.
-  args: ["--autoplay-policy=no-user-gesture-required"],
+  executablePath: process.env.CHROMIUM_PATH || undefined,
+  args: [
+    "--autoplay-policy=no-user-gesture-required",
+    ...(process.getuid?.() === 0 ? ["--no-sandbox"] : []),
+  ],
 });
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 page.on("console", (m) => {
@@ -82,7 +84,14 @@ await page.click("#connect-btn");
 await page.waitForSelector("#viewer-screen.active", { timeout: 15000 }).catch(() => fail("viewer did not activate"));
 console.log("paired through UI");
 
-// ---- verify H.264 WebCodecs streaming with changing pixels -----------------
+// ---- verify streaming with changing pixels ----------------------------------
+// The negotiated codec must match the browser's REAL decode capability:
+// H.264 with proprietary-codec Chromium builds, JPEG otherwise.
+const h264Capable = await page.evaluate(
+  async () =>
+    "VideoDecoder" in globalThis &&
+    (await VideoDecoder.isConfigSupported({ codec: "avc1.42E01F" })).supported === true,
+);
 await sleep(2500);
 const probe = async () =>
   page.evaluate(() => {
@@ -93,13 +102,19 @@ const probe = async () =>
     for (let i = 0; i < d.length; i += 97) sum = (sum * 31 + d[i]) >>> 0;
     return { w: c.width, h: c.height, hash: sum, name: document.getElementById("server-name").textContent };
   });
-const p1 = await probe();
+let p1 = await probe();
+for (let i = 0; i < 40 && (p1.w !== 1280 || p1.h !== 720); i++) {
+  await sleep(250);
+  p1 = await probe();
+}
 if (p1.w !== 1280 || p1.h !== 720) await fail(`canvas is ${p1.w}x${p1.h}, expected 1280x720`);
-if (!/H264/i.test(p1.name)) await fail(`expected H264 codec badge, got "${p1.name}"`);
+const wantCodec = h264Capable ? /H264/i : /JPEG/i;
+if (!wantCodec.test(p1.name))
+  await fail(`expected ${h264Capable ? "H264" : "JPEG"} codec badge (h264 decodable=${h264Capable}), got "${p1.name}"`);
 await sleep(700);
 const p2 = await probe();
 if (p1.hash === p2.hash) await fail("canvas pixels not changing — stream frozen?");
-console.log(`H.264 streaming verified: 1280x720, pixels changing (${p1.hash} → ${p2.hash})`);
+console.log(`${h264Capable ? "H.264" : "JPEG"} streaming verified: 1280x720, pixels changing (${p1.hash} → ${p2.hash})`);
 
 // ---- stats overlay with measured e2e latency --------------------------------
 await page.click("#stats-btn");

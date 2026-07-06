@@ -1,14 +1,16 @@
 // Clock sync (NTP-style over Ping/Pong) + measured end-to-end latency.
 
+import { epochNowMs } from "./caps";
+
 export class ClockSync {
   /** host_clock ≈ client_clock + offsetUs */
   private offsetUs: number | null = null;
   private lastRttMs = 0;
   private bestRttMs = Infinity;
 
-  /** Client timestamp in µs (unix epoch, from performance/now + epoch base). */
+  /** Client timestamp in µs (unix epoch; works without performance.timeOrigin). */
   nowUs(): number {
-    return (performance.timeOrigin + performance.now()) * 1000;
+    return epochNowMs() * 1000;
   }
 
   /** Handle a pong: t0 = our send time, t1 = server receive/reply time. */

@@ -1,5 +1,6 @@
 // NDSP session: connect → (pair | token reconnect) → encrypted session.
 
+import { probeH264Decode } from "./caps";
 import {
   b64decode,
   b64encode,
@@ -69,7 +70,10 @@ export class Session {
     const stored = loadCredentials(host);
     if (!stored && !pin) throw new Error("PIN required for first-time pairing");
 
-    const url = `ws://${host}${WS_PATH}`;
+    // Match the page's security level: an https page may not open ws://.
+    const scheme =
+      typeof location !== "undefined" && location.protocol === "https:" ? "wss" : "ws";
+    const url = `${scheme}://${host}${WS_PATH}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     await new Promise<void>((resolve, reject) => {
@@ -91,7 +95,7 @@ export class Session {
         app_version: "0.2.0",
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
-      codecs: supportedCodecs(),
+      codecs: await supportedCodecs(),
     });
 
     const ack = await nextText();
@@ -210,9 +214,12 @@ export class Session {
   }
 }
 
-function supportedCodecs(): string[] {
+async function supportedCodecs(): Promise<string[]> {
+  // JPEG decodes everywhere. H.264 requires WebCodecs (secure contexts only —
+  // never plain-HTTP LAN) AND an engine that actually accepts avc1 configs:
+  // codec-less Chromium/Electron builds expose VideoDecoder but reject H.264.
   const codecs = ["jpeg"];
-  if ("VideoDecoder" in globalThis) codecs.unshift("h264");
+  if (await probeH264Decode()) codecs.unshift("h264");
   return codecs;
 }
 

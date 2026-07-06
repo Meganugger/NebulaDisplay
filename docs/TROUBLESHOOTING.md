@@ -17,6 +17,16 @@
 6. **"Host identity changed" warning.** The host reinstalled (new identity
    key) — or something is impersonating it. If you expect the change (fresh
    install), pair again with the PIN; the stale trust entry was cleared.
+7. **"Compatibility mode" note on the connect card.** Normal when the viewer
+   is opened over plain HTTP on a LAN address (an insecure browser context):
+   the viewer transparently uses its built-in crypto and, where needed,
+   in-memory storage. Pairing and streaming work the same; H.264 is only
+   available in secure contexts, so LAN-HTTP sessions stream JPEG. Details:
+   `docs/BROWSER-COMPAT.md`.
+8. **Black screen with a "Video error" toast.** The browser advertised H.264
+   but can't actually decode it (some Chromium builds ship without
+   proprietary codecs). Reconnect — the viewer probes real decode support and
+   will negotiate JPEG. If it persists, report the console capability block.
 
 ## Symptoms
 

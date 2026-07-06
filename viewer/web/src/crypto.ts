@@ -1,6 +1,20 @@
-// Handshake crypto (WebCrypto): ECDH P-256 + HKDF-SHA256 + AES-256-GCM.
+// Handshake crypto: ECDH P-256 + HKDF-SHA256 + AES-256-GCM.
 // Byte-compatible with shared/protocol/src/crypto.rs.
+//
+// All primitives go through ./cryptobox, which picks native WebCrypto in
+// secure contexts and an audited pure-JS fallback in insecure ones (the
+// normal plain-HTTP-over-LAN case, where crypto.subtle does not exist).
 
+import { generateUuid, storage } from "./caps";
+import {
+  AesGcmKey,
+  EcdhKeyPair,
+  generateEcdhKeys,
+  hkdfSha256,
+  importAesGcmKey,
+  randomNonce,
+  sha256,
+} from "./cryptobox";
 import { b64decode, b64encode, te } from "./protocol";
 
 export const CONFIRM_CONTEXT = te.encode("ndsp-confirm-v1");
@@ -9,28 +23,17 @@ const SESSION_INFO = te.encode("ndsp-session-v1");
 
 export interface HandshakeKeys {
   publicRaw: Uint8Array; // uncompressed SEC1 (65 bytes)
-  privateKey: CryptoKey;
+  pair: EcdhKeyPair;
 }
 
 export async function generateHandshakeKeys(): Promise<HandshakeKeys> {
-  const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, [
-    "deriveBits",
-  ]);
-  const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
-  return { publicRaw, privateKey: pair.privateKey };
+  const pair = await generateEcdhKeys();
+  return { publicRaw: pair.publicRaw, pair };
 }
 
 /** ECDH → raw shared secret bits (x-coordinate, 32 bytes). */
 export async function agree(keys: HandshakeKeys, peerRaw: Uint8Array): Promise<Uint8Array> {
-  const peer = await crypto.subtle.importKey(
-    "raw",
-    peerRaw as BufferSource,
-    { name: "ECDH", namedCurve: "P-256" },
-    false,
-    [],
-  );
-  const bits = await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, keys.privateKey, 256);
-  return new Uint8Array(bits);
+  return keys.pair.ecdh(peerRaw);
 }
 
 function concat(...parts: Uint8Array[]): Uint8Array {
@@ -43,25 +46,13 @@ function concat(...parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey("raw", ikm as BufferSource, "HKDF", false, [
-    "deriveBits",
-  ]);
-  const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: info as BufferSource },
-    key,
-    256,
-  );
-  return new Uint8Array(bits);
-}
-
 export async function pairingKey(
   shared: Uint8Array,
   salt: Uint8Array,
   pin: string,
   nonce: Uint8Array,
 ): Promise<Uint8Array> {
-  return hkdf(shared, salt, concat(PAIR_INFO, te.encode(pin), nonce));
+  return hkdfSha256(shared, salt, concat(PAIR_INFO, te.encode(pin), nonce));
 }
 
 export async function sessionKeyBytes(
@@ -69,14 +60,11 @@ export async function sessionKeyBytes(
   salt: Uint8Array,
   nonce: Uint8Array,
 ): Promise<Uint8Array> {
-  return hkdf(shared, salt, concat(SESSION_INFO, nonce));
+  return hkdfSha256(shared, salt, concat(SESSION_INFO, nonce));
 }
 
-export async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
-  return crypto.subtle.importKey("raw", raw as BufferSource, "AES-GCM", false, [
-    "encrypt",
-    "decrypt",
-  ]);
+export async function importAesKey(raw: Uint8Array): Promise<AesGcmKey> {
+  return importAesGcmKey(raw);
 }
 
 /** Seal with random nonce: nonce(12) || ct || tag — matches crypto::seal. */
@@ -85,15 +73,9 @@ export async function seal(
   plaintext: Uint8Array,
   aad: Uint8Array,
 ): Promise<Uint8Array> {
-  const key = await importAesKey(keyRaw);
-  const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(
-    await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: nonce as BufferSource, additionalData: aad as BufferSource },
-      key,
-      plaintext as BufferSource,
-    ),
-  );
+  const key = await importAesGcmKey(keyRaw);
+  const nonce = randomNonce();
+  const ct = await key.seal(nonce, plaintext, aad);
   return concat(nonce, ct);
 }
 
@@ -102,17 +84,8 @@ export async function open(
   sealed: Uint8Array,
   aad: Uint8Array,
 ): Promise<Uint8Array> {
-  const key = await importAesKey(keyRaw);
-  const pt = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: sealed.subarray(0, 12) as BufferSource,
-      additionalData: aad as BufferSource,
-    },
-    key,
-    sealed.subarray(12) as BufferSource,
-  );
-  return new Uint8Array(pt);
+  const key = await importAesGcmKey(keyRaw);
+  return key.open(sealed.subarray(0, 12), sealed.subarray(12), aad);
 }
 
 /** Reconnect proof: SHA-256(token || nonce || clientPub || serverPub). */
@@ -122,11 +95,7 @@ export async function tokenProof(
   clientPub: Uint8Array,
   serverPub: Uint8Array,
 ): Promise<Uint8Array> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    concat(token, nonce, clientPub, serverPub) as BufferSource,
-  );
-  return new Uint8Array(digest);
+  return sha256(concat(token, nonce, clientPub, serverPub));
 }
 
 export interface StoredCredentials {
@@ -139,16 +108,16 @@ const CREDS_PREFIX = "ndsp.creds.";
 const DEVICE_ID_KEY = "ndsp.deviceId";
 
 export function deviceId(): string {
-  let id = localStorage.getItem(DEVICE_ID_KEY);
+  let id = storage.get(DEVICE_ID_KEY);
   if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem(DEVICE_ID_KEY, id);
+    id = generateUuid();
+    storage.set(DEVICE_ID_KEY, id);
   }
   return id;
 }
 
 export function loadCredentials(host: string): StoredCredentials | null {
-  const raw = localStorage.getItem(CREDS_PREFIX + host);
+  const raw = storage.get(CREDS_PREFIX + host);
   if (!raw) return null;
   try {
     return JSON.parse(raw) as StoredCredentials;
@@ -158,11 +127,11 @@ export function loadCredentials(host: string): StoredCredentials | null {
 }
 
 export function saveCredentials(host: string, creds: StoredCredentials): void {
-  localStorage.setItem(CREDS_PREFIX + host, JSON.stringify(creds));
+  storage.set(CREDS_PREFIX + host, JSON.stringify(creds));
 }
 
 export function clearCredentials(host: string): void {
-  localStorage.removeItem(CREDS_PREFIX + host);
+  storage.remove(CREDS_PREFIX + host);
 }
 
 export { b64decode, b64encode };

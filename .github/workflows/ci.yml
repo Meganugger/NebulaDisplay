@@ -64,6 +64,9 @@ jobs:
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)
         working-directory: viewer/web
         run: node tests/web-compat.mjs
+      - name: Cross-stack compatibility — pure-JS crypto fallback (insecure-context path)
+        working-directory: viewer/web
+        run: NDSP_CRYPTO=fallback node tests/web-compat.mjs
 
   browser-e2e:
     name: Browser E2E — Chromium pairing/H.264/input/panel
@@ -88,6 +91,9 @@ jobs:
       - name: Run browser E2E
         working-directory: viewer/web
         run: node tests/browser-e2e.mjs e2e-screenshots
+      - name: Run cross-environment compat E2E (insecure context / iOS-like / Android-like / WebView)
+        working-directory: viewer/web
+        run: node tests/compat-e2e.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

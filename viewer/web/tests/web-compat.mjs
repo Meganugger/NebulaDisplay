@@ -18,6 +18,19 @@ const webRoot = join(here, "..");
 const repoRoot = join(webRoot, "..", "..");
 
 // ---- polyfills for browser globals used by the viewer code ----------------
+// NDSP_CRYPTO=fallback strips SubtleCrypto/randomUUID (leaving only
+// getRandomValues) to mirror an insecure browser context, proving the
+// pure-JS fallback backend is byte-compatible with the Rust host too.
+if (process.env.NDSP_CRYPTO === "fallback") {
+  const grv = crypto.getRandomValues.bind(crypto);
+  Object.defineProperty(globalThis, "crypto", {
+    value: { getRandomValues: grv },
+    configurable: true,
+  });
+  console.log("crypto backend: pure-JS fallback (SubtleCrypto removed)");
+} else {
+  console.log("crypto backend: native WebCrypto");
+}
 const store = new Map();
 globalThis.localStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),

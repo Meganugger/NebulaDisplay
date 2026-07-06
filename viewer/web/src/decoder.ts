@@ -1,6 +1,11 @@
 // Video decoding: WebCodecs H.264 (Annex B) with JPEG fallback.
 // Renders into a canvas; tracks decode timing + queue depth for stats.
+//
+// Capability notes: WebCodecs only exists in secure contexts, so the
+// plain-HTTP LAN deployment always streams JPEG; older iOS Safari lacks
+// createImageBitmap, for which we decode through an <img> element instead.
 
+import { caps } from "./caps";
 import { VideoFrame as NdspFrame } from "./protocol";
 
 export interface DecoderStats {
@@ -52,6 +57,8 @@ export class Renderer {
     }
   }
 
+  private h264ErrorStreak = 0;
+
   private ensureH264(): VideoDecoder {
     if (this.h264 && this.h264.state !== "closed") return this.h264;
     this.h264 = new VideoDecoder({
@@ -60,13 +67,28 @@ export class Renderer {
         console.warn("VideoDecoder error; requesting keyframe", e);
         this.h264Configured = false;
         this.sawKeyframe = false;
-        this.requestKeyframe?.();
+        // A keyframe normally recovers a transient error; a *streak* with no
+        // presented frame in between means this engine can't decode the
+        // stream at all (e.g. codec-less builds) — surface it instead of
+        // looping forever on a black canvas.
+        this.h264ErrorStreak++;
+        if (this.h264ErrorStreak >= 5) {
+          this.onError?.(new Error(`H.264 decoding keeps failing: ${e.message}`));
+        } else {
+          this.requestKeyframe?.();
+        }
       },
     });
     return this.h264;
   }
 
   private pushH264(frame: NdspFrame): void {
+    if (!caps.webCodecsH264) {
+      // Defensive: the client never advertises h264 without WebCodecs, so a
+      // misbehaving host is the only way here — fail clearly, don't crash.
+      this.onError?.(new Error("received h264 but WebCodecs is unavailable in this context"));
+      return;
+    }
     const dec = this.ensureH264();
     if (!this.h264Configured) {
       // Annex B (no description) → decoder parses SPS/PPS from the stream.
@@ -101,6 +123,7 @@ export class Renderer {
   }
 
   private present(vf: VideoFrame): void {
+    this.h264ErrorStreak = 0;
     const match = this.pendingTs.find((p) => Number(p.tsUs & 0x7fffffffffffn) === vf.timestamp);
     if (match) {
       this.decodeSample(performance.now() - match.submittedAt);
@@ -124,17 +147,40 @@ export class Renderer {
     const t0 = performance.now();
     try {
       const copy = new Uint8Array(frame.payload); // detach from envelope buffer
-      const bmp = await createImageBitmap(new Blob([copy.buffer as ArrayBuffer], { type: "image/jpeg" }));
-      this.decodeSample(performance.now() - t0);
-      this.fit(bmp.width, bmp.height);
-      this.ctx.drawImage(bmp, 0, 0, this.canvas.width, this.canvas.height);
-      bmp.close();
+      const blob = new Blob([copy.buffer as ArrayBuffer], { type: "image/jpeg" });
+      if (caps.createImageBitmap) {
+        const bmp = await createImageBitmap(blob);
+        this.decodeSample(performance.now() - t0);
+        this.fit(bmp.width, bmp.height);
+        this.ctx.drawImage(bmp, 0, 0, this.canvas.width, this.canvas.height);
+        bmp.close();
+      } else {
+        // Older iOS Safari / WebViews: decode through an <img> element.
+        await this.drawViaImage(blob);
+        this.decodeSample(performance.now() - t0);
+      }
       this.stats.lastPresentedTsUs = frame.timestampUs;
       this.tickFps();
     } catch (e) {
       this.onError?.(e as Error);
     } finally {
       this.jpegBusy = false;
+    }
+  }
+
+  private async drawViaImage(blob: Blob): Promise<void> {
+    const url = URL.createObjectURL(blob);
+    try {
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("jpeg decode failed (<img> fallback)"));
+        img.src = url;
+      });
+      this.fit(img.naturalWidth, img.naturalHeight);
+      this.ctx.drawImage(img, 0, 0, this.canvas.width, this.canvas.height);
+    } finally {
+      URL.revokeObjectURL(url);
     }
   }
 

@@ -1,5 +1,8 @@
 // NDSP wire types + envelope framing (mirrors shared/protocol).
 
+import { readU64BE, writeU64BE } from "./caps";
+import { AesGcmKey } from "./cryptobox";
+
 export const PROTOCOL_VERSION = 1;
 export const WS_PATH = "/ndsp";
 
@@ -78,7 +81,7 @@ export function parseVideoFrame(buf: Uint8Array): VideoFrame {
     codec,
     keyframe: (buf[1]! & 1) !== 0,
     seq: dv.getUint32(2),
-    timestampUs: dv.getBigUint64(6),
+    timestampUs: readU64BE(dv, 6),
     width: dv.getUint16(14),
     height: dv.getUint16(16),
     payload: buf.subarray(18),
@@ -90,7 +93,7 @@ function nonceFor(dir: number, chan: number, counter: bigint): Uint8Array {
   const n = new Uint8Array(12);
   n[0] = dir;
   n[1] = chan;
-  new DataView(n.buffer).setBigUint64(4, counter);
+  writeU64BE(new DataView(n.buffer), 4, counter);
   return n;
 }
 
@@ -98,7 +101,7 @@ function nonceFor(dir: number, chan: number, counter: bigint): Uint8Array {
 export class Sealer {
   private counters = new Map<number, bigint>();
   constructor(
-    private key: CryptoKey,
+    private key: AesGcmKey,
     private dir: number,
   ) {}
 
@@ -106,16 +109,10 @@ export class Sealer {
     const counter = this.counters.get(chan) ?? 0n;
     this.counters.set(chan, counter + 1n);
     const nonce = nonceFor(this.dir, chan, counter);
-    const ct = new Uint8Array(
-      await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: nonce as BufferSource, additionalData: new Uint8Array([chan]) },
-        this.key,
-        plaintext as BufferSource,
-      ),
-    );
+    const ct = await this.key.seal(nonce, plaintext, new Uint8Array([chan]));
     const out = new Uint8Array(9 + ct.length);
     out[0] = chan;
-    new DataView(out.buffer).setBigUint64(1, counter);
+    writeU64BE(new DataView(out.buffer), 1, counter);
     out.set(ct, 9);
     return out;
   }
@@ -125,24 +122,18 @@ export class Sealer {
 export class Opener {
   private nextExpected = new Map<number, bigint>();
   constructor(
-    private key: CryptoKey,
+    private key: AesGcmKey,
     private dir: number,
   ) {}
 
   async open(envelope: Uint8Array): Promise<{ chan: number; plaintext: Uint8Array }> {
     if (envelope.length < 1 + 8 + 16) throw new Error("envelope too short");
     const chan = envelope[0]!;
-    const counter = new DataView(envelope.buffer, envelope.byteOffset).getBigUint64(1);
+    const counter = readU64BE(new DataView(envelope.buffer, envelope.byteOffset), 1);
     const expected = this.nextExpected.get(chan) ?? 0n;
     if (counter < expected) throw new Error("replayed envelope");
     const nonce = nonceFor(this.dir, chan, counter);
-    const pt = new Uint8Array(
-      await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: nonce as BufferSource, additionalData: new Uint8Array([chan]) },
-        this.key,
-        envelope.subarray(9) as BufferSource,
-      ),
-    );
+    const pt = await this.key.open(nonce, envelope.subarray(9), new Uint8Array([chan]));
     this.nextExpected.set(chan, counter + 1n);
     return { chan, plaintext: pt };
   }
