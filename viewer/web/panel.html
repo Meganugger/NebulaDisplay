@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>NebulaDisplay — Host Control Panel</title>
+    <script type="module" src="/src/panel.ts"></script>
+  </head>
+  <body>
+    <div class="panel-wrap">
+      <h1><span class="logo"></span>NebulaDisplay <span style="color:var(--fg-dim);font-weight:400">host panel</span></h1>
+      <div class="grid">
+        <div class="tile">
+          <h2>Pair a new device</h2>
+          <div class="pin-big mono" id="pin">······</div>
+          <img id="qr" src="/api/qr.svg" alt="QR code to open the viewer" />
+          <p style="color:var(--fg-dim);font-size:0.82rem;text-align:center">
+            Scan on the device, or open a viewer URL and type the PIN.<br />PINs are single-use and expire.
+          </p>
+          <button id="rotate" style="width:100%">Generate new PIN</button>
+        </div>
+        <div class="tile">
+          <h2>Host</h2>
+          <div id="host-info"></div>
+          <h2 style="margin-top:1.2rem">Viewer URLs</h2>
+          <div class="urls" id="urls"></div>
+          <h2 style="margin-top:1.2rem">Streaming</h2>
+          <div id="host-stats"></div>
+        </div>
+      </div>
+      <div class="tile" style="margin-top:1rem">
+        <h2>Connected now</h2>
+        <table id="clients">
+          <thead>
+            <tr><th>Device</th><th>From</th><th>FPS</th><th>Latency</th><th>RTT</th><th>Input</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p id="no-clients" style="color:var(--fg-dim)">No viewers connected.</p>
+      </div>
+      <div class="tile" style="margin-top:1rem">
+        <h2>Trusted devices <span style="text-transform:none;letter-spacing:0">(input is <b>off by default</b> — enable per device)</span></h2>
+        <table id="trusted">
+          <thead>
+            <tr><th>Device</th><th>Platform</th><th>Last seen</th><th>Allow input</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p id="no-trusted" style="color:var(--fg-dim)">No paired devices yet.</p>
+      </div>
+    </div>
+  </body>
+</html>

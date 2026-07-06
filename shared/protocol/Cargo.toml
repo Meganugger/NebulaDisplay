@@ -1,0 +1,19 @@
+[package]
+name = "ndsp-protocol"
+description = "NebulaDisplay Stream Protocol (NDSP) — versioned message schemas, media framing, and handshake crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+p256 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "ndsp-client"
+description = "NebulaDisplay client SDK: pairing, token reconnect, encrypted session I/O (used by the desktop viewer and integration tests)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ndsp-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { version = "1", features = ["v4"] }

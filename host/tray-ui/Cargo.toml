@@ -1,0 +1,4 @@
+[package]
+name="nebula-tray"
+version.workspace=true
+edition.workspace=true
