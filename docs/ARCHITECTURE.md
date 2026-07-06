@@ -49,8 +49,12 @@ implementations chosen at startup in priority order: IddCx ring (extend) →
 DXGI duplication (mirror) → synthetic test pattern (CI/dev). Everything
 downstream is identical, which is why the whole pipeline is testable on Linux.
 
-**One encoder per client.** Sessions own their encoder so quality adapts per
-client (a phone on Wi-Fi and a wired laptop get different bitrates). Frames
+**One encoder per client, hardware first.** Sessions own their encoder so
+quality adapts per client (a phone on Wi-Fi and a wired laptop get different
+bitrates). On Windows, H.264 sessions prefer the machine's hardware encoder
+(NVENC / Quick Sync / AMF via Media Foundation, `encode/mf_h264.rs`) and
+fall back to OpenH264 software; resolution changes recreate the encoder
+(session-level, codec-agnostic). Frames
 are shared zero-copy (`Arc<CapturedFrame>` in a `tokio::sync::watch`); an
 encoder only runs when its client is keeping up — slow clients naturally skip
 to the newest frame instead of queueing stale ones.

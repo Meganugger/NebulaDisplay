@@ -123,7 +123,8 @@ pub async fn run(
     let sealer = Sealer::new(&session_key, Direction::ServerToClient);
     let opener = Opener::new(&session_key, Direction::ClientToServer);
 
-    let encoder = match crate::encode::create(auth.codec) {
+    let mode = *state.mode.lock().unwrap();
+    let encoder = match crate::encode::create(auth.codec, mode) {
         Ok(e) => e,
         Err(e) => {
             warn!("encoder init failed: {e:#}");
@@ -194,6 +195,7 @@ pub async fn run(
     let video = tokio::spawn(video_task(
         state.clone(),
         encoder,
+        auth.codec,
         shared.clone(),
         vid_tx,
         consumed_seq,
@@ -368,11 +370,13 @@ async fn writer_task(
 async fn video_task(
     state: Arc<AppState>,
     mut encoder: Box<dyn crate::encode::Encoder>,
+    codec: ndsp_protocol::messages::Codec,
     shared: Arc<Shared>,
     vid_tx: watch::Sender<Option<(u64, Arc<VideoFrame>)>>,
     consumed_seq: Arc<AtomicU64>,
 ) {
     let mut frames = state.frame_tx.subscribe();
+    let mut encoder_size: (u32, u32) = (0, 0);
     let mut last_captured_seq: u64 = 0;
     let mut out_seq: u64 = 0;
     let mut frame_seq16: u32 = 0;
@@ -434,6 +438,38 @@ async fn video_task(
         let Some(frame) = frame else { continue };
         last_captured_seq = frame.seq;
         last_encode_at = Instant::now();
+
+        // Resolution change (mode switch / rotation): recreate the encoder.
+        // Hardware MF encoders are fixed-resolution; the software encoders
+        // could adapt internally, but a single recreate path is simpler and
+        // this is a rare, user-visible event anyway.
+        if encoder_size != (frame.width, frame.height) {
+            if encoder_size != (0, 0) {
+                info!(
+                    w = frame.width,
+                    h = frame.height,
+                    "capture resolution changed; recreating encoder"
+                );
+                match crate::encode::create(
+                    codec,
+                    ndsp_protocol::messages::DisplayMode {
+                        width: frame.width,
+                        height: frame.height,
+                        refresh_hz: 60,
+                    },
+                ) {
+                    Ok(e) => {
+                        encoder = e;
+                        shared.force_keyframe.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!("encoder recreate failed: {e:#}");
+                        continue;
+                    }
+                }
+            }
+            encoder_size = (frame.width, frame.height);
+        }
 
         let fk = shared.force_keyframe.swap(false, Ordering::Relaxed);
         // Capture → encode-start scheduling wait (frame age at encode time).

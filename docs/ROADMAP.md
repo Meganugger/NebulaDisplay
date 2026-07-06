@@ -28,10 +28,14 @@ harness (`viewer/web/tests/bench.mjs`).
    `host/windows-driver`, test-sign, validate extend mode end-to-end, measure
    ring throughput at 4K, add driver health reporting into the panel
    ("extend/mirror/pattern" badge exists server-side already).
-2. **Hardware encoders** via Media Foundation Transform enumeration:
-   NVENC / Quick Sync / AMF H.264+HEVC behind the existing `Encoder` trait;
-   per-client encoder selection by resolution (SW OpenH264 tops out ~1080p60
-   on typical CPUs; HW unlocks 1440p/4K60 at lower latency).
+2. **Hardware encoders — H.264 SHIPPED** (`encode/mf_h264.rs`): MFTEnumEx
+   hardware enumeration (NVENC/QuickSync/AMF), async-MFT event loop at queue
+   depth ≤1, MF_LOW_LATENCY + CBR + zero B-frames, runtime ICodecAPI bitrate,
+   NV12 dirty-row conversion, static-frame elision, automatic software
+   fallback. Compile-verified by the Windows CI job; **runtime validation
+   needs a real Windows GPU machine** (this sandbox has none — see
+   docs/TESTING.md release gate). Remaining: HEVC output type (trivial
+   variant of the same MFT plumbing) once decoder support is negotiated.
 3. **Encoder ROI from DXGI dirty/move rects**: the pixel-exact row-pair diff
    already elides static frames and limits color conversion; the remaining
    step is feeding rectangle hints into encoder rate control (needs the

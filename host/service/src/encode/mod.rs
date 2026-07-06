@@ -12,6 +12,8 @@ mod dirty;
 #[cfg(feature = "h264")]
 mod h264;
 mod jpeg;
+#[cfg(windows)]
+mod mf_h264;
 
 use ndsp_protocol::messages::Codec;
 
@@ -40,13 +42,37 @@ pub trait Encoder: Send {
 }
 
 /// Instantiate the encoder for a negotiated codec.
-pub fn create(codec: Codec) -> anyhow::Result<Box<dyn Encoder>> {
+///
+/// H.264 on Windows prefers a **hardware** Media Foundation encoder
+/// (NVENC / Quick Sync / AMF — whatever `MFTEnumEx` finds) and falls back to
+/// OpenH264 software; everywhere else it's OpenH264. `mode` sizes the
+/// hardware encoder (MF encoders are fixed-resolution; the session recreates
+/// the encoder on mode change, which was already the resolution-change
+/// contract for the software path too).
+pub fn create(
+    codec: Codec,
+    mode: ndsp_protocol::messages::DisplayMode,
+) -> anyhow::Result<Box<dyn Encoder>> {
+    let _ = &mode; // used on Windows only
     match codec {
         Codec::Jpeg => Ok(Box::new(jpeg::JpegEncoder::new())),
-        #[cfg(feature = "h264")]
-        Codec::H264 => Ok(Box::new(h264::H264Encoder::new()?)),
-        #[cfg(not(feature = "h264"))]
-        Codec::H264 => anyhow::bail!("built without the h264 feature"),
+        Codec::H264 => {
+            #[cfg(windows)]
+            if mf_h264::hw_encoder_available() {
+                match mf_h264::MfH264Encoder::new(mode.width, mode.height, 6_000, 60) {
+                    Ok(enc) => return Ok(Box::new(enc)),
+                    Err(e) => {
+                        tracing::warn!("hardware encoder init failed ({e:#}); using software");
+                    }
+                }
+            }
+            #[cfg(feature = "h264")]
+            {
+                Ok(Box::new(h264::H264Encoder::new()?))
+            }
+            #[cfg(not(feature = "h264"))]
+            anyhow::bail!("built without the h264 feature and no hardware encoder")
+        }
         other => anyhow::bail!("codec {other:?} not implemented yet"),
     }
 }
@@ -54,6 +80,18 @@ pub fn create(codec: Codec) -> anyhow::Result<Box<dyn Encoder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk(codec: Codec, w: u32, h: u32) -> Box<dyn Encoder> {
+        create(
+            codec,
+            ndsp_protocol::messages::DisplayMode {
+                width: w,
+                height: h,
+                refresh_hz: 60,
+            },
+        )
+        .unwrap()
+    }
 
     fn frame(w: u32, h: u32) -> CapturedFrame {
         let mut src = crate::capture::test_pattern_for_tests(w, h);
@@ -71,7 +109,7 @@ mod tests {
 
     #[test]
     fn jpeg_encodes_valid_frames() {
-        let mut enc = create(Codec::Jpeg).unwrap();
+        let mut enc = mk(Codec::Jpeg, 320, 240);
         let out = enc.encode(&frame(320, 240), true, 4000, 30).unwrap();
         assert!(out.keyframe);
         assert!(out.payload.len() > 500, "suspiciously small JPEG");
@@ -80,7 +118,7 @@ mod tests {
 
     #[test]
     fn jpeg_static_frame_elided() {
-        let mut enc = create(Codec::Jpeg).unwrap();
+        let mut enc = mk(Codec::Jpeg, 320, 240);
         let f = frame(320, 240);
         let out = enc.encode(&f, true, 4000, 30).unwrap();
         assert!(!out.payload.is_empty());
@@ -100,7 +138,7 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn h264_static_frame_elided_but_keyframe_still_served() {
-        let mut enc = create(Codec::H264).unwrap();
+        let mut enc = mk(Codec::H264, 320, 240);
         let f = frame(320, 240);
         enc.encode(&f, false, 4000, 30).unwrap(); // IDR
         enc.encode(&f, false, 4000, 30).unwrap(); // post-init tune IDR
@@ -118,7 +156,7 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn h264_first_frame_is_keyframe_annexb() {
-        let mut enc = create(Codec::H264).unwrap();
+        let mut enc = mk(Codec::H264, 320, 240);
         let out = enc.encode(&frame(320, 240), false, 2000, 30).unwrap();
         assert!(out.keyframe, "first frame must be IDR");
         assert!(
@@ -139,7 +177,7 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn h264_bitrate_change_does_not_reset_stream() {
-        let mut enc = create(Codec::H264).unwrap();
+        let mut enc = mk(Codec::H264, 320, 240);
         let first = enc.encode(&frame(320, 240), false, 8000, 60).unwrap();
         assert!(first.keyframe, "first frame is IDR");
         // Consume the one-time post-init-tune IDR.
@@ -159,7 +197,7 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn h264_resolution_change_rebuilds_with_keyframe() {
-        let mut enc = create(Codec::H264).unwrap();
+        let mut enc = mk(Codec::H264, 320, 240);
         enc.encode(&frame(320, 240), false, 4000, 30).unwrap();
         enc.encode(&frame(320, 240), false, 4000, 30).unwrap();
         // Resolution change is the one case that must re-init + IDR.
@@ -173,6 +211,18 @@ mod bench {
     use super::*;
     use std::time::Instant;
 
+    fn mk(codec: Codec, w: u32, h: u32) -> Box<dyn Encoder> {
+        create(
+            codec,
+            ndsp_protocol::messages::DisplayMode {
+                width: w,
+                height: h,
+                refresh_hz: 60,
+            },
+        )
+        .unwrap()
+    }
+
     /// Not a real benchmark harness — an ignored test that prints the
     /// conversion/encode split at 1080p (run with --ignored --nocapture).
     #[test]
@@ -180,7 +230,7 @@ mod bench {
     fn print_encode_timing_split() {
         let mut src = crate::capture::test_pattern_for_tests(1920, 1080);
         use crate::capture::FrameSource;
-        let mut enc = create(Codec::H264).unwrap();
+        let mut enc = mk(Codec::H264, 1920, 1080);
         let mut buf = Vec::new();
         let mut total_enc = 0.0;
         const N: u32 = 60;
