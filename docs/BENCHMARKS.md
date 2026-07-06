@@ -28,19 +28,21 @@ deployment hardware for absolute ones.
 
 | size | profile | fps | e2e ms | net+host ms | present ms | enc ms | cvt ms | age ms | send ms | dec ms |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1280x720 | office (30 cap) | 27.5 | 16.8 | 10.9 | 6.0 | 9.8 | 2.4 | 0.1 | 0.0 | 1.2 |
-| 1280x720 | video (60 cap) | 52.1 | 16.5 | 10.1 | 5.6 | 9.5 | 2.3 | 0.3 | 0.0 | 1.1 |
-| 1920x1080 | video | 24.8 | 31.5 | 20.9 | 9.6 | 20.2 | 5.8 | 0.1 | 0.1 | 1.7 |
-| 1920x1080 | gaming | 25.1 | 33.6 | 20.4 | 9.7 | 19.7 | 5.8 | 0.1 | 0.1 | 1.8 |
-| 2560x1440 | video | 14.2 | 52.4 | 33.7 | 14.8 | 33.0 | 9.8 | 0.1 | 0.1 | 2.6 |
-| 3840x2160 | video | 6.3 | 117.6 | 76.2 | 37.6 | 70.0 | 21.1 | 0.4 | 0.1 | 6.0 |
+| 1280x720 | office (30 cap) | 27.8 | 16.9 | 11.2 | 5.8 | 10.0 | 2.3 | 0.9 | 0.0 | 1.3 |
+| 1280x720 | video (60 cap) | 55.5 | 15.9 | 10.8 | 5.6 | 9.7 | 2.2 | 0.2 | 0.1 | 1.2 |
+| 1920x1080 | video | 25.0 | 30.6 | 20.7 | 9.6 | 19.8 | 5.7 | 0.1 | 0.1 | 1.7 |
+| 1920x1080 | gaming | 25.1 | 31.9 | 20.4 | 9.7 | 19.5 | 5.8 | 0.1 | 0.1 | 1.8 |
+| 2560x1440 | video | 14.2 | 49.3 | 33.3 | 14.9 | 33.0 | 9.8 | 0.1 | 0.1 | 2.6 |
+| 3840x2160 | video | 6.3 | 109.7 | 73.8 | 35.5 | 70.4 | 21.5 | 0.4 | 0.2 | 6.2 |
 
 The stages now *sum to the total*: e.g. 720p60 → 10.1 (host+net) + 1.1
 (decode) + 5.6 (present incl. software-canvas draw) ≈ 16.5 measured e2e —
 there is no unexplained latency left in the pipeline. The software encoder
 is 55–60 % of e2e at 720p/1080p and the software canvas paint most of the
-rest; on real hardware (NVENC ≈ 1–3 ms, GPU compositing < 1 ms) the same
-pipeline delivers single-digit e2e.
+rest. On real Windows hardware the shipped Media Foundation hardware encoder
+(NVENC/QuickSync/AMF, `encode/mf_h264.rs`) replaces the 10–70 ms software
+encode with 1–3 ms, and GPU-composited browsers paint in <1 ms — the same
+pipeline then delivers single-digit e2e at 1080p60 and carries 1440p/4K60.
 
 Column meanings: `e2e` = capture timestamp → canvas paint (synced clocks);
 `net+host` = capture → envelope arrival at the viewer; `present` = decode

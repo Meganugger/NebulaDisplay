@@ -108,6 +108,9 @@ jobs:
       - name: Run auto-reconnect E2E (host killed + restarted mid-stream)
         working-directory: viewer/web
         run: node tests/reconnect-e2e.mjs
+      - name: Quick pipeline benchmark (regression visibility, non-gating numbers)
+        working-directory: viewer/web
+        run: node tests/bench.mjs --quick
       - uses: actions/upload-artifact@v4
         if: always()
         with:
