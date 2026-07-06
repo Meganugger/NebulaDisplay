@@ -32,6 +32,21 @@ export const caps = {
   webCodecsH264: detect(
     () => typeof VideoDecoder === "function" && typeof EncodedVideoChunk === "function",
   ),
+  /**
+   * Media Source Extensions with H.264 — available on *insecure* origins
+   * (unlike WebCodecs), so plain-HTTP LAN pages can still stream real H.264
+   * through a client-side fMP4 remux instead of falling back to JPEG.
+   */
+  mseH264: detect(
+    () =>
+      typeof MediaSource === "function" &&
+      typeof MediaSource.isTypeSupported === "function" &&
+      MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01F"'),
+  ),
+  /** requestVideoFrameCallback — per-presented-frame callback on <video>. */
+  rvfc: detect(
+    () => typeof HTMLVideoElement === "function" && "requestVideoFrameCallback" in HTMLVideoElement.prototype,
+  ),
   /** Fast off-thread image decode; older iOS Safari lacks it. */
   createImageBitmap: detect(() => typeof createImageBitmap === "function"),
   /** Unified pointer events; older iOS Safari/WebViews need touch+mouse. */
@@ -90,7 +105,8 @@ export function capabilityReport(): string {
     `  crypto.randomUUID   ${mark(caps.randomUUID)}${caps.randomUUID ? "" : " (RFC4122-v4 fallback)"}`,
     `  WebCrypto subtle    ${mark(caps.subtle)}${caps.subtle ? "" : " (pure-JS crypto fallback)"}`,
     `  getRandomValues     ${mark(caps.getRandomValues)}`,
-    `  WebCodecs h264      ${mark(caps.webCodecsH264)}${caps.webCodecsH264 ? "" : " (JPEG streaming fallback)"}`,
+    `  WebCodecs h264      ${mark(caps.webCodecsH264)}${caps.webCodecsH264 ? "" : caps.mseH264 ? " (MSE h264 fallback)" : " (JPEG streaming fallback)"}`,
+    `  MSE h264            ${mark(caps.mseH264)}`,
     `  createImageBitmap   ${mark(caps.createImageBitmap)}${caps.createImageBitmap ? "" : " (<img> decode fallback)"}`,
     `  PointerEvent        ${mark(caps.pointerEvents)}${caps.pointerEvents ? "" : " (touch/mouse fallback)"}`,
     `  BigInt64 DataView   ${mark(caps.bigInt64DataView)}${caps.bigInt64DataView ? "" : " (u32-pair fallback)"}`,

@@ -1,6 +1,6 @@
 // NDSP session: connect → (pair | token reconnect) → encrypted session.
 
-import { probeH264Decode } from "./caps";
+import { caps, probeH264Decode } from "./caps";
 import {
   b64decode,
   b64encode,
@@ -228,11 +228,13 @@ export class Session {
 }
 
 async function supportedCodecs(): Promise<string[]> {
-  // JPEG decodes everywhere. H.264 requires WebCodecs (secure contexts only —
-  // never plain-HTTP LAN) AND an engine that actually accepts avc1 configs:
-  // codec-less Chromium/Electron builds expose VideoDecoder but reject H.264.
+  // JPEG decodes everywhere. H.264 works through either decoder backend:
+  // * WebCodecs (secure contexts) with a real avc1 probe — codec-less
+  //   Chromium/Electron builds expose VideoDecoder but reject H.264;
+  // * MSE + client-side fMP4 remux (works on insecure plain-HTTP LAN
+  //   origins, where WebCodecs doesn't exist at all).
   const codecs = ["jpeg"];
-  if (await probeH264Decode()) codecs.unshift("h264");
+  if ((await probeH264Decode()) || caps.mseH264) codecs.unshift("h264");
   return codecs;
 }
 

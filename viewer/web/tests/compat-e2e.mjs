@@ -179,8 +179,9 @@ async function pairThroughUi(page, name, { expectNoPinField = false } = {}) {
 }
 
 // ============================================================================
-// 2. Windows-Chromium-over-LAN: insecure context, fallback crypto, JPEG
-//    (this is the exact environment of the reported crash)
+// 2. Windows-Chromium-over-LAN: insecure context, fallback crypto, H.264
+//    via MSE/fMP4 (WebCodecs doesn't exist on insecure origins; MSE does)
+//    (this is the exact environment of the previously reported crash)
 // ============================================================================
 {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
@@ -193,9 +194,18 @@ async function pairThroughUi(page, name, { expectNoPinField = false } = {}) {
   }));
   if (env.secure || env.subtle || env.uuid || env.webcodecs)
     await fail(`insecure env not as expected (must lack subtle/uuid/webcodecs): ${JSON.stringify(env)}`);
+  const mse = await page.evaluate(
+    () =>
+      typeof MediaSource === "function" &&
+      MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01F"'),
+  );
   await pairThroughUi(page, "Windows LAN Chromium");
   const badge = await page.textContent("#server-name");
-  if (!/JPEG/i.test(badge)) await fail(`insecure: expected JPEG badge, got "${badge}"`);
+  // With MSE H.264 support the insecure page must stream real H.264 through
+  // the client-side fMP4 remux; only MSE-less engines drop to JPEG.
+  const want = mse ? /H264/i : /JPEG/i;
+  if (!want.test(badge))
+    await fail(`insecure: expected ${mse ? "H264 (MSE remux)" : "JPEG"} badge, got "${badge}"`);
   await expectStreaming(page, "insecure-lan");
 
   // deviceId must be a valid RFC4122 v4 UUID from the fallback generator.
@@ -215,7 +225,9 @@ async function pairThroughUi(page, name, { expectNoPinField = false } = {}) {
   await page.click("#connect-btn");
   await page.waitForSelector("#viewer-screen.active", { timeout: 15000 }).catch(() => fail("token reconnect failed"));
   await expectStreaming(page, "token-reconnect");
-  console.log("PASS 2/6  insecure LAN (Windows-Chromium case): fallback crypto pairs, streams JPEG, token reconnect OK");
+  console.log(
+    `PASS 2/6  insecure LAN (Windows-Chromium case): fallback crypto pairs, streams ${mse ? "H.264 via MSE/fMP4" : "JPEG"}, token reconnect OK`,
+  );
   await page.close();
 }
 

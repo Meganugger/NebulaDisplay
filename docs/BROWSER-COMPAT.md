@@ -11,10 +11,17 @@ engines, including current Windows Chromium, iOS Safari and Android Chrome:
 |---|---|---|
 | `crypto.randomUUID` | **absent** | RFC4122-v4 generator from `crypto.getRandomValues` (`src/caps.ts`) |
 | `crypto.subtle` (WebCrypto) | **absent** | audited pure-JS backend: `@noble/curves` (ECDH P-256), `@noble/hashes` (HKDF/SHA-256), `@noble/ciphers` (AES-256-GCM) — byte-compatible with the Rust host (`src/cryptobox.ts`) |
-| WebCodecs (`VideoDecoder`) | **absent** | JPEG streaming path (negotiated in the `hello`) |
+| WebCodecs (`VideoDecoder`) | **absent** | **H.264 via MSE**: Media Source Extensions *are* available on insecure origins, so the viewer remuxes the host's Annex-B H.264 into single-frame fMP4 fragments client-side (`src/fmp4.ts`) and plays them through a hidden `<video>` + `requestVideoFrameCallback` → canvas (`MseSink` in `src/decoder.ts`). JPEG remains the final fallback for MSE-less engines. |
 
 This is why the viewer historically "crashed before the pairing handshake" on
 real devices while passing `localhost` tests: `localhost` is a secure context.
+
+Decoder selection order for H.264: WebCodecs (secure contexts, lowest
+latency, real per-frame decode timing) → MSE/fMP4 (insecure contexts; one
+frame per fragment + live-edge chasing keeps added latency to roughly one
+frame) → JPEG (universal). Negotiated per session in the `hello`; verified
+end-to-end by compat-E2E scenario 2, which streams real H.264 on an insecure
+LAN origin.
 
 The only paths to native crypto/WebCodecs over LAN are HTTPS with a
 user-trusted certificate or a packaged (native/Electron) viewer — both remain

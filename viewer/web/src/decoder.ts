@@ -20,6 +20,7 @@
 // createImageBitmap, for which we decode through an <img> element instead.
 
 import { caps } from "./caps";
+import { Fmp4Muxer } from "./fmp4";
 import { VideoFrame as NdspFrame } from "./protocol";
 
 export interface DecoderStats {
@@ -141,6 +142,42 @@ export class Renderer {
 
   private h264ErrorStreak = 0;
 
+  // ---- MSE H.264 path (insecure contexts: no WebCodecs, MSE works) --------
+  private mse: MseSink | null = null;
+
+  private pushH264ViaMse(frame: NdspFrame): void {
+    if (!this.mse) {
+      this.mse = new MseSink(
+        (video, tsUs) => this.onMseFrame(video, tsUs),
+        (e) => this.onError?.(e),
+        () => this.requestKeyframe?.(),
+      );
+    }
+    if (!this.sawKeyframe) {
+      if (!frame.keyframe) {
+        this.stats.framesDropped++;
+        this.requestKeyframe?.();
+        return;
+      }
+      this.sawKeyframe = true;
+    }
+    const t0 = performance.now();
+    this.mse.push(frame);
+    this.stats.queueDepth = this.mse.queueDepth;
+    // MSE decode time isn't observable per frame; charge the mux+append.
+    this.decodeSample(performance.now() - t0);
+  }
+
+  private onMseFrame(video: HTMLVideoElement, tsUs: bigint): void {
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (w === 0 || h === 0) return;
+    this.fit(w, h);
+    this.ctx.drawImage(video, 0, 0, w, h);
+    this.stats.lastPresentedTsUs = tsUs;
+    this.tickFps();
+  }
+
   private ensureH264(): VideoDecoder {
     if (this.h264 && this.h264.state !== "closed") return this.h264;
     this.h264 = new VideoDecoder({
@@ -166,9 +203,13 @@ export class Renderer {
 
   private pushH264(frame: NdspFrame): void {
     if (!caps.webCodecsH264) {
-      // Defensive: the client never advertises h264 without WebCodecs, so a
+      if (caps.mseH264) {
+        this.pushH264ViaMse(frame);
+        return;
+      }
+      // Defensive: the client never advertises h264 without a decoder, so a
       // misbehaving host is the only way here — fail clearly, don't crash.
-      this.onError?.(new Error("received h264 but WebCodecs is unavailable in this context"));
+      this.onError?.(new Error("received h264 but no H.264 decoder in this context"));
       return;
     }
     const dec = this.ensureH264();
@@ -303,5 +344,183 @@ export class Renderer {
       this.latest = null;
     }
     if (this.h264 && this.h264.state !== "closed") this.h264.close();
+    this.mse?.destroy();
+    this.mse = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MSE sink: hidden <video> + MediaSource fed single-frame fMP4 fragments.
+// ---------------------------------------------------------------------------
+
+/** SourceBuffer backlog beyond which we resync via keyframe. */
+const MSE_MAX_QUEUE = 8;
+/** Chase threshold: how far behind live playback may drift (seconds). */
+const MSE_MAX_BEHIND_S = 0.12;
+
+class MseSink {
+  private video: HTMLVideoElement;
+  private muxer = new Fmp4Muxer();
+  private ms: MediaSource | null = null;
+  private sb: SourceBuffer | null = null;
+  private appendQueue: Uint8Array[] = [];
+  private opened = false;
+  private skipUntilKeyframe = false;
+  private destroyed = false;
+  /** capture timestamps of frames in flight, matched FIFO on presentation. */
+  private tsFifo: bigint[] = [];
+  private rvfcId = 0;
+  private rafId = 0;
+
+  constructor(
+    private onFrame: (video: HTMLVideoElement, tsUs: bigint) => void,
+    private onError: (e: Error) => void,
+    private requestKeyframe: () => void,
+  ) {
+    const v = document.createElement("video");
+    v.muted = true;
+    v.autoplay = true;
+    v.playsInline = true;
+    // Kept off-DOM: we only sample it into the canvas.
+    v.style.display = "none";
+    document.body.appendChild(v);
+    this.video = v;
+    this.schedulePresent();
+  }
+
+  get queueDepth(): number {
+    return this.appendQueue.length + this.tsFifo.length;
+  }
+
+  push(frame: NdspFrame): void {
+    if (this.skipUntilKeyframe) {
+      if (!frame.keyframe) {
+        this.requestKeyframe();
+        return;
+      }
+      this.skipUntilKeyframe = false;
+    }
+    if (this.appendQueue.length > MSE_MAX_QUEUE) {
+      // SourceBuffer can't keep up — drop until the next keyframe.
+      this.skipUntilKeyframe = true;
+      this.appendQueue = [];
+      this.tsFifo = [];
+      this.requestKeyframe();
+      return;
+    }
+    const segments = this.muxer.push(
+      frame.payload,
+      frame.keyframe,
+      frame.timestampUs,
+      frame.width,
+      frame.height,
+    );
+    if (!segments) return;
+    if (!this.ms) this.openMediaSource();
+    this.tsFifo.push(frame.timestampUs);
+    if (this.tsFifo.length > 240) this.tsFifo.shift();
+    for (const seg of segments) this.appendQueue.push(seg);
+    this.pump();
+  }
+
+  private openMediaSource(): void {
+    const ms = new MediaSource();
+    this.ms = ms;
+    this.video.src = URL.createObjectURL(ms);
+    ms.addEventListener("sourceopen", () => {
+      if (this.destroyed) return;
+      try {
+        const sb = ms.addSourceBuffer(this.muxer.codecString());
+        sb.mode = "segments";
+        sb.addEventListener("updateend", () => this.pump());
+        sb.addEventListener("error", () => this.onError(new Error("MSE SourceBuffer error")));
+        this.sb = sb;
+        this.opened = true;
+        this.pump();
+        void this.video.play().catch(() => {
+          /* autoplay policies don't apply to muted video, but be safe */
+        });
+      } catch (e) {
+        this.onError(e as Error);
+      }
+    });
+  }
+
+  private pump(): void {
+    const sb = this.sb;
+    if (!sb || !this.opened || sb.updating || this.destroyed) return;
+    const seg = this.appendQueue.shift();
+    if (!seg) return;
+    try {
+      sb.appendBuffer(seg.slice().buffer as ArrayBuffer);
+    } catch (e) {
+      // QuotaExceeded or state error: trim old buffer + resync.
+      try {
+        const buffered = sb.buffered;
+        if (buffered.length > 0) {
+          sb.remove(0, Math.max(0, this.video.currentTime - 1));
+        }
+      } catch {
+        /* ignore */
+      }
+      this.skipUntilKeyframe = true;
+      this.appendQueue = [];
+      this.requestKeyframe();
+      void e;
+    }
+  }
+
+  /** Paint per presented frame; chase the live edge to bound latency. */
+  private schedulePresent(): void {
+    const step = (): void => {
+      if (this.destroyed) return;
+      const v = this.video;
+      // Live-edge chase: if playback drifted behind the buffered end (tab
+      // was hidden, decoder hiccup), jump close to the newest frame.
+      try {
+        const buffered = v.buffered;
+        if (buffered.length > 0) {
+          const end = buffered.end(buffered.length - 1);
+          if (end - v.currentTime > MSE_MAX_BEHIND_S) {
+            v.currentTime = Math.max(0, end - 0.01);
+            // Frames between old and new position were skipped: keep only
+            // the newest capture timestamp so latency stays honestly matched.
+            if (this.tsFifo.length > 1) this.tsFifo.splice(0, this.tsFifo.length - 1);
+          }
+        }
+      } catch {
+        /* buffered can throw during teardown */
+      }
+      if (v.readyState >= 2 && v.videoWidth > 0) {
+        const ts = this.tsFifo.shift() ?? 0n;
+        this.onFrame(v, ts);
+      }
+      this.scheduleNext(step);
+    };
+    this.scheduleNext(step);
+  }
+
+  private scheduleNext(step: () => void): void {
+    if (caps.rvfc) {
+      this.rvfcId = this.video.requestVideoFrameCallback(() => step());
+    } else {
+      this.rafId = requestAnimationFrame(() => step());
+    }
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+    if (caps.rvfc && this.rvfcId) this.video.cancelVideoFrameCallback(this.rvfcId);
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    try {
+      this.video.pause();
+      this.video.removeAttribute("src");
+      this.video.load();
+    } catch {
+      /* ignore */
+    }
+    this.video.remove();
+    this.ms = null;
+    this.sb = null;
   }
 }

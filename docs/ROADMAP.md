@@ -17,6 +17,8 @@ color conversion), dedicated low-latency cursor channel with client overlay
 + automatic composited fallback, per-stage latency instrumentation
 (capture age / convert / encode / seal+send / arrival / decode / present),
 zero-copy in-place envelope seal, immediate-paint web presentation,
+MSE/fMP4 H.264 for insecure-context browsers (replacing JPEG),
+hardware H.264 encoding via Media Foundation (NVENC/QuickSync/AMF),
 DXGI cursor-only readback skip, profile-switch re-baselining,
 QueryDisplayConfig extend-mode input mapping, multi-monitor & multi-GPU &
 HDR-capable IddCx driver with CI syntax gate, reproducible benchmark
