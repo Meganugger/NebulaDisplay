@@ -259,6 +259,7 @@ pub fn default_client_info(name: &str, platform: &str) -> ClientInfo {
         name: name.to_string(),
         platform: platform.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
+        features: Vec::new(),
     }
 }
 

@@ -46,14 +46,22 @@ fn codec_from_u8(v: u8) -> Result<Codec> {
 }
 
 impl VideoFrame {
+    /// Just the fixed header — lets the hot path seal `header || payload`
+    /// without materializing the concatenation (see `Sealer::seal_parts`).
+    pub fn header(&self) -> [u8; HEADER_LEN] {
+        let mut h = [0u8; HEADER_LEN];
+        h[0] = codec_to_u8(self.codec);
+        h[1] = if self.keyframe { FLAG_KEYFRAME } else { 0 };
+        h[2..6].copy_from_slice(&self.seq.to_be_bytes());
+        h[6..14].copy_from_slice(&self.timestamp_us.to_be_bytes());
+        h[14..16].copy_from_slice(&self.width.to_be_bytes());
+        h[16..18].copy_from_slice(&self.height.to_be_bytes());
+        h
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
-        out.push(codec_to_u8(self.codec));
-        out.push(if self.keyframe { FLAG_KEYFRAME } else { 0 });
-        out.extend_from_slice(&self.seq.to_be_bytes());
-        out.extend_from_slice(&self.timestamp_us.to_be_bytes());
-        out.extend_from_slice(&self.width.to_be_bytes());
-        out.extend_from_slice(&self.height.to_be_bytes());
+        out.extend_from_slice(&self.header());
         out.extend_from_slice(&self.payload);
         out
     }

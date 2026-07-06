@@ -28,6 +28,8 @@ export interface ViewerStats {
   frames_dropped: number;
   rtt_ms: number;
   e2e_latency_ms: number;
+  net_ms_avg: number;
+  present_wait_ms_avg: number;
 }
 
 export interface HostStats {
@@ -38,6 +40,9 @@ export interface HostStats {
   frames_sent: number;
   frames_skipped: number;
   clients: number;
+  capture_age_ms_avg: number;
+  convert_ms_avg: number;
+  seal_send_ms_avg: number;
 }
 
 export type TouchPhase = "start" | "move" | "end" | "cancel";

@@ -78,6 +78,7 @@ async fn session_loop(
         name: args.name.clone(),
         platform: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
+        features: Vec::new(),
     };
 
     set_status(shared, proxy, format!("connecting to {host_key}…"));

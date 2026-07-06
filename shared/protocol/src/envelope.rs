@@ -74,24 +74,32 @@ impl Sealer {
     }
 
     pub fn seal(&mut self, chan: Channel, plaintext: &[u8]) -> Vec<u8> {
+        self.seal_parts(chan, &[plaintext])
+    }
+
+    /// Seal a plaintext given as multiple concatenated parts (e.g. a frame
+    /// header + payload) **in place**: one output allocation, one copy of
+    /// each part, and in-buffer AES-GCM. Wire format is byte-identical to
+    /// [`Sealer::seal`]. This is the video hot path — the naive compose →
+    /// encrypt → frame pipeline cost two extra full-frame copies per frame.
+    pub fn seal_parts(&mut self, chan: Channel, parts: &[&[u8]]) -> Vec<u8> {
+        use aes_gcm::aead::AeadInPlace;
         let idx = chan as usize;
         let counter = self.counters[idx];
         self.counters[idx] = counter.checked_add(1).expect("envelope counter overflow");
         let nonce = nonce_for(self.dir, chan, counter);
-        let ct = self
-            .cipher
-            .encrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &[chan as u8],
-                },
-            )
-            .expect("AES-GCM encryption is infallible for valid inputs");
-        let mut out = Vec::with_capacity(9 + ct.len());
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut out = Vec::with_capacity(9 + total + 16);
         out.push(chan as u8);
         out.extend_from_slice(&counter.to_be_bytes());
-        out.extend_from_slice(&ct);
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(&Nonce::from(nonce), &[chan as u8], &mut out[9..])
+            .expect("AES-GCM encryption is infallible for valid inputs");
+        out.extend_from_slice(&tag);
         out
     }
 }
@@ -156,6 +164,21 @@ mod tests {
         }
         let env = s.seal(Channel::Control, b"{}");
         assert_eq!(o.open(&env).unwrap().0, Channel::Control);
+    }
+
+    #[test]
+    fn seal_parts_matches_seal_wire_format() {
+        let key = [7u8; 32];
+        let mut s1 = Sealer::new(&key, Direction::ServerToClient);
+        let mut s2 = Sealer::new(&key, Direction::ServerToClient);
+        let mut o = Opener::new(&key, Direction::ServerToClient);
+        let header = [1u8, 2, 3];
+        let payload = vec![9u8; 500];
+        let joined: Vec<u8> = header.iter().chain(payload.iter()).copied().collect();
+        let a = s1.seal(Channel::Video, &joined);
+        let b = s2.seal_parts(Channel::Video, &[&header, &payload]);
+        assert_eq!(a, b, "in-place seal must be byte-identical");
+        assert_eq!(o.open(&b).unwrap().1, joined);
     }
 
     #[test]

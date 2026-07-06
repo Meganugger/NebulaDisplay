@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 /// Last known mouse-pointer state; duplication frames never include the
-/// cursor, so we composite it into the BGRA buffer ourselves.
+/// cursor. Depending on the client mix it is either composited into the
+/// BGRA buffer (legacy clients) or forwarded through the dedicated cursor
+/// channel (see `FrameSource::cursor`).
 #[derive(Default)]
 struct PointerState {
     visible: bool,
@@ -33,6 +35,10 @@ struct PointerState {
     y: i32,
     shape: Vec<u8>,
     shape_info: Option<DXGI_OUTDUPL_POINTER_SHAPE_INFO>,
+    /// Position/visibility changed since the last `cursor()` poll.
+    moved: bool,
+    /// Shape changed since the last `cursor()` poll.
+    shape_changed: bool,
 }
 
 use super::FrameSource;
@@ -48,6 +54,8 @@ pub struct DxgiDuplicationSource {
     /// Captured output's rect in desktop coordinates (multi-monitor input mapping).
     desktop_rect: (i32, i32, i32, i32),
     pointer: PointerState,
+    /// Blend the cursor into frames (true while any legacy client needs it).
+    composite_cursor: bool,
 }
 
 // SAFETY: the source is owned by a single capture thread for its entire
@@ -102,6 +110,7 @@ impl DxgiDuplicationSource {
                     desc.DesktopCoordinates.bottom,
                 ),
                 pointer: PointerState::default(),
+                composite_cursor: true,
             };
             src.recreate_duplication()?;
             Ok(src)
@@ -201,6 +210,7 @@ impl FrameSource for DxgiDuplicationSource {
                 self.pointer.visible = info.PointerPosition.Visible.as_bool();
                 self.pointer.x = info.PointerPosition.Position.x;
                 self.pointer.y = info.PointerPosition.Position.y;
+                self.pointer.moved = true;
             }
             if info.PointerShapeBufferSize > 0 {
                 self.pointer
@@ -218,6 +228,7 @@ impl FrameSource for DxgiDuplicationSource {
                     .is_ok()
                 {
                     self.pointer.shape_info = Some(shape_info);
+                    self.pointer.shape_changed = true;
                 }
             }
             let result = (|| -> anyhow::Result<bool> {
@@ -247,15 +258,119 @@ impl FrameSource for DxgiDuplicationSource {
                 Ok(true)
             })();
             let _ = dup.ReleaseFrame();
-            if matches!(result, Ok(true)) {
+            if matches!(result, Ok(true)) && self.composite_cursor {
                 self.composite_pointer(out);
             }
             result
         }
     }
+
+    fn cursor(&mut self) -> Option<super::CursorUpdate> {
+        if !self.pointer.moved && !self.pointer.shape_changed {
+            return None;
+        }
+        let shape = if self.pointer.shape_changed {
+            self.pointer.shape_changed = false;
+            self.shape_as_rgba().map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        self.pointer.moved = false;
+        let w = (self.desktop_rect.2 - self.desktop_rect.0).max(1) as f32;
+        let h = (self.desktop_rect.3 - self.desktop_rect.1).max(1) as f32;
+        Some(super::CursorUpdate {
+            // DXGI pointer position is already relative to this output.
+            x: (self.pointer.x as f32 / w).clamp(0.0, 1.0),
+            y: (self.pointer.y as f32 / h).clamp(0.0, 1.0),
+            visible: self.pointer.visible,
+            shape,
+        })
+    }
+
+    fn set_composite_cursor(&mut self, on: bool) {
+        self.composite_cursor = on;
+    }
 }
 
 impl DxgiDuplicationSource {
+    /// Convert the last captured DXGI pointer shape to straight RGBA8 for
+    /// the cursor channel. Monochrome and masked-color shapes XOR against
+    /// screen content, which a client-side overlay cannot reproduce exactly;
+    /// the standard approximation (white where inverted) is used — identical
+    /// to what other remote-desktop stacks ship.
+    fn shape_as_rgba(&self) -> Option<crate::state::CursorShapeData> {
+        let si = self.pointer.shape_info?;
+        let pitch = si.Pitch as usize;
+        let sw = si.Width as usize;
+        let mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32;
+        let sh = if mono {
+            si.Height as usize / 2
+        } else {
+            si.Height as usize
+        };
+        let shape = &self.pointer.shape;
+        let mut rgba = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let di = (y * sw + x) * 4;
+                if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+                    let s = y * pitch + x * 4;
+                    if s + 4 > shape.len() {
+                        continue;
+                    }
+                    rgba[di] = shape[s + 2]; // R (BGRA → RGBA)
+                    rgba[di + 1] = shape[s + 1];
+                    rgba[di + 2] = shape[s];
+                    rgba[di + 3] = shape[s + 3];
+                } else if mono {
+                    let byte = y * pitch + x / 8;
+                    let bit = 7 - (x % 8);
+                    let and_b = shape.get(byte).map_or(1, |b| (b >> bit) & 1);
+                    let xor_b = shape.get(byte + sh * pitch).map_or(0, |b| (b >> bit) & 1);
+                    // AND=0 → opaque (XOR selects black/white); AND=1,XOR=1 →
+                    // screen-invert, approximated as opaque white.
+                    if and_b == 0 {
+                        let c = if xor_b == 1 { 255 } else { 0 };
+                        rgba[di] = c;
+                        rgba[di + 1] = c;
+                        rgba[di + 2] = c;
+                        rgba[di + 3] = 255;
+                    } else if xor_b == 1 {
+                        rgba[di] = 255;
+                        rgba[di + 1] = 255;
+                        rgba[di + 2] = 255;
+                        rgba[di + 3] = 255;
+                    }
+                } else if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
+                    let s = y * pitch + x * 4;
+                    if s + 4 > shape.len() {
+                        continue;
+                    }
+                    let mask = shape[s + 3];
+                    if mask == 0 {
+                        rgba[di] = shape[s + 2];
+                        rgba[di + 1] = shape[s + 1];
+                        rgba[di + 2] = shape[s];
+                        rgba[di + 3] = 255;
+                    } else {
+                        // XOR region — approximate as opaque white.
+                        rgba[di] = 255;
+                        rgba[di + 1] = 255;
+                        rgba[di + 2] = 255;
+                        rgba[di + 3] = 255;
+                    }
+                }
+            }
+        }
+        Some(crate::state::CursorShapeData {
+            width: sw as u16,
+            height: sh as u16,
+            hot_x: si.HotSpot.x.max(0) as u16,
+            hot_y: si.HotSpot.y.max(0) as u16,
+            rgba,
+        })
+    }
+
     /// Blend the last known cursor shape into the BGRA frame at its current
     /// position. Handles the three DXGI shape types.
     fn composite_pointer(&self, out: &mut [u8]) {

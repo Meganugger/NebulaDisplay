@@ -93,6 +93,9 @@ export class Session {
         name: clientName,
         platform: "web",
         app_version: "0.2.0",
+        // This viewer renders the host cursor from the dedicated cursor
+        // channel (CursorShape/CursorPos) — never baked into video frames.
+        features: ["cursor"],
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
       codecs: await supportedCodecs(),

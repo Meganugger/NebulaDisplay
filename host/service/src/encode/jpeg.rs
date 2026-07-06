@@ -5,14 +5,18 @@
 use jpeg_encoder::{ColorType, Encoder as JEncoder};
 use ndsp_protocol::messages::Codec;
 
+use super::dirty::DirtyTracker;
 use super::{Encoded, Encoder};
 use crate::state::CapturedFrame;
 
-pub struct JpegEncoder;
+#[derive(Default)]
+pub struct JpegEncoder {
+    dirty: DirtyTracker,
+}
 
 impl JpegEncoder {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     /// Map a bitrate budget to JPEG quality for a given frame rate/size.
@@ -39,6 +43,17 @@ impl Encoder for JpegEncoder {
         let (w, h) = (frame.width as usize, frame.height as usize);
         anyhow::ensure!(frame.bgra.len() == w * h * 4, "frame buffer size mismatch");
 
+        // Static-frame elision: identical frame → send nothing. (JPEG frames
+        // are self-contained, so there is no keyframe obligation either.)
+        if self.dirty.update(&frame.bgra, w, h).is_static() {
+            return Ok(Encoded {
+                payload: Vec::new(),
+                keyframe: false,
+                codec: Codec::Jpeg,
+                convert_us: 0,
+            });
+        }
+
         let quality = self.quality_for(frame, target_bitrate_kbps, fps_hint);
         // Encode straight from BGRA (the encoder ignores alpha) — no swizzle
         // pass, no RGB scratch buffer, one less full-frame copy per frame.
@@ -54,6 +69,7 @@ impl Encoder for JpegEncoder {
             payload: out,
             keyframe: true,
             codec: Codec::Jpeg,
+            convert_us: 0, // encodes straight from BGRA — no conversion pass
         })
     }
 }

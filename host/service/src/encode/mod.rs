@@ -8,6 +8,7 @@
 //! Hardware encoders (Media Foundation → NVENC/QuickSync/AMF) plug in behind
 //! the same trait; see `docs/ROADMAP.md`.
 
+mod dirty;
 #[cfg(feature = "h264")]
 mod h264;
 mod jpeg;
@@ -20,6 +21,9 @@ pub struct Encoded {
     pub payload: Vec<u8>,
     pub keyframe: bool,
     pub codec: Codec,
+    /// Input color-conversion share of the encode time (µs) — instrumentation
+    /// for the per-stage latency breakdown. 0 when no conversion happened.
+    pub convert_us: u32,
 }
 
 pub trait Encoder: Send {
@@ -72,6 +76,40 @@ mod tests {
         assert!(out.keyframe);
         assert!(out.payload.len() > 500, "suspiciously small JPEG");
         assert_eq!(&out.payload[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+    }
+
+    #[test]
+    fn jpeg_static_frame_elided() {
+        let mut enc = create(Codec::Jpeg).unwrap();
+        let f = frame(320, 240);
+        let out = enc.encode(&f, true, 4000, 30).unwrap();
+        assert!(!out.payload.is_empty());
+        // Identical frame again → elided entirely.
+        let out2 = enc.encode(&f, false, 4000, 30).unwrap();
+        assert!(out2.payload.is_empty(), "static frame must not be re-encoded");
+        // A changed frame resumes the stream.
+        let mut f3 = frame(320, 240);
+        f3.bgra[0] ^= 0xFF;
+        let out3 = enc.encode(&f3, false, 4000, 30).unwrap();
+        assert!(!out3.payload.is_empty());
+    }
+
+    #[cfg(feature = "h264")]
+    #[test]
+    fn h264_static_frame_elided_but_keyframe_still_served() {
+        let mut enc = create(Codec::H264).unwrap();
+        let f = frame(320, 240);
+        enc.encode(&f, false, 4000, 30).unwrap(); // IDR
+        enc.encode(&f, false, 4000, 30).unwrap(); // post-init tune IDR
+        // Static frames elided.
+        for _ in 0..3 {
+            let out = enc.encode(&f, false, 4000, 30).unwrap();
+            assert!(out.payload.is_empty(), "static frames must be elided");
+        }
+        // ...but an explicit keyframe request must still produce an IDR
+        // (decoder resync after loss cannot wait for screen activity).
+        let out = enc.encode(&f, true, 4000, 30).unwrap();
+        assert!(out.keyframe && !out.payload.is_empty());
     }
 
     #[cfg(feature = "h264")]

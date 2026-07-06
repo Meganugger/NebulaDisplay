@@ -31,6 +31,30 @@ const MOVE_FLUSH_MS = 4;
  * content* inside an `object-fit: contain` element. Pure function (unit
  * tested in tests/web-compat.mjs).
  */
+/**
+ * The displayed content box (screen pixels) of an `object-fit: contain`
+ * element: where the video actually is, inside the letterboxing.
+ */
+export function contentBox(
+  rect: { left: number; top: number; width: number; height: number },
+  contentW: number,
+  contentH: number,
+): { left: number; top: number; width: number; height: number; scale: number } {
+  if (contentW <= 0 || contentH <= 0 || rect.width <= 0 || rect.height <= 0) {
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, scale: 1 };
+  }
+  const scale = Math.min(rect.width / contentW, rect.height / contentH);
+  const width = contentW * scale;
+  const height = contentH * scale;
+  return {
+    left: rect.left + (rect.width - width) / 2,
+    top: rect.top + (rect.height - height) / 2,
+    width,
+    height,
+    scale,
+  };
+}
+
 export function mapToContent(
   rect: { left: number; top: number; width: number; height: number },
   contentW: number,

@@ -1,11 +1,16 @@
 // Video decoding: WebCodecs H.264 (Annex B) with JPEG fallback.
 // Renders into a canvas; tracks decode timing + queue depth for stats.
 //
-// Presentation model — "latest frame wins":
-// * Decoded frames land in a single `latest` slot (replacing — and closing —
-//   any undisplayed predecessor) and are painted once per animation frame.
-//   The viewer therefore never shows an outdated frame, never paints more
-//   than the display can show, and a hidden tab simply parks one frame.
+// Presentation model — "paint immediately, latest frame wins":
+// * A decoded frame is painted the moment it exists. The canvas uses
+//   `desynchronized: true`, so on supporting compositors the paint bypasses
+//   the compositor queue entirely; elsewhere it is picked up by the next
+//   compositor deadline — never *later* than a rAF-scheduled paint, and up to
+//   a full display frame earlier (the old model parked frames in a slot and
+//   painted once per requestAnimationFrame, adding 0–16.7 ms of queueing and
+//   stalling completely when rAF throttles in background tabs).
+// * If decode output ever outpaces paint (JPEG decode bursts), the single
+//   `latest` slot still guarantees only the newest frame is painted.
 // * H.264 overload never drops *delta* frames silently (that corrupts every
 //   frame until the next IDR — a v0.2 bug). Instead the feeder enters a
 //   skip-until-keyframe state and asks the host for a fresh IDR.
@@ -25,15 +30,17 @@ export interface DecoderStats {
   /** capture-timestamp of the most recently presented frame (µs, host clock) */
   lastPresentedTsUs: bigint;
   lastPresentedAtMs: number;
+  /** decode-completion → paint delay EMA, ms (presentation scheduling). */
+  presentWaitMsAvg: number;
 }
 
 /** Decoder queue depth beyond which we resync via keyframe instead of queueing. */
 const MAX_DECODE_QUEUE = 8;
 
 type Presentable =
-  | { kind: "vf"; frame: VideoFrame; tsUs: bigint }
-  | { kind: "bmp"; frame: ImageBitmap; tsUs: bigint }
-  | { kind: "img"; frame: HTMLImageElement; tsUs: bigint };
+  | { kind: "vf"; frame: VideoFrame; tsUs: bigint; readyAt: number }
+  | { kind: "bmp"; frame: ImageBitmap; tsUs: bigint; readyAt: number }
+  | { kind: "img"; frame: HTMLImageElement; tsUs: bigint; readyAt: number };
 
 export class Renderer {
   private ctx: CanvasRenderingContext2D;
@@ -47,7 +54,7 @@ export class Renderer {
   private jpegPending: NdspFrame | null = null;
   // --- latest-frame presentation ---
   private latest: Presentable | null = null;
-  private rafId = 0;
+  private paintScheduled = false;
   private destroyed = false;
   stats: DecoderStats = {
     fpsDecoded: 0,
@@ -56,6 +63,7 @@ export class Renderer {
     framesDropped: 0,
     lastPresentedTsUs: 0n,
     lastPresentedAtMs: 0,
+    presentWaitMsAvg: 0,
   };
   onError: ((e: Error) => void) | null = null;
   /** Ask the host for a keyframe (set by the app; called on decode errors). */
@@ -68,12 +76,6 @@ export class Renderer {
     const ctx = canvas.getContext("2d", { desynchronized: true });
     if (!ctx) throw new Error("2d canvas context unavailable");
     this.ctx = ctx;
-    const paint = () => {
-      if (this.destroyed) return;
-      this.paintLatest();
-      this.rafId = requestAnimationFrame(paint);
-    };
-    this.rafId = requestAnimationFrame(paint);
   }
 
   async push(frame: NdspFrame): Promise<void> {
@@ -86,13 +88,24 @@ export class Renderer {
     }
   }
 
-  /** Replace the undisplayed frame (if any) with a newer one. */
+  /**
+   * Present a frame. Painted synchronously right here — the microtask defer
+   * exists only to coalesce decode-output bursts (a queued decoder draining
+   * several frames in one task) down to a single paint of the newest one.
+   */
   private setLatest(p: Presentable): void {
     if (this.latest) {
       this.closePresentable(this.latest);
       this.stats.framesDropped++;
     }
     this.latest = p;
+    if (!this.paintScheduled) {
+      this.paintScheduled = true;
+      queueMicrotask(() => {
+        this.paintScheduled = false;
+        if (!this.destroyed) this.paintLatest();
+      });
+    }
   }
 
   private closePresentable(p: Presentable): void {
@@ -120,6 +133,9 @@ export class Renderer {
     this.ctx.drawImage(p.frame, 0, 0, this.canvas.width, this.canvas.height);
     this.closePresentable(p);
     this.stats.lastPresentedTsUs = p.tsUs;
+    const wait = performance.now() - p.readyAt;
+    this.stats.presentWaitMsAvg =
+      this.stats.presentWaitMsAvg === 0 ? wait : this.stats.presentWaitMsAvg * 0.9 + wait * 0.1;
     this.tickFps();
   }
 
@@ -204,7 +220,7 @@ export class Renderer {
       this.pendingTs = this.pendingTs.filter((p) => p !== match);
     }
     if (this.h264) this.stats.queueDepth = this.h264.decodeQueueSize;
-    this.setLatest({ kind: "vf", frame: vf, tsUs });
+    this.setLatest({ kind: "vf", frame: vf, tsUs, readyAt: performance.now() });
   }
 
   private async pushJpeg(frame: NdspFrame): Promise<void> {
@@ -223,12 +239,12 @@ export class Renderer {
       if (caps.createImageBitmap) {
         const bmp = await createImageBitmap(blob);
         this.decodeSample(performance.now() - t0);
-        this.setLatest({ kind: "bmp", frame: bmp, tsUs: frame.timestampUs });
+        this.setLatest({ kind: "bmp", frame: bmp, tsUs: frame.timestampUs, readyAt: performance.now() });
       } else {
         // Older iOS Safari / WebViews: decode through an <img> element.
         const img = await this.decodeViaImage(blob);
         this.decodeSample(performance.now() - t0);
-        this.setLatest({ kind: "img", frame: img, tsUs: frame.timestampUs });
+        this.setLatest({ kind: "img", frame: img, tsUs: frame.timestampUs, readyAt: performance.now() });
       }
     } catch (e) {
       this.onError?.(e as Error);
@@ -282,7 +298,6 @@ export class Renderer {
 
   destroy(): void {
     this.destroyed = true;
-    cancelAnimationFrame(this.rafId);
     if (this.latest) {
       this.closePresentable(this.latest);
       this.latest = null;

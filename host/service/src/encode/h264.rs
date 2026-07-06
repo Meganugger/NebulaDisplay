@@ -20,6 +20,7 @@ use openh264::encoder::{
 use openh264::formats::YUVSource;
 use openh264::OpenH264API;
 
+use super::dirty::{DirtyMap, DirtyTracker};
 use super::{Encoded, Encoder};
 use crate::state::CapturedFrame;
 
@@ -39,6 +40,9 @@ pub struct H264Encoder {
     /// state should be 0 — rebuilds only happen on resolution change or if a
     /// runtime rate update is rejected (which the ceiling lift prevents).
     pub rebuilds: u64,
+    /// Row-pair frame diffing: powers static-frame elision and partial
+    /// color conversion (see `encode::dirty`).
+    dirty: DirtyTracker,
 }
 
 /// Plain I420 planes implementing openh264's `YUVSource` so we can feed the
@@ -86,7 +90,12 @@ impl I420Buffer {
     /// this direct path changes no colors). Processes 2×2 blocks through
     /// slice iterators so each source pixel is read exactly once and the
     /// inner loop stays bounds-check free.
-    fn fill_from_bgra(&mut self, bgra: &[u8], w: usize, h: usize) {
+    ///
+    /// `dirty` (when given) limits conversion to changed row pairs — the
+    /// untouched YUV regions are still valid from the previous frame. This
+    /// makes conversion cost proportional to on-screen change (cursor-only /
+    /// text-editing workloads convert almost nothing).
+    fn fill_from_bgra(&mut self, bgra: &[u8], w: usize, h: usize, dirty: Option<&DirtyMap>) {
         self.ensure(w, h);
         debug_assert_eq!(bgra.len(), w * h * 4);
         let half_w = w / 2;
@@ -99,7 +108,14 @@ impl I420Buffer {
         let y_pairs = self.y.chunks_exact_mut(w * 2);
         let u_rows = self.u.chunks_exact_mut(half_w);
         let v_rows = self.v.chunks_exact_mut(half_w);
-        for (((src2, y2), u_row), v_row) in src_pairs.zip(y_pairs).zip(u_rows).zip(v_rows) {
+        for (i, (((src2, y2), u_row), v_row)) in
+            src_pairs.zip(y_pairs).zip(u_rows).zip(v_rows).enumerate()
+        {
+            if let Some(d) = dirty {
+                if !d.pairs.get(i).copied().unwrap_or(true) {
+                    continue; // row pair unchanged — YUV already correct
+                }
+            }
             let (src0, src1) = src2.split_at(row);
             let (y0, y1) = y2.split_at_mut(w);
             let it = src0
@@ -174,6 +190,7 @@ impl H264Encoder {
             last_rebuild: std::time::Instant::now(),
             ceiling_lifted: false,
             rebuilds: 0,
+            dirty: DirtyTracker::default(),
         })
     }
 
@@ -325,12 +342,28 @@ impl Encoder for H264Encoder {
         }
         self.apply_targets(target_bitrate_kbps, fps_hint)?;
 
-        if force_keyframe || self.force_key_next {
+        let want_key = force_keyframe || self.force_key_next;
+        let t_conv = std::time::Instant::now();
+        let dirty = self.dirty.update(&frame.bgra, w, h);
+        // Static-frame elision: nothing changed and no keyframe owed →
+        // nothing to encode, nothing to send (decoders hold the last frame).
+        if dirty.is_static() && !want_key {
+            return Ok(Encoded {
+                payload: Vec::new(),
+                keyframe: false,
+                codec: Codec::H264,
+                convert_us: t_conv.elapsed().as_micros() as u32,
+            });
+        }
+        if want_key {
             self.inner.force_intra_frame();
             self.force_key_next = false;
         }
-
-        self.yuv.fill_from_bgra(&frame.bgra, w, h);
+        // Partial conversion: only changed row pairs. (If the frame is
+        // static but a keyframe was requested, the YUV buffer is already
+        // byte-correct from the previous conversion — zero work here.)
+        self.yuv.fill_from_bgra(&frame.bgra, w, h, Some(&dirty));
+        let convert_us = t_conv.elapsed().as_micros() as u32;
 
         let (keyframe, skipped, payload) = {
             let bitstream = self
@@ -354,12 +387,14 @@ impl Encoder for H264Encoder {
                 payload: Vec::new(),
                 keyframe: false,
                 codec: Codec::H264,
+                convert_us,
             });
         }
         Ok(Encoded {
             payload,
             keyframe,
             codec: Codec::H264,
+            convert_us,
         })
     }
 }
@@ -377,7 +412,7 @@ mod conv_tests {
             *b = ((i * 2654435761usize) >> 7) as u8;
         }
         let mut ours = I420Buffer::default();
-        ours.fill_from_bgra(&bgra, w, h);
+        ours.fill_from_bgra(&bgra, w, h, None);
 
         let mut rgb = vec![0u8; w * h * 3];
         for (src, dst) in bgra.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
@@ -452,11 +487,11 @@ mod conv_tests {
         let (w, h) = (1920usize, 1080usize);
         let bgra = vec![128u8; w * h * 4];
         let mut buf = I420Buffer::default();
-        buf.fill_from_bgra(&bgra, w, h); // warm
+        buf.fill_from_bgra(&bgra, w, h, None); // warm
         let t = std::time::Instant::now();
         const N: u32 = 100;
         for _ in 0..N {
-            buf.fill_from_bgra(std::hint::black_box(&bgra), w, h);
+            buf.fill_from_bgra(std::hint::black_box(&bgra), w, h, None);
         }
         println!(
             "1080p BGRA→I420: {:.2} ms/frame",

@@ -13,6 +13,34 @@ use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
 
+/// Host cursor image (RGBA8, tightly packed) + hotspot.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CursorShapeData {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: Vec<u8>,
+}
+
+/// Latest host cursor state, published by the capture loop and watched by
+/// every session (forwarded over the control channel, never behind video).
+#[derive(Debug, Clone, Default)]
+pub struct CursorState {
+    /// Monotonic update counter (0 = never updated).
+    pub seq: u64,
+    /// Normalized (0..1) position against the captured surface.
+    pub x: f32,
+    pub y: f32,
+    pub visible: bool,
+    /// Bumped when `shape` changes so sessions know to (re)send the image.
+    pub shape_seq: u64,
+    pub shape: Option<Arc<CursorShapeData>>,
+    /// True → the cursor is baked into the video frames (legacy client
+    /// connected); cursor-capable viewers must hide their overlay.
+    pub composited: bool,
+}
+
 /// One captured frame, shared zero-copy between all client sessions.
 pub struct CapturedFrame {
     pub seq: u64,
@@ -38,6 +66,8 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    /// Client advertised the "cursor" feature (renders host cursor itself).
+    pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
     pub commands: mpsc::Sender<SessionCommand>,
 }
@@ -50,6 +80,8 @@ pub struct AppState {
     pub trust: Mutex<TrustStore>,
     /// Latest captured frame; sessions `watch` this.
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
+    /// Latest host cursor state; sessions `watch` this.
+    pub cursor_tx: watch::Sender<CursorState>,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -73,12 +105,14 @@ impl AppState {
         );
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
+        let (cursor_tx, _) = watch::channel(CursorState::default());
         Ok(Self {
             cfg,
             fingerprint,
             pins,
             trust: Mutex::new(trust),
             frame_tx,
+            cursor_tx,
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -115,6 +149,8 @@ impl AppState {
         self.clients.lock().unwrap().insert(id, handle);
         let mut hs = self.host_stats.lock().unwrap();
         hs.clients += 1;
+        drop(hs);
+        self.refresh_cursor_policy();
         id
     }
 
@@ -122,7 +158,35 @@ impl AppState {
         if self.clients.lock().unwrap().remove(&id).is_some() {
             let mut hs = self.host_stats.lock().unwrap();
             hs.clients = hs.clients.saturating_sub(1);
+            drop(hs);
+            self.refresh_cursor_policy();
         }
+    }
+
+    /// The cursor rides its own channel only while *every* connected client
+    /// can render it; one legacy client flips the capture path back to
+    /// compositing the cursor into video frames.
+    pub fn cursor_channel_active(&self) -> bool {
+        self.clients
+            .lock()
+            .unwrap()
+            .values()
+            .all(|c| c.supports_cursor)
+    }
+
+    /// Re-publish cursor state with the current composited policy so capable
+    /// viewers hide/show their overlay when the client mix changes.
+    fn refresh_cursor_policy(&self) {
+        let composited = !self.cursor_channel_active();
+        self.cursor_tx.send_if_modified(|cs| {
+            if cs.composited != composited {
+                cs.composited = composited;
+                cs.seq += 1;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Push an input-grant change both to the persistent store and any live

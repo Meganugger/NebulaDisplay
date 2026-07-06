@@ -69,6 +69,23 @@ struct Shared {
     frames_skipped: AtomicU64,
     /// EMA of encode time in µs.
     encode_us_avg: AtomicU64,
+    /// EMA of the color-conversion share of encode time in µs.
+    convert_us_avg: AtomicU64,
+    /// EMA of capture→encode-start age in µs (scheduling wait).
+    capture_age_us_avg: AtomicU64,
+    /// EMA of seal+socket-send time per video frame in µs.
+    seal_send_us_avg: AtomicU64,
+}
+
+/// EMA with α = 0.1 over µs samples stored in relaxed atomics.
+fn ema_update(cell: &AtomicU64, sample_us: u64) {
+    let prev = cell.load(Ordering::Relaxed);
+    let ema = if prev == 0 {
+        sample_us
+    } else {
+        (prev * 9 + sample_us) / 10
+    };
+    cell.store(ema, Ordering::Relaxed);
 }
 
 impl Shared {
@@ -126,8 +143,12 @@ pub async fn run(
         frames_sent: AtomicU64::new(0),
         frames_skipped: AtomicU64::new(0),
         encode_us_avg: AtomicU64::new(0),
+        convert_us_avg: AtomicU64::new(0),
+        capture_age_us_avg: AtomicU64::new(0),
+        seal_send_us_avg: AtomicU64::new(0),
     });
 
+    let supports_cursor = auth.client.features.iter().any(|f| f == "cursor");
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(8);
     let handle = Arc::new(ClientHandle {
         device_id: auth.client.device_id.clone(),
@@ -139,6 +160,7 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
     });
@@ -182,6 +204,14 @@ pub async fn run(
     host_stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pump = pump;
     let mut bytes_window_start = Instant::now();
+    // Cursor forwarding (only for cursor-capable clients): shape image on
+    // change, then positions. Control channel → never queued behind video.
+    let mut cursor_rx = state.cursor_tx.subscribe();
+    // Deliver the current cursor state right away (a client connecting while
+    // the mouse is idle should not wait for the first physical move).
+    cursor_rx.mark_changed();
+    let mut sent_shape_seq: u64 = 0;
+    let mut sent_cursor_hidden = false;
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
@@ -199,6 +229,38 @@ pub async fn run(
 
             _ = &mut pump => break, // client went away / protocol violation
 
+            changed = cursor_rx.changed(), if supports_cursor => {
+                if changed.is_err() { continue; }
+                let cs = cursor_rx.borrow_and_update().clone();
+                if cs.seq == 0 { continue; }
+                if cs.composited {
+                    // Cursor is baked into video while a legacy client is
+                    // connected — hide the overlay (once).
+                    if !sent_cursor_hidden {
+                        sent_cursor_hidden = true;
+                        if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: false }).await.is_err() { break; }
+                    }
+                    continue;
+                }
+                sent_cursor_hidden = false;
+                if cs.shape_seq != sent_shape_seq {
+                    if let Some(shape) = &cs.shape {
+                        sent_shape_seq = cs.shape_seq;
+                        use base64::Engine as _;
+                        let rgba = base64::engine::general_purpose::STANDARD.encode(&shape.rgba);
+                        let msg = ControlMsg::CursorShape {
+                            width: shape.width,
+                            height: shape.height,
+                            hot_x: shape.hot_x,
+                            hot_y: shape.hot_y,
+                            rgba,
+                        };
+                        if ctl_tx.send(msg).await.is_err() { break; }
+                    }
+                }
+                if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: cs.visible }).await.is_err() { break; }
+            }
+
             _ = host_stats_timer.tick() => {
                 if shared.recv_age() > RECV_TIMEOUT {
                     warn!(client_id, "client unresponsive; closing");
@@ -212,6 +274,12 @@ pub async fn run(
                     }
                     hs.encode_ms_avg =
                         shared.encode_us_avg.load(Ordering::Relaxed) as f32 / 1000.0;
+                    hs.convert_ms_avg =
+                        shared.convert_us_avg.load(Ordering::Relaxed) as f32 / 1000.0;
+                    hs.capture_age_ms_avg =
+                        shared.capture_age_us_avg.load(Ordering::Relaxed) as f32 / 1000.0;
+                    hs.seal_send_ms_avg =
+                        shared.seal_send_us_avg.load(Ordering::Relaxed) as f32 / 1000.0;
                     hs.frames_sent = shared.frames_sent.load(Ordering::Relaxed);
                     hs.frames_skipped = shared.frames_skipped.load(Ordering::Relaxed);
                     let elapsed = bytes_window_start.elapsed().as_secs_f64();
@@ -263,10 +331,15 @@ async fn writer_task(
                 };
                 let Some((seq, vf)) = frame else { continue };
                 consumed_seq.store(seq, Ordering::Release);
-                let envelope = sealer.seal(Channel::Video, &vf.encode());
+                let t_seal = Instant::now();
+                // In-place seal of header ‖ payload: one allocation, no
+                // intermediate full-frame concatenation copy.
+                let envelope =
+                    sealer.seal_parts(Channel::Video, &[&vf.header(), &vf.payload]);
                 shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 let t_send = Instant::now();
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+                ema_update(&shared.seal_send_us_avg, t_seal.elapsed().as_micros() as u64);
                 shared.frames_sent.fetch_add(1, Ordering::Relaxed);
                 // A send that takes longer than a frame period means the TCP
                 // buffer is full — a direct congestion signal.
@@ -337,6 +410,11 @@ async fn video_task(
         last_encode_at = Instant::now();
 
         let fk = shared.force_keyframe.swap(false, Ordering::Relaxed);
+        // Capture → encode-start scheduling wait (frame age at encode time).
+        ema_update(
+            &shared.capture_age_us_avg,
+            now_us().saturating_sub(frame.timestamp_us),
+        );
         let t_enc = Instant::now();
         let encoded = tokio::task::block_in_place(|| encoder.encode(&frame, fk, bitrate, fps));
         let encoded = match encoded {
@@ -346,15 +424,8 @@ async fn video_task(
                 continue;
             }
         };
-        // EMA (α = 0.1) over encode time, stored as µs for atomic transport.
-        let enc_us = t_enc.elapsed().as_micros() as u64;
-        let prev = shared.encode_us_avg.load(Ordering::Relaxed);
-        let ema = if prev == 0 {
-            enc_us
-        } else {
-            (prev * 9 + enc_us) / 10
-        };
-        shared.encode_us_avg.store(ema, Ordering::Relaxed);
+        ema_update(&shared.encode_us_avg, t_enc.elapsed().as_micros() as u64);
+        ema_update(&shared.convert_us_avg, encoded.convert_us as u64);
 
         if encoded.payload.is_empty() {
             continue; // encoder skipped this frame for rate control

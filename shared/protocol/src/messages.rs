@@ -17,6 +17,11 @@ pub struct ClientInfo {
     pub platform: String,
     /// Client app version string.
     pub app_version: String,
+    /// Optional feature flags ("cursor" → renders the host cursor from
+    /// CursorShape/CursorPos messages instead of expecting it baked into the
+    /// video). Unknown flags are ignored; absent = no optional features.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -142,6 +147,13 @@ pub struct ViewerStats {
     pub rtt_ms: f32,
     /// Measured end-to-end latency (capture timestamp → presentation), ms.
     pub e2e_latency_ms: f32,
+    /// Capture-timestamp → envelope-arrival (host pipeline + network), ms.
+    /// Measured against the synced clock. 0 until the clock is synced.
+    #[serde(default)]
+    pub net_ms_avg: f32,
+    /// Decode-completion → paint wait (presentation scheduling), ms.
+    #[serde(default)]
+    pub present_wait_ms_avg: f32,
 }
 
 /// Server → client/panel stats.
@@ -154,6 +166,16 @@ pub struct HostStats {
     pub frames_sent: u64,
     pub frames_skipped: u64,
     pub clients: u32,
+    /// Age of the captured frame when its encode started (capture → encode
+    /// scheduling wait), ms.
+    #[serde(default)]
+    pub capture_age_ms_avg: f32,
+    /// Color-conversion share of `encode_ms_avg` (BGRA → I420 etc.), ms.
+    #[serde(default)]
+    pub convert_ms_avg: f32,
+    /// Encrypt + socket write time per video frame, ms.
+    #[serde(default)]
+    pub seal_send_ms_avg: f32,
 }
 
 /// One display mode the host offers for a (virtual) monitor.
@@ -266,6 +288,23 @@ pub enum ControlMsg {
     /// Server is about to switch modes (resolution change etc.).
     ModeChange {
         mode: DisplayMode,
+    },
+    /// Host cursor image changed. Sent to clients that advertised the
+    /// "cursor" feature; `rgba` is base64 of tightly packed RGBA8.
+    CursorShape {
+        width: u16,
+        height: u16,
+        hot_x: u16,
+        hot_y: u16,
+        rgba: String,
+    },
+    /// Host cursor moved / visibility changed. Coordinates are normalized
+    /// (0..1) against the captured surface — the same space input events use.
+    /// Rides the control channel, so it is never queued behind video frames.
+    CursorPos {
+        x: f32,
+        y: f32,
+        visible: bool,
     },
     /// Graceful shutdown/teardown with reason.
     Bye {

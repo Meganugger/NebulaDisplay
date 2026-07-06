@@ -7,13 +7,20 @@
 //! tests confirm pixels actually change frame-to-frame).
 
 use ndsp_protocol::messages::DisplayMode;
+use std::sync::Arc;
 
-use super::FrameSource;
+use super::{CursorUpdate, FrameSource};
+use crate::state::CursorShapeData;
 
 pub struct TestPatternSource {
     width: u32,
     height: u32,
     tick: u64,
+    /// Synthetic cursor (circular path) so the cursor channel is exercisable
+    /// everywhere — CI, dev machines, browser E2E.
+    cursor_sent_shape: bool,
+    last_cursor: (f32, f32),
+    composite_cursor: bool,
 }
 
 impl TestPatternSource {
@@ -22,6 +29,41 @@ impl TestPatternSource {
             width,
             height,
             tick: 0,
+            cursor_sent_shape: false,
+            last_cursor: (-1.0, -1.0),
+            composite_cursor: false,
+        }
+    }
+
+    fn cursor_pos(&self) -> (f32, f32) {
+        // One revolution every 240 ticks around the center third.
+        let a = (self.tick as f32) * (std::f32::consts::TAU / 240.0);
+        (0.5 + 0.25 * a.cos(), 0.5 + 0.25 * a.sin())
+    }
+
+    /// 12×19 white-outlined black arrow, procedurally drawn.
+    fn cursor_shape() -> CursorShapeData {
+        let (w, h) = (12u16, 19u16);
+        let mut rgba = vec![0u8; w as usize * h as usize * 4];
+        for y in 0..h as usize {
+            // Classic pointer silhouette: widening triangle with a tail.
+            let row_w = if y < 12 { y + 1 } else { 12 - (y - 12).min(7) };
+            for x in 0..row_w.min(w as usize) {
+                let i = (y * w as usize + x) * 4;
+                let edge = x == 0 || x == row_w - 1 || y == 0 || y == h as usize - 1;
+                let c = if edge { 255 } else { 0 };
+                rgba[i] = c;
+                rgba[i + 1] = c;
+                rgba[i + 2] = c;
+                rgba[i + 3] = 255;
+            }
+        }
+        CursorShapeData {
+            width: w,
+            height: h,
+            hot_x: 0,
+            hot_y: 0,
+            rgba,
         }
     }
 }
@@ -145,8 +187,57 @@ impl FrameSource for TestPatternSource {
             }
         }
 
+        // Composite the synthetic cursor when a legacy client needs it in
+        // the frame (mirrors the DXGI behavior).
+        if self.composite_cursor {
+            let (cx, cy) = self.cursor_pos();
+            let shape = Self::cursor_shape();
+            let px = (cx * w as f32) as usize;
+            let py = (cy * h as f32) as usize;
+            for sy in 0..shape.height as usize {
+                for sx in 0..shape.width as usize {
+                    let (dx, dy) = (px + sx, py + sy);
+                    if dx >= w || dy >= h {
+                        continue;
+                    }
+                    let si = (sy * shape.width as usize + sx) * 4;
+                    if shape.rgba[si + 3] == 0 {
+                        continue;
+                    }
+                    let di = (dy * w + dx) * 4;
+                    out[di] = shape.rgba[si + 2];
+                    out[di + 1] = shape.rgba[si + 1];
+                    out[di + 2] = shape.rgba[si];
+                }
+            }
+        }
+
         self.tick += 1;
         Ok(true)
+    }
+
+    fn cursor(&mut self) -> Option<CursorUpdate> {
+        let (x, y) = self.cursor_pos();
+        let shape = if self.cursor_sent_shape {
+            None
+        } else {
+            self.cursor_sent_shape = true;
+            Some(Arc::new(Self::cursor_shape()))
+        };
+        if (x, y) == self.last_cursor && shape.is_none() {
+            return None;
+        }
+        self.last_cursor = (x, y);
+        Some(CursorUpdate {
+            x,
+            y,
+            visible: true,
+            shape,
+        })
+    }
+
+    fn set_composite_cursor(&mut self, on: bool) {
+        self.composite_cursor = on;
     }
 }
 

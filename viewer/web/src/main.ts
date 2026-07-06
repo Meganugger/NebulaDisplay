@@ -6,7 +6,7 @@ import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
-import { InputCapture } from "./input";
+import { contentBox, InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
 import { Session } from "./session";
 
@@ -28,6 +28,7 @@ const canvas = $<HTMLCanvasElement>("screen");
 const statsOverlay = $("stats-overlay");
 const inputDenied = $("input-denied");
 const toast = $("toast");
+const remoteCursor = $<HTMLImageElement>("remote-cursor");
 
 let session: Session | null = null;
 let renderer: Renderer | null = null;
@@ -37,6 +38,11 @@ let pingTimer: number | undefined;
 const clock = new ClockSync();
 let hostStats: HostStats | null = null;
 let inputAllowed = false;
+/** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
+let netMsAvg = 0;
+/** Host cursor overlay state (cursor channel). */
+let cursorHot = { x: 0, y: 0 };
+let cursorPos: { x: number; y: number; visible: boolean } | null = null;
 
 function defaultHost(): string {
   // When served by nebulad itself, the page origin *is* the host.
@@ -111,7 +117,13 @@ async function openSession(host: string, pin: string | null): Promise<void> {
   try {
     renderer = new Renderer(canvas);
     const s = await Session.connect(host, pin, nameInput.value.trim(), {
-      onVideo: (frame) => void renderer?.push(frame),
+      onVideo: (frame) => {
+        // Capture-timestamp → arrival: everything upstream of the decoder
+        // (host capture/encode/seal/send + network), against the synced clock.
+        const lat = clock.latencyMs(frame.timestampUs);
+        if (lat !== null && lat >= 0) netMsAvg = netMsAvg === 0 ? lat : netMsAvg * 0.9 + lat * 0.1;
+        void renderer?.push(frame);
+      },
       onControl: onControl,
       onClose: (reason) => onSessionClosed(host, reason),
     });
@@ -182,6 +194,30 @@ function onControl(msg: ControlMsg): void {
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
       break;
     }
+    case "cursor_shape": {
+      // RGBA8 → canvas → data URL for the overlay <img>.
+      const w = Number(msg.width);
+      const h = Number(msg.height);
+      cursorHot = { x: Number(msg.hot_x), y: Number(msg.hot_y) };
+      try {
+        const bytes = Uint8Array.from(atob(String(msg.rgba)), (c) => c.charCodeAt(0));
+        const cnv = document.createElement("canvas");
+        cnv.width = w;
+        cnv.height = h;
+        const cctx = cnv.getContext("2d");
+        if (cctx) {
+          cctx.putImageData(new ImageData(new Uint8ClampedArray(bytes.buffer), w, h), 0, 0);
+          remoteCursor.src = cnv.toDataURL();
+        }
+      } catch (e) {
+        console.warn("cursor shape decode failed", e);
+      }
+      break;
+    }
+    case "cursor_pos":
+      cursorPos = { x: Number(msg.x), y: Number(msg.y), visible: Boolean(msg.visible) };
+      placeRemoteCursor();
+      break;
     case "mode_change":
       break; // canvas auto-fits per frame
     case "bye":
@@ -191,6 +227,29 @@ function onControl(msg: ControlMsg): void {
       console.warn("host error", msg);
       break;
   }
+}
+
+/**
+ * Position the host-cursor overlay: normalized capture coordinates → screen
+ * pixels of the letterboxed content box, hotspot-adjusted, scaled with the
+ * video. A transform (not left/top) keeps this off the layout path.
+ */
+function placeRemoteCursor(): void {
+  const p = cursorPos;
+  if (!p || !p.visible || !remoteCursor.src) {
+    remoteCursor.style.display = "none";
+    return;
+  }
+  const r = canvas.getBoundingClientRect();
+  const box = contentBox(
+    { left: r.left, top: r.top, width: r.width, height: r.height },
+    canvas.width,
+    canvas.height,
+  );
+  const x = box.left + p.x * box.width - cursorHot.x * box.scale;
+  const y = box.top + p.y * box.height - cursorHot.y * box.scale;
+  remoteCursor.style.display = "block";
+  remoteCursor.style.transform = `translate(${x}px, ${y}px) scale(${box.scale})`;
 }
 
 function refreshInputBadge(): void {
@@ -233,6 +292,8 @@ function enterViewer(s: Session): void {
         frames_dropped: st.framesDropped,
         rtt_ms: round1(clock.rttMs),
         e2e_latency_ms: e2e === null ? 0 : round1(e2e),
+        net_ms_avg: round1(netMsAvg),
+        present_wait_ms_avg: round1(st.presentWaitMsAvg),
       },
     });
     if (statsOverlay.classList.contains("visible")) {
@@ -242,9 +303,11 @@ function enterViewer(s: Session): void {
         `decode avg ${st.decodeMsAvg.toFixed(1)} ms`,
         `rtt        ${clock.rttMs.toFixed(1)} ms`,
         `e2e        ${e2e === null ? "syncing…" : e2e.toFixed(1) + " ms"}`,
+        `net+host   ${netMsAvg.toFixed(1)} ms`,
+        `present    ${st.presentWaitMsAvg.toFixed(2)} ms`,
         `dropped    ${st.framesDropped}`,
         hostStats
-          ? `host       ${hostStats.capture_fps.toFixed(0)} fps cap · enc ${hostStats.encode_ms_avg.toFixed(1)} ms · ${(hostStats.actual_bitrate_kbps / 1000).toFixed(1)} Mbps`
+          ? `host       ${hostStats.capture_fps.toFixed(0)} fps cap · enc ${hostStats.encode_ms_avg.toFixed(1)} ms (cvt ${hostStats.convert_ms_avg.toFixed(1)}) · age ${hostStats.capture_age_ms_avg.toFixed(1)} · send ${hostStats.seal_send_ms_avg.toFixed(1)} · ${(hostStats.actual_bitrate_kbps / 1000).toFixed(1)} Mbps`
           : "host       …",
       ].join("\n");
     }
@@ -261,6 +324,9 @@ function endSession(reason: string): void {
   renderer = null;
   session = null;
   hostStats = null;
+  cursorPos = null;
+  remoteCursor.style.display = "none";
+  remoteCursor.removeAttribute("src");
   viewerScreen.classList.remove("active");
   connectScreen.style.display = "";
   setStatus(reason, reason.includes("error") || reason.includes("impostor") ? "err" : "");

@@ -130,3 +130,18 @@ th { color: var(--fg-dim); font-weight: 500; }
 }
 .switch input:checked + span { background: color-mix(in srgb, var(--ok) 45%, transparent); }
 .switch input:checked + span::after { transform: translateX(16px); background: #fff; }
+
+/* Host cursor overlay (cursor channel) — positioned in screen pixels over
+   the letterboxed video content; never intercepts local input. */
+#remote-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: none;
+  pointer-events: none;
+  user-select: none;
+  z-index: 5;
+  image-rendering: pixelated;
+  transform-origin: 0 0;
+  will-change: transform;
+}

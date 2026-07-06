@@ -17,8 +17,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use crate::state::{AppState, CapturedFrame};
+use crate::state::{AppState, CapturedFrame, CursorShapeData};
 use crate::util::now_us;
+
+/// A cursor change reported by a frame source since the previous poll.
+pub struct CursorUpdate {
+    /// Normalized (0..1) hotspot position against the captured surface.
+    pub x: f32,
+    pub y: f32,
+    pub visible: bool,
+    /// Present only when the shape changed.
+    pub shape: Option<Arc<CursorShapeData>>,
+}
 
 /// A source of BGRA frames. Implementations may block briefly inside
 /// `next_frame` (it runs on a dedicated blocking thread).
@@ -34,6 +44,15 @@ pub trait FrameSource: Send {
     fn desktop_rect(&self) -> Option<(i32, i32, i32, i32)> {
         None
     }
+    /// Cursor state change since the last call (None = unchanged). Polled by
+    /// the capture loop after every `next_frame`, including `Ok(false)`
+    /// returns — cursor-only movement must flow even when pixels don't.
+    fn cursor(&mut self) -> Option<CursorUpdate> {
+        None
+    }
+    /// Whether the source should blend the cursor into captured frames.
+    /// Off while every client renders the cursor from its own channel.
+    fn set_composite_cursor(&mut self, _on: bool) {}
 }
 
 /// Test helper: expose the synthetic source to other modules' unit tests.
@@ -125,6 +144,8 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            let composited = !state2.cursor_channel_active();
+            source.set_composite_cursor(composited);
             match source.next_frame(&mut buf) {
                 Ok(true) => {
                     seq += 1;
@@ -166,6 +187,21 @@ pub async fn run_capture_loop(state: Arc<AppState>, mut source: Box<dyn FrameSou
                     warn!("capture error: {e:#}; retrying in 1s");
                     std::thread::sleep(Duration::from_secs(1));
                 }
+            }
+            // Cursor updates flow even when no pixels changed — that's the
+            // whole point of the dedicated cursor channel.
+            if let Some(cu) = source.cursor() {
+                state2.cursor_tx.send_modify(|cs| {
+                    cs.seq += 1;
+                    cs.x = cu.x;
+                    cs.y = cu.y;
+                    cs.visible = cu.visible;
+                    cs.composited = composited;
+                    if let Some(shape) = cu.shape {
+                        cs.shape_seq += 1;
+                        cs.shape = Some(shape);
+                    }
+                });
             }
             if fps_window_start.elapsed() >= Duration::from_secs(2) {
                 let fps = fps_frames as f32 / fps_window_start.elapsed().as_secs_f32();
