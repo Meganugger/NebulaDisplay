@@ -1,0 +1,62 @@
+# Roadmap
+
+Everything below is **designed but not yet implemented** unless marked
+otherwise. Ordering = impact / effort.
+
+## P0 — performance & the driver
+
+1. **Driver bring-up** (needs a WDK machine): compile
+   `host/windows-driver`, test-sign, validate extend mode end-to-end, measure
+   ring throughput at 4K, add driver health reporting into the panel
+   ("extend/mirror/pattern" badge exists server-side already).
+2. **Hardware encoders** via Media Foundation Transform enumeration:
+   NVENC / Quick Sync / AMF H.264+HEVC behind the existing `Encoder` trait;
+   per-client encoder selection by resolution (SW OpenH264 tops out ~1080p60
+   on typical CPUs; HW unlocks 1440p/4K60 at lower latency).
+3. **Dirty-rect encoding**: DXGI duplication + IddCx both expose dirty/move
+   rects; feed encoder ROI and skip static frames entirely (big battery win
+   for Office profile).
+
+## P1 — security & transports
+
+4. **PAKE pairing** (CPace or SPAKE2) replacing PIN-bound HKDF: removes the
+   offline-grinding caveat in SECURITY.md; wire format has room (new
+   `auth.method`).
+5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
+   video, streams for control; WebTransport for the web viewer where
+   available; WS stays as fallback.
+6. OS keystore for trust tokens (DPAPI / Keychain / Keystore).
+7. Optional HTTPS with self-signed cert + fingerprint pinning for the web
+   viewer's *code* integrity on hostile LANs.
+
+## P2 — features
+
+8. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
+   mute/volume; off by default with a visible indicator.
+9. **Clipboard sync** with explicit per-device permission + per-event size
+   caps (protocol slot: control messages).
+10. **File drop** with explicit accept dialog per transfer.
+11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
+    already parameterized by `MaxMonitorsSupported`), per-client monitor
+    assignment, video-wall spanning mode.
+12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
+    clean-room scope; use Windows.Gaming.Input injection when available).
+13. Layout-aware keyboard mapping (send both `code` and `key`, host picks).
+14. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
+    (current fallback maps pen to mouse).
+
+## P3 — platform breadth
+
+15. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
+    packaging docs.
+16. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
+    protocol and viewers are already host-OS-agnostic.
+17. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees
+    ciphertext only), separate binary + explicit user action; never on by
+    default.
+
+## Deliberately rejected
+
+* Cloud accounts, telemetry, auto-update phone-home — against the product's
+  core promise.
+* Unsigned-driver install "hacks" — mirror mode is the honest fallback.

@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (Linux) — build, test, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (unit + protocol + e2e over real sockets)
+        run: cargo test --workspace
+      - name: Build release host
+        run: cargo build --release -p nebulad
+
+  rust-windows:
+    name: Rust (Windows) — cfg(windows) paths compile + tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  web:
+    name: Web viewer — typecheck, build, host compat test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: viewer/web/package-lock.json
+      - name: Install
+        working-directory: viewer/web
+        run: npm ci
+      - name: Typecheck + build
+        working-directory: viewer/web
+        run: npm run build
+      - name: Build host for compat test
+        run: cargo build -p nebulad
+      - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)
+        working-directory: viewer/web
+        run: node tests/web-compat.mjs
+
+  browser-e2e:
+    name: Browser E2E — Chromium pairing/H.264/input/panel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install web deps + Chromium
+        working-directory: viewer/web
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+      - name: Build
+        run: cargo build --release -p nebulad
+      - name: Build viewer
+        working-directory: viewer/web
+        run: npm run build
+      - name: Run browser E2E
+        working-directory: viewer/web
+        run: node tests/browser-e2e.mjs e2e-screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: viewer/web/e2e-screenshots/
+          if-no-files-found: ignore

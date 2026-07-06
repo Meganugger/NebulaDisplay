@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NebulaDisplay</string>
+    <string name="hint_host">Host address (e.g. 192.168.1.20:41800)</string>
+    <string name="hint_pin">PIN (first pairing only)</string>
+    <string name="connect">Connect</string>
+    <string name="connecting">Connecting…</string>
+    <string name="err_no_host">Enter the host address shown on the PC.</string>
+    <string name="err_need_pin">First connection to this host needs the PIN.</string>
+    <string name="input_granted">Host granted touch control</string>
+    <string name="input_revoked">Host revoked touch control</string>
+</resources>
