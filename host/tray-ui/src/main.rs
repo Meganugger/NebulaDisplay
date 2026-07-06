@@ -65,14 +65,6 @@ mod tray {
         http("GET", panel_port, "/api/status").is_some()
     }
 
-    /// Extract `"key":"value"` / `"key":[...]` fragments without a JSON dep.
-    fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-        let pat = format!("\"{key}\":\"");
-        let start = json.find(&pat)? + pat.len();
-        let end = json[start..].find('"')? + start;
-        Some(&json[start..end])
-    }
-
     fn viewer_url(panel_port: u16) -> Option<String> {
         let body = http("GET", panel_port, "/api/status")?;
         // First entry of viewer_urls.

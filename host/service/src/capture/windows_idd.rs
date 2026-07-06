@@ -156,7 +156,7 @@ impl FrameSource for WindowsIddSource {
             // Seqlock read: retry on torn frames (driver mid-write).
             for _ in 0..3 {
                 let seq1 = std::ptr::read_volatile(&slot.seq);
-                if seq1 % 2 != 0 {
+                if !seq1.is_multiple_of(2) {
                     std::hint::spin_loop();
                     continue;
                 }

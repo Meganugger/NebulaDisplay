@@ -20,7 +20,7 @@ pub trait InputSink: Send + Sync {
 pub fn create_sink() -> Box<dyn InputSink> {
     #[cfg(windows)]
     {
-        return Box::new(windows_inject::WindowsInputSink::new());
+        Box::new(windows_inject::WindowsInputSink::new())
     }
     #[cfg(not(windows))]
     {

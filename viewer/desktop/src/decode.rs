@@ -10,6 +10,7 @@ pub struct Decoder {
     #[cfg(feature = "h264")]
     h264: Option<openh264::decoder::Decoder>,
     /// Wait for a keyframe after start/decode errors.
+    #[cfg(feature = "h264")]
     need_keyframe: bool,
 }
 
@@ -18,6 +19,7 @@ impl Decoder {
         Self {
             #[cfg(feature = "h264")]
             h264: None,
+            #[cfg(feature = "h264")]
             need_keyframe: true,
         }
     }

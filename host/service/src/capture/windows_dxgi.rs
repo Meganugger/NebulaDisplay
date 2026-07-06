@@ -9,6 +9,7 @@
 use anyhow::{bail, Context};
 use ndsp_protocol::messages::DisplayMode;
 use windows::core::Interface;
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -45,8 +46,9 @@ impl DxgiDuplicationSource {
             let output: IDXGIOutput = adapter.EnumOutputs(0).context("EnumOutputs(0)")?;
             let output: IDXGIOutput1 = output.cast().context("IDXGIOutput1 cast")?;
 
-            let mut desc = DXGI_OUTPUT_DESC::default();
-            output.GetDesc(&mut desc).context("GetDesc")?;
+            // windows 0.62: IDXGIOutput::GetDesc returns the descriptor
+            // instead of filling an out-parameter.
+            let desc: DXGI_OUTPUT_DESC = output.GetDesc().context("GetDesc")?;
             let width = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
             let height = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
 
@@ -56,7 +58,8 @@ impl DxgiDuplicationSource {
             D3D11CreateDevice(
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
-                None,
+                // windows 0.62: `software` is a plain HMODULE, not Option.
+                HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
                 D3D11_SDK_VERSION,
@@ -106,16 +109,21 @@ impl DxgiDuplicationSource {
             }
         }
         unsafe {
-            let mut src_desc = D3D11_TEXTURE2D_DESC::default();
             // Describe a CPU-readable staging copy matching the frame.
-            src_desc.Width = w;
-            src_desc.Height = h;
-            src_desc.MipLevels = 1;
-            src_desc.ArraySize = 1;
-            src_desc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-            src_desc.SampleDesc.Count = 1;
-            src_desc.Usage = D3D11_USAGE_STAGING;
-            src_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            let src_desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
             let mut tex: Option<ID3D11Texture2D> = None;
             self.device
                 .CreateTexture2D(&src_desc, None, Some(&mut tex))
