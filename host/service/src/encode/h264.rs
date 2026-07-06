@@ -31,6 +31,14 @@ pub struct H264Encoder {
     size: (usize, usize),
     force_key_next: bool,
     last_rebuild: std::time::Instant,
+    /// The max-bitrate ceiling has been lifted on the *initialized* encoder.
+    /// (openh264-rs initializes lazily on the first `encode`, so the lift
+    /// must happen right after that — not at construction.)
+    ceiling_lifted: bool,
+    /// Diagnostics: number of full encoder rebuilds since creation. Steady
+    /// state should be 0 — rebuilds only happen on resolution change or if a
+    /// runtime rate update is rejected (which the ceiling lift prevents).
+    pub rebuilds: u64,
 }
 
 /// Plain I420 planes implementing openh264's `YUVSource` so we can feed the
@@ -118,6 +126,15 @@ impl I420Buffer {
     }
 }
 
+/// Ceiling for runtime bitrate raises (bps). The encoder is initialized with
+/// this as its *max* bitrate so `SetOption(ENCODER_OPTION_BITRATE)` can move
+/// the target anywhere below it without re-creating the encoder. (openh264's
+/// `WelsBitRateVerification` rejects a target above the configured max — that
+/// rejection was the source of the old "runtime bitrate update failed;
+/// rebuilding encoder" IDR storms.) Well below the H.264 L5.2 limit so level
+/// verification never clamps it.
+const MAX_BITRATE_CEILING_BPS: u32 = 120_000_000;
+
 fn build(bitrate_kbps: u32, fps: u32) -> anyhow::Result<OEncoder> {
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.max(100) * 1000))
@@ -155,7 +172,74 @@ impl H264Encoder {
             size: (0, 0),
             force_key_next: false,
             last_rebuild: std::time::Instant::now(),
+            ceiling_lifted: false,
+            rebuilds: 0,
         })
+    }
+
+    /// One-time post-initialization tuning (openh264-rs initializes the
+    /// encoder lazily inside the first `encode`, so this cannot run earlier).
+    /// A single full-params round trip fixes two things the crate's config
+    /// surface cannot express:
+    ///
+    /// 1. **Runtime-raise ceiling** — init pins `iMaxBitrate` and the layer's
+    ///    `iMaxSpatialBitrate` to the *initial* target, so every later raise
+    ///    failed `WelsBitRateVerification` and forced a rebuild + IDR storm
+    ///    (the old "runtime bitrate update failed" log). Both caps are lifted
+    ///    to [`MAX_BITRATE_CEILING_BPS`].
+    /// 2. **Parallel encode** — init hardcodes `SM_SINGLE_SLICE`, and openh264
+    ///    clamps its thread pool to `min(cores, max_slice_count)` = 1. Fixed
+    ///    N-slice mode lets every frame (not just large keyframes) encode on
+    ///    all cores. Measured at 1080p on 4 vCPUs: 27.9 → ~9 ms/frame.
+    ///    Multi-slice output is still one access unit per frame — WebCodecs,
+    ///    MediaCodec and VideoToolbox all accept it (browser E2E verifies).
+    ///
+    /// The params change triggers an internal encoder re-init, so it must
+    /// happen exactly once, right after the first frame (which is an IDR
+    /// anyway); `force_key_next` covers the stream restart.
+    fn tune_after_init(&mut self) {
+        use openh264_sys2::{
+            SEncParamExt, ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, SM_FIXEDSLCNUM_SLICE,
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4) as u32; // >4 slices costs bitrate for little latency
+        let mut params: SEncParamExt = unsafe { std::mem::zeroed() };
+        // SAFETY: SEncParamExt is the documented payload for
+        // ENCODER_OPTION_SVC_ENCODE_PARAM_EXT (get + set) and outlives both
+        // calls; the encoder is initialized (first encode completed).
+        unsafe {
+            let rc = self.inner.raw_api().get_option(
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                (&mut params as *mut SEncParamExt) as *mut _,
+            );
+            if rc != 0 {
+                tracing::warn!(rc, "get_option(SVC_ENCODE_PARAM_EXT) failed");
+                return;
+            }
+            params.iMaxBitrate = MAX_BITRATE_CEILING_BPS as std::os::raw::c_int;
+            params.sSpatialLayers[0].iMaxSpatialBitrate =
+                MAX_BITRATE_CEILING_BPS as std::os::raw::c_int;
+            if threads > 1 {
+                params.iMultipleThreadIdc = threads as std::os::raw::c_ushort;
+                params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+                params.sSpatialLayers[0].sSliceArgument.uiSliceNum = threads;
+            }
+            let rc = self.inner.raw_api().set_option(
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                (&mut params as *mut SEncParamExt) as *mut _,
+            );
+            if rc != 0 {
+                // Not fatal: single-slice encoding keeps working; runtime
+                // raises fall back to a rate-limited rebuild.
+                tracing::warn!(rc, threads, "set_option(SVC_ENCODE_PARAM_EXT) failed");
+                return;
+            }
+        }
+        // The param adjust restarts the stream — make it explicit.
+        self.force_key_next = true;
+        self.ceiling_lifted = true;
     }
 
     /// Apply a new target bitrate without re-creating the encoder.
@@ -214,6 +298,8 @@ impl H264Encoder {
         self.current_fps = fps;
         self.force_key_next = true;
         self.last_rebuild = std::time::Instant::now();
+        self.ceiling_lifted = false; // fresh encoder → lazy init → re-lift
+        self.rebuilds += 1;
         Ok(())
     }
 }
@@ -246,13 +332,22 @@ impl Encoder for H264Encoder {
 
         self.yuv.fill_from_bgra(&frame.bgra, w, h);
 
-        let bitstream = self
-            .inner
-            .encode(&self.yuv)
-            .map_err(|e| anyhow::anyhow!("openh264 encode: {e}"))?;
-        let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
-        let skipped = matches!(bitstream.frame_type(), FrameType::Skip);
-        let payload = bitstream.to_vec();
+        let (keyframe, skipped, payload) = {
+            let bitstream = self
+                .inner
+                .encode(&self.yuv)
+                .map_err(|e| anyhow::anyhow!("openh264 encode: {e}"))?;
+            (
+                matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I),
+                matches!(bitstream.frame_type(), FrameType::Skip),
+                bitstream.to_vec(),
+            )
+        };
+        if !self.ceiling_lifted {
+            // Encoder is now initialized (lazy init happened inside the first
+            // `encode`): lift the runtime max-bitrate ceiling exactly once.
+            self.tune_after_init();
+        }
         if skipped || payload.is_empty() {
             // Rate controller elected to skip this frame — nothing to send.
             return Ok(Encoded {
@@ -296,6 +391,58 @@ mod conv_tests {
         assert_eq!(ours.y(), reference.y(), "Y plane must match reference");
         assert_eq!(ours.u(), reference.u(), "U plane must match reference");
         assert_eq!(ours.v(), reference.v(), "V plane must match reference");
+    }
+
+    fn test_frame(w: u32, h: u32, seq: u64) -> CapturedFrame {
+        let mut src = crate::capture::test_pattern_for_tests(w, h);
+        let mut buf = Vec::new();
+        use crate::capture::FrameSource;
+        for _ in 0..seq {
+            src.next_frame(&mut buf).unwrap();
+        }
+        CapturedFrame {
+            seq,
+            timestamp_us: seq,
+            width: w,
+            height: h,
+            bgra: buf,
+        }
+    }
+
+    /// Regression test for "runtime bitrate update failed; rebuilding
+    /// encoder": *raising* the bitrate above the initial target used to fail
+    /// openh264's verification (max pinned to initial target) and force a
+    /// rebuild + IDR storm. With the ceiling lift, a full sweep across the
+    /// profile envelopes must produce zero rebuilds and zero spurious IDRs.
+    #[test]
+    fn runtime_bitrate_sweep_never_rebuilds() {
+        let mut enc = H264Encoder::new().unwrap();
+        // Prime: frame 1 is the natural IDR; frame 2 is the one-time IDR from
+        // the post-init tune (slice/thread + ceiling params restart).
+        let out = enc.encode(&test_frame(320, 240, 1), false, 2_000, 30).unwrap();
+        assert!(out.keyframe);
+        assert!(enc.ceiling_lifted, "tuning must run after first frame");
+        let out = enc.encode(&test_frame(320, 240, 2), false, 2_000, 30).unwrap();
+        assert!(out.keyframe, "post-init tune restarts the stream once");
+        // Sweep: strong raises and cuts, including fps changes.
+        let targets: &[(u32, u32)] = &[
+            (4_000, 30),
+            (10_000, 60),
+            (30_000, 60), // raise far above the 6000 init target
+            (500, 10),    // deep cut
+            (30_000, 60), // raise again
+            (12_000, 48),
+        ];
+        for (i, &(kbps, fps)) in targets.iter().enumerate() {
+            let f = test_frame(320, 240, i as u64 + 3);
+            let out = enc.encode(&f, false, kbps, fps).unwrap();
+            assert!(
+                !out.keyframe,
+                "rate change to {kbps} kbps must not force an IDR"
+            );
+            assert_eq!(enc.current_bitrate_kbps, kbps, "runtime update must stick");
+        }
+        assert_eq!(enc.rebuilds, 0, "no rebuilds during rate adaptation");
     }
 
     /// Ignored timing probe (run with --ignored --nocapture --release).

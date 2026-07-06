@@ -84,12 +84,15 @@ mod tests {
             out.payload.windows(4).any(|w| w == [0, 0, 0, 1]),
             "Annex-B start code expected"
         );
-        // Second frame should be a (smaller) delta frame.
+        // Frame 2 is the one-time IDR from the post-init tune; frame 3 must
+        // be a delta frame.
         let out2 = enc.encode(&frame(320, 240), false, 2000, 30).unwrap();
-        assert!(!out2.keyframe);
+        assert!(out2.keyframe, "post-init tune restarts the stream once");
+        let out3 = enc.encode(&frame(320, 240), false, 2000, 30).unwrap();
+        assert!(!out3.keyframe, "steady state must be delta frames");
         // Forced keyframe honored.
-        let out3 = enc.encode(&frame(320, 240), true, 2000, 30).unwrap();
-        assert!(out3.keyframe);
+        let out4 = enc.encode(&frame(320, 240), true, 2000, 30).unwrap();
+        assert!(out4.keyframe);
     }
 
     #[cfg(feature = "h264")]
@@ -98,6 +101,8 @@ mod tests {
         let mut enc = create(Codec::H264).unwrap();
         let first = enc.encode(&frame(320, 240), false, 8000, 60).unwrap();
         assert!(first.keyframe, "first frame is IDR");
+        // Consume the one-time post-init-tune IDR.
+        enc.encode(&frame(320, 240), false, 8000, 60).unwrap();
         // Big bitrate + fps changes are applied at runtime via SetOption —
         // the stream must continue with delta frames (no IDR storm).
         let out = enc.encode(&frame(320, 240), false, 500, 30).unwrap();
