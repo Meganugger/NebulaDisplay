@@ -17,8 +17,13 @@ Authority: `shared/protocol` — this document describes what that code does.
 ### 1. Plaintext handshake (JSON text frames)
 
 ```
-C→S  hello        {protocol, client{device_id,name,platform,app_version},
-                   auth{method: pair | token+device_id}, codecs[]}
+C→S  hello        {protocol, client{device_id,name,platform,app_version,
+                   features?[]}, auth{method: pair | token+device_id},
+                   codecs[]}
+                   # features: optional capability flags. "cursor" → this
+                   # viewer renders the host cursor from cursor_shape/
+                   # cursor_pos messages (host stops baking it into video
+                   # while ALL connected viewers advertise it).
 S→C  hello_ack    {protocol, server{name,app_version,fingerprint},
                    pairing_required, connection_nonce}      # 16B nonce, b64
 C→S  pair_start   {client_pubkey}                           # P-256, uncompressed SEC1, b64
@@ -91,9 +96,11 @@ ts_us: host-clock capture timestamp (for measured e2e latency)
 | `set_input_mode {mode}` | C→S | view_only / touchpad / direct_touch / keyboard_mouse / drawing_tablet |
 | `request_keyframe` | C→S | decoder resync |
 | `input {events[]}` | C→S | batched input (below) |
-| `stats {stats}` | C→S | fps/decode/queue/rtt/e2e — drives adaptation + panel |
-| `host_stats {stats}` | S→C | capture fps, encode ms, bitrate, drops |
+| `stats {stats}` | C→S | fps/decode/queue/rtt/e2e/net/present-wait — drives adaptation + panel |
+| `host_stats {stats}` | S→C | capture fps, encode/convert ms, capture age, seal+send ms, bitrate, drops |
 | `input_grant {allowed}` | S→C | live grant change from the panel |
+| `cursor_shape {width,height,hot_x,hot_y,rgba}` | S→C | host cursor image (b64 RGBA8), sent on change to "cursor" viewers |
+| `cursor_pos {x,y,visible}` | S→C | host cursor moved (normalized coords); `visible:false` also = hide overlay (e.g. legacy client joined) |
 | `mode_change {mode}` | S→C | resolution/refresh switch |
 | `bye {reason}` | both | graceful close |
 | `error {code,message}` | both | non-fatal report |

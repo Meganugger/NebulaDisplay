@@ -10,6 +10,18 @@ single-pass BGRA→I420, TCP_NODELAY, DXGI cursor compositing, multi-monitor
 input mapping, letterbox-correct touch coordinates on all viewers,
 device-rate pointer sampling, latest-frame rendering everywhere.
 
+Shipped since (v0.4 pipeline overhaul — no longer roadmap items):
+zero-rebuild runtime bitrate raises (max-bitrate ceiling lift), parallel
+multi-slice encode, dirty-region encoding (static-frame elision + partial
+color conversion), dedicated low-latency cursor channel with client overlay
++ automatic composited fallback, per-stage latency instrumentation
+(capture age / convert / encode / seal+send / arrival / decode / present),
+zero-copy in-place envelope seal, immediate-paint web presentation,
+DXGI cursor-only readback skip, profile-switch re-baselining,
+QueryDisplayConfig extend-mode input mapping, multi-monitor & multi-GPU &
+HDR-capable IddCx driver with CI syntax gate, reproducible benchmark
+harness (`viewer/web/tests/bench.mjs`).
+
 ## P0 — performance & the driver
 
 1. **Driver bring-up** (needs a WDK machine): compile
@@ -20,9 +32,10 @@ device-rate pointer sampling, latest-frame rendering everywhere.
    NVENC / Quick Sync / AMF H.264+HEVC behind the existing `Encoder` trait;
    per-client encoder selection by resolution (SW OpenH264 tops out ~1080p60
    on typical CPUs; HW unlocks 1440p/4K60 at lower latency).
-3. **Dirty-rect encoding**: DXGI duplication + IddCx both expose dirty/move
-   rects; feed encoder ROI and skip static frames entirely (big battery win
-   for Office profile).
+3. **Encoder ROI from DXGI dirty/move rects**: the pixel-exact row-pair diff
+   already elides static frames and limits color conversion; the remaining
+   step is feeding rectangle hints into encoder rate control (needs the
+   MF/NVENC encoders — OpenH264's ROI support is too limited to matter).
 
 ## P1 — security & transports
 
@@ -31,7 +44,13 @@ device-rate pointer sampling, latest-frame rendering everywhere.
    `auth.method`).
 5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
    video, streams for control; WebTransport for the web viewer where
-   available; WS stays as fallback.
+   available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
+   LAN (sub-ms RTT, ~zero loss) TCP_NODELAY + latest-only send slots already
+   avoid the queueing QUIC would remove, so it does not materially cut
+   latency there; the win is head-of-line-blocking removal on lossy Wi-Fi.
+   Kept at P1: real, but smaller than hardware encoders (P0.2). Browser
+   WebTransport additionally requires TLS certs (serverCertificateHashes =
+   Chromium-only today), so the web path stays WS regardless.*
 6. OS keystore for trust tokens (DPAPI / Keychain / Keystore).
 7. Optional HTTPS with self-signed cert + fingerprint pinning for the web
    viewer's *code* integrity on hostile LANs.

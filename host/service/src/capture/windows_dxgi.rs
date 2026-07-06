@@ -231,16 +231,34 @@ impl FrameSource for DxgiDuplicationSource {
                     self.pointer.shape_changed = true;
                 }
             }
+            // LastPresentTime == 0 → the desktop image did NOT change; the
+            // acquisition was cursor/metadata-only. Skipping the GPU→CPU
+            // round trip here is a large win for the "moving the mouse over
+            // a static screen" case:
+            // * cursor channel active → no frame at all (the overlay moves).
+            // * legacy compositing → re-read the *existing* staging texture
+            //   (it still holds the last image; no CopyResource needed) and
+            //   blend the cursor at its new position.
+            let image_updated = info.LastPresentTime != 0;
+            if !image_updated && !self.composite_cursor {
+                let _ = dup.ReleaseFrame();
+                return Ok(false);
+            }
             let result = (|| -> anyhow::Result<bool> {
-                let resource = resource.as_ref().context("no frame resource")?;
-                let tex: ID3D11Texture2D = resource.cast().context("frame texture cast")?;
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                tex.GetDesc(&mut desc);
-                let (w, h) = (desc.Width, desc.Height);
-                self.width = w;
-                self.height = h;
-                let staging = self.ensure_staging(w, h)?;
-                self.context.CopyResource(&staging, &tex);
+                if image_updated {
+                    let resource = resource.as_ref().context("no frame resource")?;
+                    let tex: ID3D11Texture2D = resource.cast().context("frame texture cast")?;
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    tex.GetDesc(&mut desc);
+                    self.width = desc.Width;
+                    self.height = desc.Height;
+                    let staging = self.ensure_staging(desc.Width, desc.Height)?;
+                    self.context.CopyResource(&staging, &tex);
+                } else if self.staging.is_none() {
+                    return Ok(false); // no image received yet at all
+                }
+                let staging = self.staging.clone().context("no staging texture")?;
+                let (w, h) = (self.width, self.height);
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context
                     .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))

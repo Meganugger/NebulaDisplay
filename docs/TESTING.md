@@ -9,10 +9,19 @@
 | Rust e2e (6, real sockets) | full pairing → H.264 streaming (seq order, changing payloads, keyframe first), encrypted ping/pong, wrong PIN rejected + PIN rotation, token reconnect, input-grant live flow, revocation kick + token invalidation, client-side fingerprint pinning, **video keeps full rate under a 240 Hz input flood** (pipeline-independence regression guard) |
 | Mapping unit tests (Node) | letterbox/pillarbox coordinate math (`mapToContent`): content-box normalization, black-bar clamping, offsets, aspect mismatches |
 | Node compat test (×2) | the **actual web-viewer session code** (esbuild-bundled) against the real host: pair, decrypt frames, JPEG magic, encrypted ping/pong, token reconnect, wrong PIN — run on **both** crypto backends (native WebCrypto, and `NDSP_CRYPTO=fallback` pure-JS as in insecure browser contexts) |
-| Browser E2E (Chromium) | UI pairing, streaming 1280×720 with changing canvas pixels (H.264 or JPEG matching the browser's *probed* decode capability), stats overlay showing *measured* e2e latency, input grant flow reaching the host input sink, panel PIN/QR/client list, profile switch |
+| Browser E2E (Chromium) | UI pairing, streaming 1280×720 with changing canvas pixels (H.264 or JPEG matching the browser's *probed* decode capability), stats overlay showing *measured* per-stage latency, input grant flow reaching the host input sink, panel PIN/QR/client list, profile switch, **cursor channel** (shape delivery + live overlay movement) |
 | Compat E2E (Chromium, 6 envs) | pairing + full handshake + moving video on: secure localhost, **insecure LAN origin** (no `crypto.subtle`/`randomUUID`/WebCodecs — the real Windows/iOS/Android deployment), iOS-Safari-like (no PointerEvent/createImageBitmap/BigInt DataView/fullscreen, touch), Android-Chrome-like (touch), storage-blocked WebView, and a regression guard for the `crypto.randomUUID` crash — see `docs/BROWSER-COMPAT.md` |
 | Reconnect E2E (Chromium) | host SIGKILLed mid-stream and restarted: the viewer auto-recovers by itself via token reconnect and video provably resumes (canvas pixels change) |
-| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing, IddCx ring consumer, SendInput multi-monitor mapping, tray) |
+| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing + cursor-only readback skip, IddCx multi-ring consumer, QueryDisplayConfig input mapping, SendInput multi-monitor mapping, tray) |
+| Driver syntax check | `host/windows-driver/tests/syntax-check.sh`: full clang syntax/type check of the IddCx driver against stub WDK headers modeled from public docs, under **both** the IddCx 1.10 and 1.4 header models |
+
+## Benchmarks (reproducible)
+
+`node viewer/web/tests/bench.mjs [--quick] [--json out.json]` runs the real
+host + real Chromium across a resolution × profile matrix and prints a
+markdown table of *measured* per-stage numbers (fps, e2e, arrival, present
+wait, encode, convert, capture age, seal+send, decode, bitrate). See
+`docs/BENCHMARKS.md` for the latest recorded run and how to interpret it.
 
 Run locally: see `docs/BUILDING.md`.
 

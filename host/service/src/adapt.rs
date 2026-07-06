@@ -140,10 +140,18 @@ impl AdaptiveController {
 
     pub fn set_profile(&mut self, profile: Profile) {
         self.env = envelope(profile, self.codec);
+        // Re-baseline: the user explicitly asked for this quality tier, so
+        // jump straight to its starting point instead of crawling there via
+        // the upward probe (which previously left FPS stuck at the old
+        // profile's rate for ~30 s after e.g. Office → Video). Congestion
+        // signals will cut within frames if the link can't carry it.
         self.bitrate_kbps = self
             .bitrate_kbps
+            .max(self.env.start_kbps)
             .clamp(self.env.min_kbps, self.env.max_kbps);
-        self.fps = self.fps.clamp(self.env.min_fps, self.env.max_fps);
+        self.fps = self.env.max_fps;
+        self.floor_pressure = 0;
+        self.clean_since = Instant::now();
     }
 
     pub fn bitrate_kbps(&self) -> u32 {
@@ -257,6 +265,19 @@ mod tests {
 
     fn rewind_cooldowns(c: &mut AdaptiveController) {
         c.last_decrease = Instant::now() - DECREASE_COOLDOWN;
+    }
+
+    #[test]
+    fn profile_switch_rebaselines_immediately() {
+        let mut c = AdaptiveController::new(Profile::Office, Codec::H264);
+        assert_eq!(c.fps(), envelope(Profile::Office, Codec::H264).max_fps);
+        c.set_profile(Profile::Video);
+        let env = envelope(Profile::Video, Codec::H264);
+        assert_eq!(c.fps(), env.max_fps, "fps must jump to the new profile");
+        assert!(
+            c.bitrate_kbps() >= env.start_kbps,
+            "bitrate must start at least at the new profile's baseline"
+        );
     }
 
     #[test]

@@ -83,7 +83,31 @@ only ever rebuilt on resolution change.
 
 **Latency is measured, not guessed.** Frames carry host-clock capture
 timestamps; viewers run NTP-style Ping/Pong sync and report true
-capture→present latency back, visible in the overlay and the panel.
+capture→present latency back, visible in the overlay and the panel. Every
+pipeline stage is individually instrumented — capture age at encode start,
+color-convert share, encode, seal+send, capture→arrival, decode, and
+decode→paint wait — so a regression in any stage is attributable, not folded
+into one opaque number. `viewer/web/tests/bench.mjs` turns this into a
+reproducible benchmark matrix.
+
+**Dirty-region encoding.** Each encoder diffs every frame against its
+previous one in exact row pairs (SIMD `memcmp`, no hashes — no false
+"unchanged" ever). Fully static frames are elided entirely: no color
+conversion, no encode, no packet (a keyframe owed to a resyncing decoder is
+still served). Partially changed frames color-convert only the changed row
+pairs. Result: desktop idle costs ~zero CPU/bandwidth; text editing, window
+dragging and scrolling convert only the moved region; full-screen video
+performs as before (diff cost ≈ 0.4–0.8 ms at 1080p, repaid by the skips).
+
+**Cursor rides its own channel.** DXGI pointer updates (position + shape)
+are forwarded as `CursorShape`/`CursorPos` control messages — never queued
+behind video frames — and rendered client-side as a hotspot-correct scaled
+overlay. Cursor motion over a static desktop therefore costs a few dozen
+bytes instead of a GPU readback + encode + full frame (the DXGI source skips
+the whole readback for cursor-only acquisitions). When a legacy viewer that
+can't render the overlay connects, the host automatically falls back to
+compositing the cursor into the video for everyone (`ClientInfo.features`
+negotiates this).
 
 **The driver knows nothing about the network.** It only fills a triple-buffered
 seqlock ring in shared memory. nebulad consumes it like any other capture
@@ -94,11 +118,19 @@ desktop down.
 
 ### Video
 capture thread (recycled buffers, idle-parked) → `watch` channel →
-per-session event-driven encode task (block_in_place; single-pass BGRA→I420)
-→ latest-only slot → writer task → GCM envelope → WS (TCP_NODELAY).
+per-session event-driven encode task (block_in_place; row-pair dirty diff →
+static-frame elision / partial single-pass BGRA→I420; multi-slice parallel
+encode) → latest-only slot → writer task → in-place GCM seal of
+header‖payload (`seal_parts`, no concatenation copy) → WS (TCP_NODELAY).
 Viewer: decrypt → decoder (WebCodecs/MediaCodec/VideoToolbox/OpenH264) →
-latest-frame slot → one paint per animation frame → stats back to host
-every second.
+immediate paint on decode (desynchronized canvas; a microtask coalesces
+decode bursts to the newest frame) → stats back to host every second.
+
+### Cursor
+DXGI pointer updates → `watch` channel → per-session forwarder (control
+channel, preempts video in the writer) → client-side overlay positioned in
+letterbox space with hotspot + scale correction. Static-desktop mouse motion
+never touches the video pipeline.
 
 ### Input
 Viewer captures pointer/touch/pen/key → letterbox-corrected normalized
