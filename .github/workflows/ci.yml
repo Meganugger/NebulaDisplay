@@ -97,6 +97,9 @@ jobs:
       - name: Run cross-environment compat E2E (insecure context / iOS-like / Android-like / WebView)
         working-directory: viewer/web
         run: node tests/compat-e2e.mjs
+      - name: Run auto-reconnect E2E (host killed + restarted mid-stream)
+        working-directory: viewer/web
+        run: node tests/reconnect-e2e.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

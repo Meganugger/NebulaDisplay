@@ -11,7 +11,8 @@
 | Node compat test (×2) | the **actual web-viewer session code** (esbuild-bundled) against the real host: pair, decrypt frames, JPEG magic, encrypted ping/pong, token reconnect, wrong PIN — run on **both** crypto backends (native WebCrypto, and `NDSP_CRYPTO=fallback` pure-JS as in insecure browser contexts) |
 | Browser E2E (Chromium) | UI pairing, streaming 1280×720 with changing canvas pixels (H.264 or JPEG matching the browser's *probed* decode capability), stats overlay showing *measured* e2e latency, input grant flow reaching the host input sink, panel PIN/QR/client list, profile switch |
 | Compat E2E (Chromium, 6 envs) | pairing + full handshake + moving video on: secure localhost, **insecure LAN origin** (no `crypto.subtle`/`randomUUID`/WebCodecs — the real Windows/iOS/Android deployment), iOS-Safari-like (no PointerEvent/createImageBitmap/BigInt DataView/fullscreen, touch), Android-Chrome-like (touch), storage-blocked WebView, and a regression guard for the `crypto.randomUUID` crash — see `docs/BROWSER-COMPAT.md` |
-| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI, IddCx ring consumer, SendInput, tray) |
+| Reconnect E2E (Chromium) | host SIGKILLed mid-stream and restarted: the viewer auto-recovers by itself via token reconnect and video provably resumes (canvas pixels change) |
+| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing, IddCx ring consumer, SendInput multi-monitor mapping, tray) |
 
 Run locally: see `docs/BUILDING.md`.
 

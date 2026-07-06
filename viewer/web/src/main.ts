@@ -96,11 +96,24 @@ async function connect(): Promise<void> {
   connectBtn.disabled = true;
   setStatus(paired ? "Reconnecting with stored trust…" : "Pairing…");
   try {
+    await openSession(host, paired ? null : pin);
+    setStatus("");
+  } catch (e) {
+    setStatus((e as Error).message, "err");
+    updatePairedHint(); // stale creds may have been cleared
+  } finally {
+    connectBtn.disabled = false;
+  }
+}
+
+/** Establish a session and enter the viewer. Throws on failure. */
+async function openSession(host: string, pin: string | null): Promise<void> {
+  try {
     renderer = new Renderer(canvas);
-    const s = await Session.connect(host, paired ? null : pin, nameInput.value.trim(), {
+    const s = await Session.connect(host, pin, nameInput.value.trim(), {
       onVideo: (frame) => void renderer?.push(frame),
       onControl: onControl,
-      onClose: (reason) => endSession(reason),
+      onClose: (reason) => onSessionClosed(host, reason),
     });
     session = s;
     renderer.requestKeyframe = () => void s.send({ type: "request_keyframe" });
@@ -109,16 +122,50 @@ async function connect(): Promise<void> {
       showToast(`Video error: ${e.message}`, 8000);
     };
     inputAllowed = s.info.inputAllowed;
+    userDisconnected = false; // fresh session — clear any stale flag
     enterViewer(s);
-    setStatus("");
   } catch (e) {
     renderer?.destroy();
     renderer = null;
-    setStatus((e as Error).message, "err");
-    updatePairedHint(); // stale creds may have been cleared
-  } finally {
-    connectBtn.disabled = false;
+    throw e;
   }
+}
+
+let userDisconnected = false;
+let reconnecting = false;
+
+/**
+ * Wi-Fi blips and host restarts shouldn't dump the user back at the connect
+ * form: when a session closes unexpectedly and stored trust exists, quietly
+ * retry (token reconnect, no PIN) with short backoff before giving up.
+ */
+function onSessionClosed(host: string, reason: string): void {
+  if (!session) return; // already handled
+  const wasUser = userDisconnected;
+  userDisconnected = false;
+  endSession(reason);
+  if (wasUser || reconnecting || loadCredentials(host) === null) return;
+  if (/impostor|protocol error|revoked/i.test(reason)) return; // not transient
+  void (async () => {
+    reconnecting = true;
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        showToast(`Connection lost — reconnecting (${attempt}/5)…`, 2500);
+        await new Promise((r) => setTimeout(r, attempt === 1 ? 300 : 1500 * (attempt - 1)));
+        try {
+          await openSession(host, null);
+          showToast("Reconnected ✓");
+          setStatus("");
+          return;
+        } catch {
+          if (loadCredentials(host) === null) break; // trust cleared — needs PIN
+        }
+      }
+      setStatus("Connection lost. Reconnect manually.", "err");
+    } finally {
+      reconnecting = false;
+    }
+  })();
 }
 
 function onControl(msg: ControlMsg): void {
@@ -236,6 +283,7 @@ if (fullscreen.supported) {
   $("fullscreen-btn").style.display = "none";
 }
 $("disconnect-btn").onclick = () => {
+  userDisconnected = true;
   session?.close();
   endSession("Disconnected.");
 };

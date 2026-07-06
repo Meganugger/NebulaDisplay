@@ -119,7 +119,7 @@ pub async fn run(
         input_allowed: input_allowed.clone(),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
-        ctl: Mutex::new(AdaptiveController::new(Profile::Office)),
+        ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
         last_recv_ms: AtomicU64::new(0),
         epoch: Instant::now(),
         bytes_sent: AtomicU64::new(0),

@@ -32,6 +32,8 @@ touch a modern API without going through it:
 | WebCodecs H.264 | **probed with `VideoDecoder.isConfigSupported`** — API existence is not enough: codec-less Chromium/Electron builds expose `VideoDecoder` but reject `avc1` configs. JPEG otherwise. Repeated decoder errors surface a visible error instead of a black canvas. |
 | `createImageBitmap` | JPEG decode through an `<img>` element (older iOS Safari) |
 | `PointerEvent` | raw `touch*` + `mouse*` listeners (older iOS Safari / WebViews) |
+| `pointerrawupdate` | `pointermove` (display-rate instead of device-rate move sampling) |
+| `getCoalescedEvents` | the single event's coordinates (fewer samples per move) |
 | `localStorage` | in-memory store (Safari private mode / locked-down WebViews); UI notes that pairing won't persist |
 | Fullscreen API | `webkit`-prefixed variants; button hidden when absent (iPhone Safari) |
 | `DataView#getBigUint64/setBigUint64` | spec-compliant implementation installed when missing (Safari < 15; also required by `@noble/ciphers`) |

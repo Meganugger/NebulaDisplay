@@ -124,6 +124,11 @@ impl FrameSource for WindowsIddSource {
         "iddcx-ring"
     }
 
+    // desktop_rect: intentionally the default (None) for now — the virtual
+    // monitor's position in desktop space must be resolved from
+    // QueryDisplayConfig by matching the IDD adapter (extend-mode input
+    // mapping lands with driver bring-up; see docs/ROADMAP.md P0.1).
+
     fn mode(&self) -> DisplayMode {
         let h = self.header();
         let (w, hgt, hz) = unsafe {

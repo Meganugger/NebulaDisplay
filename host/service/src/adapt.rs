@@ -21,7 +21,7 @@
 //! * **Increases are gentle** (≈8%/s multiplicative probe) so recovery does
 //!   not immediately re-trigger congestion.
 
-use ndsp_protocol::messages::{Profile, ViewerStats};
+use ndsp_protocol::messages::{Codec, Profile, ViewerStats};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -33,7 +33,22 @@ pub struct ProfileEnvelope {
     pub max_fps: u32,
 }
 
-pub fn envelope(profile: Profile) -> ProfileEnvelope {
+pub fn envelope(profile: Profile, codec: Codec) -> ProfileEnvelope {
+    let mut env = base_envelope(profile);
+    // JPEG is roughly 5-10x less bit-efficient than H.264 for screen
+    // content. The profiles express *perceived quality* targets, so the
+    // JPEG (insecure-context web viewer) path gets a proportionally larger
+    // bandwidth envelope — LAN links have the headroom, and congestion
+    // signals still adapt it down when they don't.
+    if codec == Codec::Jpeg {
+        env.min_kbps *= 2;
+        env.start_kbps *= 4;
+        env.max_kbps *= 4;
+    }
+    env
+}
+
+fn base_envelope(profile: Profile) -> ProfileEnvelope {
     match profile {
         Profile::Office => ProfileEnvelope {
             min_kbps: 500,
@@ -85,6 +100,7 @@ const BACKLOG_FOR_DECREASE: u32 = 3;
 const FLOOR_PRESSURE_FOR_FPS_DROP: u32 = 2;
 
 pub struct AdaptiveController {
+    codec: Codec,
     env: ProfileEnvelope,
     bitrate_kbps: u32,
     fps: u32,
@@ -100,10 +116,11 @@ pub struct AdaptiveController {
 }
 
 impl AdaptiveController {
-    pub fn new(profile: Profile) -> Self {
-        let env = envelope(profile);
+    pub fn new(profile: Profile, codec: Codec) -> Self {
+        let env = envelope(profile, codec);
         let now = Instant::now();
         Self {
+            codec,
             env,
             bitrate_kbps: env.start_kbps,
             fps: env.max_fps,
@@ -122,7 +139,7 @@ impl AdaptiveController {
     }
 
     pub fn set_profile(&mut self, profile: Profile) {
-        self.env = envelope(profile);
+        self.env = envelope(profile, self.codec);
         self.bitrate_kbps = self
             .bitrate_kbps
             .clamp(self.env.min_kbps, self.env.max_kbps);
@@ -243,8 +260,20 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_envelope_scaled_for_codec_efficiency() {
+        let h264 = envelope(Profile::Office, Codec::H264);
+        let jpeg = envelope(Profile::Office, Codec::Jpeg);
+        assert!(jpeg.start_kbps > h264.start_kbps * 2);
+        assert!(jpeg.max_kbps > h264.max_kbps * 2);
+        assert_eq!(
+            jpeg.max_fps, h264.max_fps,
+            "fps targets are codec-independent"
+        );
+    }
+
+    #[test]
     fn backlog_cuts_bitrate() {
-        let mut c = AdaptiveController::new(Profile::Video);
+        let mut c = AdaptiveController::new(Profile::Video, Codec::H264);
         let start = c.bitrate_kbps();
         for _ in 0..3 {
             c.on_send_backlog();
@@ -254,7 +283,7 @@ mod tests {
 
     #[test]
     fn decrease_cooldown_prevents_oscillation() {
-        let mut c = AdaptiveController::new(Profile::Video);
+        let mut c = AdaptiveController::new(Profile::Video, Codec::H264);
         for _ in 0..3 {
             c.on_send_backlog();
         }
@@ -268,7 +297,7 @@ mod tests {
 
     #[test]
     fn floor_shifts_pressure_to_fps_slowly() {
-        let mut c = AdaptiveController::new(Profile::Office);
+        let mut c = AdaptiveController::new(Profile::Office, Codec::H264);
         // Drive to the floor (rewinding the cooldown to simulate time).
         for _ in 0..20 {
             rewind_cooldowns(&mut c);
@@ -276,28 +305,31 @@ mod tests {
                 c.on_send_backlog();
             }
         }
-        assert_eq!(c.bitrate_kbps(), envelope(Profile::Office).min_kbps);
-        assert!(c.fps() < envelope(Profile::Office).max_fps);
-        assert!(c.fps() >= envelope(Profile::Office).min_fps);
+        assert_eq!(
+            c.bitrate_kbps(),
+            envelope(Profile::Office, Codec::H264).min_kbps
+        );
+        assert!(c.fps() < envelope(Profile::Office, Codec::H264).max_fps);
+        assert!(c.fps() >= envelope(Profile::Office, Codec::H264).min_fps);
     }
 
     #[test]
     fn fps_does_not_drop_before_bitrate_floor() {
-        let mut c = AdaptiveController::new(Profile::Video);
+        let mut c = AdaptiveController::new(Profile::Video, Codec::H264);
         rewind_cooldowns(&mut c);
         for _ in 0..3 {
             c.on_send_backlog();
         }
         assert_eq!(
             c.fps(),
-            envelope(Profile::Video).max_fps,
+            envelope(Profile::Video, Codec::H264).max_fps,
             "fps must stay at max while bitrate can still absorb congestion"
         );
     }
 
     #[test]
     fn bufferbloat_needs_sustained_rtt_rise() {
-        let mut c = AdaptiveController::new(Profile::Gaming);
+        let mut c = AdaptiveController::new(Profile::Gaming, Codec::H264);
         let start = c.bitrate_kbps();
         c.on_rtt_sample(5.0);
         // A couple of outliers must NOT trigger a cut...
@@ -315,7 +347,7 @@ mod tests {
 
     #[test]
     fn clean_link_recovers() {
-        let mut c = AdaptiveController::new(Profile::Video);
+        let mut c = AdaptiveController::new(Profile::Video, Codec::H264);
         for _ in 0..3 {
             c.on_send_backlog();
         }
@@ -329,7 +361,7 @@ mod tests {
 
     #[test]
     fn fps_restores_after_long_clean_period() {
-        let mut c = AdaptiveController::new(Profile::Video);
+        let mut c = AdaptiveController::new(Profile::Video, Codec::H264);
         // Force fps down.
         for _ in 0..20 {
             rewind_cooldowns(&mut c);
@@ -337,14 +369,17 @@ mod tests {
                 c.on_send_backlog();
             }
         }
-        assert!(c.fps() < envelope(Profile::Video).max_fps);
+        assert!(c.fps() < envelope(Profile::Video, Codec::H264).max_fps);
         // Recover bitrate fully.
         for _ in 0..200 {
             c.clean_since = Instant::now() - CLEAN_BEFORE_FPS_RESTORE;
             c.last_increase = Instant::now() - INCREASE_INTERVAL;
             c.on_tick();
         }
-        assert_eq!(c.bitrate_kbps(), envelope(Profile::Video).max_kbps);
-        assert_eq!(c.fps(), envelope(Profile::Video).max_fps);
+        assert_eq!(
+            c.bitrate_kbps(),
+            envelope(Profile::Video, Codec::H264).max_kbps
+        );
+        assert_eq!(c.fps(), envelope(Profile::Video, Codec::H264).max_fps);
     }
 }
