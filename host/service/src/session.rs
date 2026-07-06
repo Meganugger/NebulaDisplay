@@ -379,8 +379,18 @@ async fn video_task(
     let mut last_encode_at = Instant::now() - Duration::from_secs(1);
 
     loop {
-        if frames.changed().await.is_err() {
-            break; // capture loop gone
+        // Wake on a new captured frame — or, rarely, on a pending keyframe
+        // request while the screen is static (capture publishes nothing for
+        // an unchanged screen, but a resyncing decoder still needs its IDR;
+        // without this arm it would wait for on-screen activity).
+        let keyframe_pending = shared.force_keyframe.load(Ordering::Relaxed);
+        tokio::select! {
+            changed = frames.changed() => {
+                if changed.is_err() {
+                    break; // capture loop gone
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)), if keyframe_pending => {}
         }
 
         let (bitrate, fps) = {
@@ -394,14 +404,30 @@ async fn video_task(
         let since = last_encode_at.elapsed();
         if since < min_interval {
             tokio::time::sleep(min_interval - since).await;
+            // Rate-capped means the pipeline has headroom — so prefer
+            // encoding content captured *after* the pacing gate opened.
+            // Without this, the frame picked here is on average half a
+            // capture interval old (measured: 9 ms at a 30 fps cap with
+            // 60 Hz capture). Bounded wait so a screen going static (or a
+            // pending keyframe) can't stall the loop.
+            let fresh_wait = Duration::from_millis(17).min(min_interval);
+            let stale = frames
+                .borrow()
+                .as_ref()
+                .is_none_or(|f| now_us().saturating_sub(f.timestamp_us) > 4_000);
+            if stale {
+                let _ = tokio::time::timeout(fresh_wait, frames.changed()).await;
+            }
         }
 
         // Newest captured frame (frames that landed during the pacing sleep
-        // are coalesced — we always encode the latest).
+        // are coalesced — we always encode the latest). A pending keyframe
+        // request may re-encode the current frame even without a new one.
+        let want_key_now = shared.force_keyframe.load(Ordering::Relaxed);
         let frame = {
             let borrowed = frames.borrow_and_update();
             match borrowed.as_ref() {
-                Some(f) if f.seq > last_captured_seq => Some(f.clone()),
+                Some(f) if f.seq > last_captured_seq || want_key_now => Some(f.clone()),
                 _ => None,
             }
         };

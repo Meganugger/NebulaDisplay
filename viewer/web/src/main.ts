@@ -282,7 +282,12 @@ function enterViewer(s: Session): void {
   statsTimer = window.setInterval(() => {
     if (!renderer) return;
     const st = renderer.stats;
-    const e2e = st.lastPresentedTsUs > 0n ? clock.latencyMs(st.lastPresentedTsUs) : null;
+    // Latency of the last presented frame *at the moment it was painted* —
+    // latencyMs() alone would add however long ago that paint happened
+    // (up to a full frame interval of pure measurement error).
+    const sincePaintMs = performance.now() - st.lastPresentedAtMs;
+    const raw = st.lastPresentedTsUs > 0n ? clock.latencyMs(st.lastPresentedTsUs) : null;
+    const e2e = raw === null ? null : Math.max(0, raw - sincePaintMs);
     void s.send({
       type: "stats",
       stats: {

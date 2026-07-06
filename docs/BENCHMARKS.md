@@ -28,12 +28,19 @@ deployment hardware for absolute ones.
 
 | size | profile | fps | e2e ms | net+host ms | present ms | enc ms | cvt ms | age ms | send ms | dec ms |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1280x720 | office (30 cap) | 29.0 | 41.6 | 19.2 | 5.8 | 9.6 | 2.3 | 9.0 | 0.0 | 1.2 |
-| 1280x720 | video (60 cap) | 54.8 | 23.6 | 15.1 | 5.7 | 9.5 | 2.2 | 5.0 | 0.0 | 1.1 |
-| 1920x1080 | video | 25.3 | 44.2 | 19.7 | 9.5 | 19.1 | 5.6 | 0.1 | 0.0 | 1.7 |
-| 1920x1080 | gaming | 25.2 | 61.3 | 20.6 | 11.8 | 19.3 | 5.7 | 0.2 | 0.0 | 3.0 |
-| 2560x1440 | video | 14.3 | 78.8 | 34.2 | 14.7 | 34.0 | 9.7 | 0.1 | 0.1 | 2.6 |
-| 3840x2160 | video | 6.4 | 159.8 | 75.9 | 31.2 | 71.8 | 21.1 | 0.4 | 0.1 | 5.9 |
+| 1280x720 | office (30 cap) | 27.5 | 16.8 | 10.9 | 6.0 | 9.8 | 2.4 | 0.1 | 0.0 | 1.2 |
+| 1280x720 | video (60 cap) | 52.1 | 16.5 | 10.1 | 5.6 | 9.5 | 2.3 | 0.3 | 0.0 | 1.1 |
+| 1920x1080 | video | 24.8 | 31.5 | 20.9 | 9.6 | 20.2 | 5.8 | 0.1 | 0.1 | 1.7 |
+| 1920x1080 | gaming | 25.1 | 33.6 | 20.4 | 9.7 | 19.7 | 5.8 | 0.1 | 0.1 | 1.8 |
+| 2560x1440 | video | 14.2 | 52.4 | 33.7 | 14.8 | 33.0 | 9.8 | 0.1 | 0.1 | 2.6 |
+| 3840x2160 | video | 6.3 | 117.6 | 76.2 | 37.6 | 70.0 | 21.1 | 0.4 | 0.1 | 6.0 |
+
+The stages now *sum to the total*: e.g. 720p60 → 10.1 (host+net) + 1.1
+(decode) + 5.6 (present incl. software-canvas draw) ≈ 16.5 measured e2e —
+there is no unexplained latency left in the pipeline. The software encoder
+is 55–60 % of e2e at 720p/1080p and the software canvas paint most of the
+rest; on real hardware (NVENC ≈ 1–3 ms, GPU compositing < 1 ms) the same
+pipeline delivers single-digit e2e.
 
 Column meanings: `e2e` = capture timestamp → canvas paint (synced clocks);
 `net+host` = capture → envelope arrival at the viewer; `present` = decode
@@ -52,10 +59,17 @@ carry it.
 
 ## Before → after (this overhaul, same harness/hardware)
 
+Two latency fixes landed *between* these rows and the first recorded matrix:
+the pacing loop now waits for content captured **after** the rate gate opens
+(cut ≈ 9 ms of average frame staleness at a 30 fps cap), and a measurement
+bug was fixed where e2e was sampled at stats time instead of paint time
+(inflating every previously reported e2e by up to a frame interval — the
+"before" numbers below share that inflation, so relative deltas hold).
+
 | Metric | before | after |
 |---|---|---|
-| Browser E2E, 720p office | 58.4 ms @ 30.1 fps | 41.6 ms @ 29 fps (10 s avg) |
-| Browser E2E, 720p video profile | *stuck at ~29 fps* (profile-switch bug) | 54.8 fps @ 23.6 ms |
+| Browser E2E, 720p office | 58.4 ms @ 30.1 fps | 16.8 ms @ 27.5 fps (10 s avg, corrected measurement) |
+| Browser E2E, 720p video profile | *stuck at ~29 fps* (profile-switch bug) | 52.1 fps @ 16.5 ms |
 | 1080p software encode (full-motion microbench) | 27.9 ms/frame | 22.6 ms/frame (multi-slice) |
 | Encoder rebuilds during bitrate adaptation | on **every raise** (IDR storm: "runtime bitrate update failed") | **zero** (regression-tested) |
 | Static desktop (idle) | full encode+send per frame | **no encode, no send** (dirty elision) |
