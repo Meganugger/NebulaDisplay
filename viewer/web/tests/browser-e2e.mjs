@@ -9,7 +9,7 @@
 
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +25,10 @@ const port = 41997;
 const panelPort = 41996;
 
 const host = spawn(
-  join(repoRoot, "target", "debug", "nebulad"),
+  process.env.NEBULAD_BIN ??
+    (existsSync(join(repoRoot, "target", "release", "nebulad"))
+      ? join(repoRoot, "target", "release", "nebulad")
+      : join(repoRoot, "target", "debug", "nebulad")),
   [
     "--test-pattern", "--bind", "127.0.0.1",
     "--port", String(port), "--panel-port", String(panelPort),

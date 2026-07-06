@@ -1,0 +1,67 @@
+; NebulaDisplay Virtual Display Driver — INF
+; UMDF v2 Indirect Display Driver (IddCx), root-enumerated software device.
+;
+; Install (test-signed / dev): see ..\..\installer\install-driver.ps1
+; Production requires an attestation-signed or WHQL package (docs/DRIVER.md).
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = nebuladisplay.cat
+DriverVer   = 07/06/2026,0.2.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13 ; driver store
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+NebulaDisplayDriver.dll = 1
+
+[Manufacturer]
+%ProviderName% = NebulaDisplay, NT$ARCH$.10.0...17763
+
+[NebulaDisplay.NT$ARCH$.10.0...17763]
+%DeviceName% = NebulaDisplay_Install, Root\NebulaDisplayIdd
+
+[NebulaDisplay_Install.NT]
+CopyFiles = @NebulaDisplayDriver.dll
+
+[NebulaDisplay_Install.NT.hw]
+AddReg = NebulaDisplay_HwAddReg
+
+[NebulaDisplay_HwAddReg]
+; UMDF host process runs the driver DLL.
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "WudfRd"
+
+[NebulaDisplay_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[NebulaDisplay_Install.NT.Wdf]
+UmdfService              = NebulaDisplayDriver, NebulaDisplay_UmdfInstall
+UmdfServiceOrder         = NebulaDisplayDriver
+UmdfKernelModeClientPolicy   = AllowKernelModeClients
+UmdfHostProcessSharing   = ProcessSharingDisabled
+
+[NebulaDisplay_UmdfInstall]
+UmdfLibraryVersion  = $UMDFVERSION$
+ServiceBinary       = %13%\NebulaDisplayDriver.dll
+UmdfExtensions      = IddCx0102
+
+[Strings]
+ProviderName      = "NebulaDisplay Project"
+DeviceName        = "NebulaDisplay Virtual Display"
+DiskName          = "NebulaDisplay Driver Disk"
+WudfRdDisplayName = "Windows Driver Framework - Reflector"
+REG_MULTI_SZ      = 0x00010000

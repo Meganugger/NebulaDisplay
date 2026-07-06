@@ -8,7 +8,7 @@
 // Usage: node tests/web-compat.mjs  (spawns its own nebulad)
 
 import { spawn, execSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,7 +37,10 @@ const { Session } = await import("/tmp/ndsp-session-bundle.mjs");
 const dataDir = mkdtempSync(join(tmpdir(), "ndsp-webcompat-"));
 const port = 41999;
 const host = spawn(
-  join(repoRoot, "target", "debug", "nebulad"),
+  process.env.NEBULAD_BIN ??
+    (existsSync(join(repoRoot, "target", "release", "nebulad"))
+      ? join(repoRoot, "target", "release", "nebulad")
+      : join(repoRoot, "target", "debug", "nebulad")),
   [
     "--test-pattern",
     "--port", String(port),

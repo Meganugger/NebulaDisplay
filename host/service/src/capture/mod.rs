@@ -8,6 +8,8 @@
 mod test_pattern;
 #[cfg(windows)]
 mod windows_dxgi;
+#[cfg(windows)]
+mod windows_idd;
 
 use ndsp_protocol::messages::DisplayMode;
 use std::sync::Arc;
@@ -34,10 +36,28 @@ pub fn test_pattern_for_tests(width: u32, height: u32) -> impl FrameSource {
 }
 
 /// Choose the best available source for this platform.
+/// Priority on Windows: IddCx virtual-display ring (extend mode) → DXGI
+/// duplication (mirror mode) → test pattern.
 pub fn create_source(force_test_pattern: bool, width: u32, height: u32) -> Box<dyn FrameSource> {
     #[cfg(windows)]
     {
         if !force_test_pattern {
+            match windows_idd::WindowsIddSource::new() {
+                Ok(src) if src.is_connected() => {
+                    info!(
+                        "using IddCx virtual display (extend mode, {}x{})",
+                        src.mode().width,
+                        src.mode().height
+                    );
+                    return Box::new(src);
+                }
+                Ok(_) => {
+                    info!("driver ring present but no monitor attached yet; using mirror mode");
+                }
+                Err(e) => {
+                    info!("virtual display driver not active ({e:#}); using mirror mode");
+                }
+            }
             match windows_dxgi::DxgiDuplicationSource::new() {
                 Ok(src) => {
                     info!(

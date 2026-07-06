@@ -57,7 +57,11 @@ impl HandshakeKeys {
         let secret = EphemeralSecret::random(&mut OsRng);
         // Explicitly uncompressed SEC1 (65 bytes, 0x04-prefixed): the only raw
         // EC point encoding every browser's WebCrypto importKey("raw") accepts.
-        let public_sec1 = secret.public_key().to_encoded_point(false).as_bytes().to_vec();
+        let public_sec1 = secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
         Self {
             secret,
             public_sec1,
