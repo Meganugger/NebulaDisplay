@@ -16,12 +16,17 @@ use windows::Win32::System::Threading::{
 use super::FrameSource;
 
 const RING_MAGIC: u32 = 0x4E44_5352; // "NDSR"
-const RING_VERSION: u32 = 1;
+const RING_VERSION: u32 = 2;
 const RING_SLOTS: u32 = 3;
-const RING_NAME: &str = "Local\\NebulaDisplay.FrameRing.v1";
-const FRAME_EVENT: &str = "Local\\NebulaDisplay.FrameReady.v1";
 const MAX_W: u32 = 4096;
 const MAX_H: u32 = 2304;
+
+fn ring_name(index: u32) -> String {
+    format!("Local\\NebulaDisplay.FrameRing.v2.{index}")
+}
+fn frame_event_name(index: u32) -> String {
+    format!("Local\\NebulaDisplay.FrameReady.v2.{index}")
+}
 
 #[repr(C, align(8))]
 struct SlotHeader {
@@ -44,7 +49,8 @@ struct RingHeader {
     width: u32,
     height: u32,
     refresh_hz: u32,
-    reserved: [u32; 7],
+    monitor_index: u32,
+    reserved: [u32; 6],
     slot_headers: [SlotHeader; RING_SLOTS as usize],
 }
 
@@ -60,11 +66,12 @@ pub struct WindowsIddSource {
 unsafe impl Send for WindowsIddSource {}
 
 impl WindowsIddSource {
-    /// Attach to the driver's ring. Fails cleanly when the driver isn't
-    /// installed/running — callers fall back to DXGI mirror mode.
-    pub fn new() -> anyhow::Result<Self> {
+    /// Attach to the driver's ring for virtual monitor `index`. Fails
+    /// cleanly when the driver isn't installed/running — callers fall back
+    /// to DXGI mirror mode.
+    pub fn new(index: u32) -> anyhow::Result<Self> {
         unsafe {
-            let mapping = OpenFileMappingW(FILE_MAP_READ.0, false, &HSTRING::from(RING_NAME))
+            let mapping = OpenFileMappingW(FILE_MAP_READ.0, false, &HSTRING::from(ring_name(index)))
                 .context("virtual display driver ring not found (driver not installed/active)")?;
             let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
             if view.Value.is_null() {
@@ -86,7 +93,7 @@ impl WindowsIddSource {
             let event = OpenEventW(
                 SYNCHRONIZATION_SYNCHRONIZE,
                 false,
-                &HSTRING::from(FRAME_EVENT),
+                &HSTRING::from(frame_event_name(index)),
             )
             .context("driver frame event not found")?;
             Ok(Self {

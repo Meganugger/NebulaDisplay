@@ -62,13 +62,18 @@ pub fn test_pattern_for_tests(width: u32, height: u32) -> impl FrameSource {
 }
 
 /// Choose the best available source for this platform.
-/// Priority on Windows: IddCx virtual-display ring (extend mode) → DXGI
-/// duplication (mirror mode) → test pattern.
-pub fn create_source(force_test_pattern: bool, width: u32, height: u32) -> Box<dyn FrameSource> {
+/// Priority on Windows: IddCx virtual-display ring (extend mode; ring index
+/// from `display_index`) → DXGI duplication (mirror mode) → test pattern.
+pub fn create_source(
+    force_test_pattern: bool,
+    width: u32,
+    height: u32,
+    display_index: u32,
+) -> Box<dyn FrameSource> {
     #[cfg(windows)]
     {
         if !force_test_pattern {
-            match windows_idd::WindowsIddSource::new() {
+            match windows_idd::WindowsIddSource::new(display_index) {
                 Ok(src) if src.is_connected() => {
                     info!(
                         "using IddCx virtual display (extend mode, {}x{})",
@@ -99,7 +104,7 @@ pub fn create_source(force_test_pattern: bool, width: u32, height: u32) -> Box<d
             }
         }
     }
-    let _ = force_test_pattern; // silence unused on non-windows
+    let _ = (force_test_pattern, display_index); // silence unused on non-windows
     info!("using synthetic test-pattern source ({width}x{height})");
     Box::new(test_pattern::TestPatternSource::new(width, height))
 }

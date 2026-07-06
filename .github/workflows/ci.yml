@@ -41,6 +41,14 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  driver-syntax:
+    name: IddCx driver — syntax/type check (both header models)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check against stub WDK headers (IddCx 1.10 + 1.4)
+        run: host/windows-driver/tests/syntax-check.sh
+
   web:
     name: Web viewer — typecheck, build, host compat test
     runs-on: ubuntu-latest

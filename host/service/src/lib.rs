@@ -53,7 +53,7 @@ impl EmbeddedHost {
         };
         let state = Arc::new(AppState::new(cfg).await?);
 
-        let source = capture::create_source(true, opts.capture.0, opts.capture.1);
+        let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();
         let cap = tokio::spawn(async move {
             capture::run_capture_loop(cap_state, source).await;

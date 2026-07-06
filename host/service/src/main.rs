@@ -37,6 +37,10 @@ pub struct Args {
     /// Capture size for the test pattern source, e.g. 1280x720.
     #[arg(long, default_value = "1280x720")]
     pub capture_size: String,
+    /// Which virtual display (IddCx driver monitor index) to stream when the
+    /// driver exposes several. Ignored in mirror/test-pattern modes.
+    #[arg(long, default_value_t = 0)]
+    pub display_index: u32,
     /// Exit after N seconds (for smoke tests).
     #[arg(long)]
     pub exit_after: Option<u64>,
@@ -75,7 +79,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     // Capture → broadcast pipeline.
     let (w, h) = util::parse_size(&args.capture_size)?;
-    let source = capture::create_source(args.test_pattern, w, h);
+    let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
 
     // UDP discovery responder.

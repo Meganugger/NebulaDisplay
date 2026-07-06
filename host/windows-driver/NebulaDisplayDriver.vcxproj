@@ -40,11 +40,18 @@
   <ImportGroup Label="ExtensionSettings" />
   <PropertyGroup>
     <IncludePath>..\include;$(IncludePath)</IncludePath>
+    <!-- IddCx header version to compile against. 10 (IddCx 1.10, WDK for
+         Win11 22H2 / 10.0.22621+) enables the HDR-capable *2 callbacks;
+         pass /p:IddcxMinor=4 to build with an older WDK (10.0.19041+) —
+         Driver.h's NDSP_IDDCX_HAS_* gates adapt automatically.
+         IDDCX_MINIMUM_VERSION_REQUIRED=4 keeps the runtime floor at
+         Windows 10 2004 either way. -->
+    <IddcxMinor Condition="'$(IddcxMinor)'==''">10</IddcxMinor>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=2;IDDCX_MINIMUM_VERSION_REQUIRED=0x0102;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=$(IddcxMinor);IDDCX_MINIMUM_VERSION_REQUIRED=4;UMDF_DRIVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
     </ClCompile>

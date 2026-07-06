@@ -3,18 +3,26 @@
 ;
 ; Install (test-signed / dev): see ..\..\installer\install-driver.ps1
 ; Production requires an attestation-signed or WHQL package (docs/DRIVER.md).
+;
+; Targets Windows 10 2004 (build 19041, first IddCx 1.4 release) and later,
+; including all Windows 11 versions. Validate with:
+;   infverif /v /w nebuladisplay.inf   (WDK tool; /w = declarative-INF rules)
 
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer    = 2.0
 Provider    = %ProviderName%
 CatalogFile = nebuladisplay.cat
-DriverVer   = 07/06/2026,0.2.0.0
+DriverVer   = 07/06/2026,0.3.0.0
 PnpLockdown = 1
 
-[DestinationDirs]
-DefaultDestDir = 13 ; driver store
+[Manufacturer]
+%ProviderName% = NebulaDisplay, NT$ARCH$.10.0...19041
+
+[NebulaDisplay.NT$ARCH$.10.0...19041]
+%DeviceName% = NebulaDisplay_Install, Root\NebulaDisplayIdd
 
 [SourceDisksNames]
 1 = %DiskName%
@@ -22,46 +30,55 @@ DefaultDestDir = 13 ; driver store
 [SourceDisksFiles]
 NebulaDisplayDriver.dll = 1
 
-[Manufacturer]
-%ProviderName% = NebulaDisplay, NT$ARCH$.10.0...17763
+[DestinationDirs]
+UMDriverCopy = 12,UMDF ; %SystemRoot%\System32\drivers\UMDF
 
-[NebulaDisplay.NT$ARCH$.10.0...17763]
-%DeviceName% = NebulaDisplay_Install, Root\NebulaDisplayIdd
+[UMDriverCopy]
+NebulaDisplayDriver.dll
+
+; =================== UMDF device ==================================
 
 [NebulaDisplay_Install.NT]
-CopyFiles = @NebulaDisplayDriver.dll
+Include   = WUDFRD.inf
+Needs     = WUDFRD.NT
+CopyFiles = UMDriverCopy
 
 [NebulaDisplay_Install.NT.hw]
-AddReg = NebulaDisplay_HwAddReg
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.HW
+AddReg  = NebulaDisplay_HwAddReg
 
 [NebulaDisplay_HwAddReg]
-; UMDF host process runs the driver DLL.
-HKR,, "UpperFilters", %REG_MULTI_SZ%, "WudfRd"
+; IddCx drivers are loaded under the IndirectKmd kernel-mode filter.
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+; Dedicated UMDF host process group for this driver.
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "NebulaDisplayIddGroup"
+; Defaults consumed by the driver (companion CLI/installer may override;
+; device restart applies changes).
+HKR,, "MonitorCount", %REG_DWORD%, 1
 
 [NebulaDisplay_Install.NT.Services]
-AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
-
-[WUDFRD_ServiceInstall]
-DisplayName   = %WudfRdDisplayName%
-ServiceType   = 1
-StartType     = 3
-ErrorControl  = 1
-ServiceBinary = %12%\WUDFRd.sys
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.Services
 
 [NebulaDisplay_Install.NT.Wdf]
-UmdfService              = NebulaDisplayDriver, NebulaDisplay_UmdfInstall
-UmdfServiceOrder         = NebulaDisplayDriver
-UmdfKernelModeClientPolicy   = AllowKernelModeClients
-UmdfHostProcessSharing   = ProcessSharingDisabled
+UmdfService                = NebulaDisplayDriver, NebulaDisplay_UmdfInstall
+UmdfServiceOrder           = NebulaDisplayDriver
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing     = ProcessSharingDisabled
 
 [NebulaDisplay_UmdfInstall]
-UmdfLibraryVersion  = $UMDFVERSION$
-ServiceBinary       = %13%\NebulaDisplayDriver.dll
-UmdfExtensions      = IddCx0102
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %12%\UMDF\NebulaDisplayDriver.dll
+UmdfExtensions     = IddCx0102
+
+; =================== Strings ==================================
 
 [Strings]
-ProviderName      = "NebulaDisplay Project"
-DeviceName        = "NebulaDisplay Virtual Display"
-DiskName          = "NebulaDisplay Driver Disk"
-WudfRdDisplayName = "Windows Driver Framework - Reflector"
-REG_MULTI_SZ      = 0x00010000
+ProviderName = "NebulaDisplay Project"
+DeviceName   = "NebulaDisplay Virtual Display"
+DiskName     = "NebulaDisplay Driver Disk"
+
+REG_MULTI_SZ = 0x00010000
+REG_SZ       = 0x00000000
+REG_DWORD    = 0x00010001
