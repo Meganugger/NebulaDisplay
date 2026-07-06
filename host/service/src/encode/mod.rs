@@ -121,3 +121,38 @@ mod tests {
         assert!(out.keyframe, "resolution change must produce a keyframe");
     }
 }
+
+#[cfg(all(test, feature = "h264"))]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// Not a real benchmark harness — an ignored test that prints the
+    /// conversion/encode split at 1080p (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn print_encode_timing_split() {
+        let mut src = crate::capture::test_pattern_for_tests(1920, 1080);
+        use crate::capture::FrameSource;
+        let mut enc = create(Codec::H264).unwrap();
+        let mut buf = Vec::new();
+        let mut total_enc = 0.0;
+        const N: u32 = 60;
+        for i in 0..N {
+            src.next_frame(&mut buf).unwrap();
+            let f = crate::state::CapturedFrame {
+                seq: i as u64 + 1,
+                timestamp_us: 1,
+                width: 1920,
+                height: 1080,
+                bgra: std::mem::take(&mut buf),
+            };
+            let t = Instant::now();
+            let out = enc.encode(&f, false, 8000, 60).unwrap();
+            total_enc += t.elapsed().as_secs_f64() * 1000.0;
+            buf = f.bgra;
+            std::hint::black_box(out);
+        }
+        println!("1080p encode avg: {:.2} ms/frame", total_enc / N as f64);
+    }
+}

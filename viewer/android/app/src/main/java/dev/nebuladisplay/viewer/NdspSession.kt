@@ -194,6 +194,10 @@ class NdspSession private constructor(
         }
     }
 
+    // Synchronized: envelope counters must be allocated AND enqueued in the
+    // same order (the host closes the session on counter regression), and
+    // sendControl is reachable from both the UI thread and OkHttp callbacks.
+    @Synchronized
     fun sendControl(msg: JSONObject) {
         ws.send(envelope.seal(Envelope.CHAN_CONTROL, msg.toString().toByteArray()).toByteString())
     }

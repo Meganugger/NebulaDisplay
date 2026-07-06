@@ -8,15 +8,11 @@ use ndsp_protocol::messages::Codec;
 use super::{Encoded, Encoder};
 use crate::state::CapturedFrame;
 
-pub struct JpegEncoder {
-    rgb_scratch: Vec<u8>,
-}
+pub struct JpegEncoder;
 
 impl JpegEncoder {
     pub fn new() -> Self {
-        Self {
-            rgb_scratch: Vec::new(),
-        }
+        Self
     }
 
     /// Map a bitrate budget to JPEG quality for a given frame rate/size.
@@ -43,26 +39,16 @@ impl Encoder for JpegEncoder {
         let (w, h) = (frame.width as usize, frame.height as usize);
         anyhow::ensure!(frame.bgra.len() == w * h * 4, "frame buffer size mismatch");
 
-        // BGRA → RGB swizzle into a reused scratch buffer.
-        self.rgb_scratch.resize(w * h * 3, 0);
-        for (src, dst) in frame
-            .bgra
-            .chunks_exact(4)
-            .zip(self.rgb_scratch.chunks_exact_mut(3))
-        {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-        }
-
         let quality = self.quality_for(frame, target_bitrate_kbps, fps_hint);
+        // Encode straight from BGRA (the encoder ignores alpha) — no swizzle
+        // pass, no RGB scratch buffer, one less full-frame copy per frame.
         let mut out = Vec::with_capacity(w * h / 4);
         let enc = JEncoder::new(&mut out, quality);
         enc.encode(
-            &self.rgb_scratch,
+            &frame.bgra,
             frame.width as u16,
             frame.height as u16,
-            ColorType::Rgb,
+            ColorType::Bgra,
         )?;
         Ok(Encoded {
             payload: out,

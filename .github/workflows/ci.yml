@@ -59,6 +59,9 @@ jobs:
       - name: Typecheck + build
         working-directory: viewer/web
         run: npm run build
+      - name: Letterbox coordinate-mapping unit tests
+        working-directory: viewer/web
+        run: node tests/mapping.mjs
       - name: Build host for compat test
         run: cargo build -p nebulad
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)

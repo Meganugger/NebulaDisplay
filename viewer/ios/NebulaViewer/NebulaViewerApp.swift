@@ -79,10 +79,19 @@ final class ViewerModel: ObservableObject, NdspSessionDelegate {
 
     func sendTouch(phase: String, id: Int, location: CGPoint, size: CGSize) {
         guard let session, inputAllowed else { return }
+        // The video is displayed aspect-fit inside `size` — normalize against
+        // the letterboxed content box so taps hit the exact desktop pixel.
+        var box = CGRect(origin: .zero, size: size)
+        if let img = image, img.width > 0, img.height > 0, size.width > 0, size.height > 0 {
+            let scale = min(size.width / CGFloat(img.width), size.height / CGFloat(img.height))
+            let w = CGFloat(img.width) * scale
+            let h = CGFloat(img.height) * scale
+            box = CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+        }
         let event: [String: Any] = [
             "kind": "touch", "id": id, "phase": phase,
-            "x": min(max(location.x / max(size.width, 1), 0), 1),
-            "y": min(max(location.y / max(size.height, 1), 0), 1),
+            "x": min(max((location.x - box.minX) / max(box.width, 1), 0), 1),
+            "y": min(max((location.y - box.minY) / max(box.height, 1), 0), 1),
             "pressure": 1.0,
         ]
         Task { try? await session.sendControl(["type": "input", "events": [event]]) }

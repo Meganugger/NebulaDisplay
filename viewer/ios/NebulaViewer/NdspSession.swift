@@ -173,6 +173,11 @@ public final class NdspSession: NSObject {
 
     // MARK: encrypted phase
 
+    /// MainActor so concurrent callers cannot interleave counter allocation
+    /// with enqueueing: `seal` (counter++) and the `task.send` call both run
+    /// in the synchronous prefix, and URLSessionWebSocketTask preserves the
+    /// order of queued sends — the host closes on any counter regression.
+    @MainActor
     public func sendControl(_ obj: [String: Any]) async throws {
         let json = try JSONSerialization.data(withJSONObject: obj)
         let envelope = try sealer.seal(channel: 1, plaintext: json)

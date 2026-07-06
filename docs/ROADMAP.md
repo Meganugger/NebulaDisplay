@@ -3,6 +3,13 @@
 Everything below is **designed but not yet implemented** unless marked
 otherwise. Ordering = impact / effort.
 
+Recently shipped (v0.3 latency overhaul — no longer roadmap items):
+independent input/video session pipelines, event-driven encode, runtime
+encoder bitrate/fps (no re-init), adaptation hysteresis with sticky FPS,
+single-pass BGRA→I420, TCP_NODELAY, DXGI cursor compositing, multi-monitor
+input mapping, letterbox-correct touch coordinates on all viewers,
+device-rate pointer sampling, latest-frame rendering everywhere.
+
 ## P0 — performance & the driver
 
 1. **Driver bring-up** (needs a WDK machine): compile

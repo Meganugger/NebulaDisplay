@@ -14,7 +14,13 @@ class StreamRenderer(private val holder: SurfaceHolder) {
     private var configuredSize: Pair<Int, Int>? = null
     private var sawKeyframe = false
 
+    /** Native size of the current stream (width, height) for input mapping. */
+    @Volatile
+    var videoSize: Pair<Int, Int>? = null
+        private set
+
     fun onFrame(frame: VideoFrame) {
+        videoSize = frame.width to frame.height
         when (frame.codec) {
             1 -> renderH264(frame)
             0 -> renderJpeg(frame)

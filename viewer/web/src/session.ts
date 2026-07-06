@@ -198,10 +198,20 @@ export class Session {
     return session;
   }
 
-  async send(msg: ControlMsg): Promise<void> {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
-    const env = await this.sealer.seal(CHANNEL_CONTROL, te.encode(JSON.stringify(msg)));
-    this.ws.send(env);
+  /**
+   * Sends are chained: envelope counters must hit the wire in seal order or
+   * the server's replay protection (counter monotonicity) kills the session.
+   * Overlapping awaits on `seal` could otherwise reorder two messages.
+   */
+  private sendChain: Promise<void> = Promise.resolve();
+
+  send(msg: ControlMsg): Promise<void> {
+    this.sendChain = this.sendChain.then(async () => {
+      if (this.ws.readyState !== WebSocket.OPEN) return;
+      const env = await this.sealer.seal(CHANNEL_CONTROL, te.encode(JSON.stringify(msg)));
+      this.ws.send(env);
+    });
+    return this.sendChain;
   }
 
   /** Bytes currently queued on the socket (backpressure indicator). */

@@ -117,8 +117,19 @@ class MainActivity : Activity(), SessionListener {
                     put("kind", "touch")
                     put("id", ev.getPointerId(i))
                     put("phase", phase)
-                    put("x", (ev.getX(i) / v.width).coerceIn(0f, 1f))
-                    put("y", (ev.getY(i) / v.height).coerceIn(0f, 1f))
+                    // Normalize against the aspect-fit content box, not the
+                    // whole view — taps must hit the exact desktop pixel.
+                    val vs = renderer?.videoSize
+                    var left = 0f; var top = 0f
+                    var w = v.width.toFloat(); var h = v.height.toFloat()
+                    if (vs != null && vs.first > 0 && vs.second > 0 && w > 0 && h > 0) {
+                        val scale = minOf(w / vs.first, h / vs.second)
+                        val cw = vs.first * scale; val ch = vs.second * scale
+                        left = (w - cw) / 2; top = (h - ch) / 2
+                        w = cw; h = ch
+                    }
+                    put("x", ((ev.getX(i) - left) / w).coerceIn(0f, 1f))
+                    put("y", ((ev.getY(i) - top) / h).coerceIn(0f, 1f))
                     put("pressure", ev.getPressure(i))
                 })
             }
@@ -128,8 +139,28 @@ class MainActivity : Activity(), SessionListener {
     }
 
     // ---- SessionListener (called from OkHttp threads) -----------------------
+    private var fittedSize: Pair<Int, Int>? = null
+
     override fun onVideo(frame: VideoFrame) {
         renderer?.onFrame(frame)
+        // MediaCodec surface output stretches to the view bounds — keep the
+        // SurfaceView itself aspect-fit inside its parent so the image is
+        // undistorted and touch mapping stays 1:1.
+        val size = frame.width to frame.height
+        if (size != fittedSize && frame.width > 0 && frame.height > 0) {
+            fittedSize = size
+            runOnUiThread {
+                val parent = surface.parent as? View ?: return@runOnUiThread
+                val pw = parent.width.toFloat()
+                val ph = parent.height.toFloat()
+                if (pw <= 0 || ph <= 0) return@runOnUiThread
+                val scale = minOf(pw / frame.width, ph / frame.height)
+                val lp = surface.layoutParams
+                lp.width = (frame.width * scale).toInt()
+                lp.height = (frame.height * scale).toInt()
+                surface.layoutParams = lp
+            }
+        }
     }
 
     override fun onControl(msg: JSONObject) {
