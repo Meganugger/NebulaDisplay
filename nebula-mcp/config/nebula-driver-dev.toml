@@ -1,0 +1,83 @@
+# NebulaDisplay MCP — driver-development profile.
+#
+# A ready-to-use configuration for autonomously building, signing, installing
+# and testing the NebulaDisplay IddCx virtual-display driver on a Windows dev
+# box. Adjust the paths to your checkout, then:
+#
+#     nebula-mcp run --config nebula-driver-dev.toml --workdir C:\src\NebulaDisplay
+#
+# Security posture: elevation and destructive operations are DENIED globally and
+# granted only to the specific tools that need them, via per-tool overrides
+# (least privilege). Review before use on a shared machine; test-signing a
+# driver and toggling test-sign mode still require the external steps noted in
+# SECURITY.md (a reboot the server cannot perform).
+
+[server]
+name = "nebula-mcp-driverdev"
+max_concurrent_calls = 16
+
+[logging]
+level = "info"
+format = "json"
+# directory = "C:\\ProgramData\\nebula-mcp\\logs"
+rotation = "daily"
+
+[security]
+# Your driver source tree, build output, and a scratch area for certs/dumps.
+allowed_paths = [
+    "C:\\src\\NebulaDisplay\\**",
+    "C:\\builds\\**",
+    "C:\\nebula-scratch\\**",
+]
+allowed_commands = [
+    # Build + sign toolchain (Windows SDK/WDK on PATH).
+    "msbuild", "inf2cat", "signtool", "cargo", "rustc",
+    # Driver + device management.
+    "pnputil", "devcon", "verifier", "sc", "reg", "schtasks", "logman",
+    # Shell + diagnostics + benchmarking.
+    "powershell", "pwsh", "cdb", "procdump", "PresentMon", "wpr", "wpaexporter",
+    # VCS + net.
+    "git", "curl", "ping",
+]
+default_timeout_secs = 300
+max_runtime_secs = 3600
+max_output_bytes = 16777216
+# Denied globally; granted per-tool below.
+allow_elevated = false
+allow_destructive = false
+allow_network = true
+
+# --- Least-privilege elevation/destructive grants for the driver workflow ---
+
+[tools."driver.install"]
+allow_elevated = true
+allow_destructive = true
+
+[tools."driver.uninstall"]
+allow_elevated = true
+allow_destructive = true
+
+[tools."driver.display_restart"]
+allow_elevated = true
+allow_destructive = true
+
+[tools."driver.verifier"]
+allow_elevated = true
+allow_destructive = true
+
+[tools."driver.pnputil"]
+allow_elevated = true
+allow_destructive = true
+
+# Register/remove the kernel service under test.
+[tools."windows.service"]
+allow_elevated = true
+allow_destructive = true
+
+# Longer budget for full driver builds.
+[tools."driver.build"]
+timeout_secs = 1800
+
+# Frame captures can be large; allow more output.
+[tools."display.duplicate_frame"]
+max_output_bytes = 33554432

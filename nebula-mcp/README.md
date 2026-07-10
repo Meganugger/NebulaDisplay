@@ -14,7 +14,7 @@ model in front of everything.
 
 - **Language:** Rust (2021 edition, async Tokio).
 - **Transport:** MCP over stdio (newline-delimited JSON-RPC 2.0).
-- **Tools:** 138 across 16 categories (see [TOOLS.md](TOOLS.md)).
+- **Tools:** 140 across 16 categories (see [TOOLS.md](TOOLS.md)).
 - **Also implements** MCP resources (`resources/*`, incl. subscriptions),
   prompts (`prompts/*`), progress streaming, and runtime `logging/setLevel`.
 - **Platforms:** cross-platform core; Windows-specific subsystems compile
@@ -101,6 +101,7 @@ maximum captured-output size, and explicit `allow_elevated` / `allow_network` /
 | [CONFIGURATION.md](CONFIGURATION.md) | Every config field, hot reload, per-tool overrides |
 | [TOOLS.md](TOOLS.md) | The complete tool catalogue |
 | [API.md](API.md) | MCP methods, request/response shapes, error codes |
+| [RUNBOOK.md](RUNBOOK.md) | Autonomous driver build → sign → install → test → benchmark flow |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [ROADMAP.md](ROADMAP.md) | Planned work and known external limitations |
 

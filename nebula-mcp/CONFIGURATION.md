@@ -93,6 +93,19 @@ Per-tool overrides layered on the `[security]` baseline. All fields optional.
 | `allowed_paths` | [glob] | **Additional** paths (merged with baseline). |
 | `allowed_commands` | [string] | **Additional** commands (merged with baseline). |
 | `allow_destructive` | bool | Override the destructive gate for this tool. |
+| `allow_elevated` | bool | Override the elevation gate for this tool (least-privilege scoping). |
+
+Example (least-privilege: elevation off globally, granted only to the driver
+install tool):
+
+```toml
+[security]
+allow_elevated = false
+
+[tools."driver.install"]
+allow_elevated = true
+allow_destructive = true
+```
 
 Example:
 

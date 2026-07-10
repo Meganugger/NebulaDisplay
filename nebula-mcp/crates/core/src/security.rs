@@ -58,6 +58,7 @@ impl EffectivePolicy {
         let mut timeout_secs = base.default_timeout_secs;
         let mut max_output_bytes = base.max_output_bytes;
         let mut allow_destructive = base.allow_destructive;
+        let mut allow_elevated = base.allow_elevated;
 
         if let Some(o) = ov {
             if let Some(extra) = &o.allowed_paths {
@@ -74,6 +75,9 @@ impl EffectivePolicy {
             }
             if let Some(d) = o.allow_destructive {
                 allow_destructive = d;
+            }
+            if let Some(e) = o.allow_elevated {
+                allow_elevated = e;
             }
         }
 
@@ -94,7 +98,7 @@ impl EffectivePolicy {
             timeout,
             max_runtime,
             max_output_bytes,
-            allow_elevated: base.allow_elevated,
+            allow_elevated,
             allow_network: base.allow_network,
             allow_destructive,
         })
@@ -408,5 +412,23 @@ mod tests {
         let (out, truncated) = p.clamp_output(b"123456");
         assert_eq!(out, b"1234");
         assert!(truncated);
+    }
+
+    #[test]
+    fn per_tool_elevation_override_grants_scoped_elevation() {
+        let base = SecurityConfig {
+            allow_elevated: false,
+            ..Default::default()
+        };
+        // Baseline denies elevation.
+        let p = EffectivePolicy::build("driver.other", &base, None).unwrap();
+        assert!(p.ensure_elevation_allowed().is_err());
+        // A per-tool override grants it just for this tool.
+        let ov = crate::config::ToolOverride {
+            allow_elevated: Some(true),
+            ..Default::default()
+        };
+        let p2 = EffectivePolicy::build("driver.install", &base, Some(&ov)).unwrap();
+        assert!(p2.ensure_elevation_allowed().is_ok());
     }
 }

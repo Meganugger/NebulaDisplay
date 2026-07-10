@@ -199,6 +199,8 @@ pub struct ToolOverride {
     pub allowed_commands: Option<Vec<String>>,
     /// Override the destructive flag for this tool.
     pub allow_destructive: Option<bool>,
+    /// Override the elevation flag for this tool (least-privilege scoping).
+    pub allow_elevated: Option<bool>,
 }
 
 /// Per-category enable switch. A disabled category disables all of its tools.

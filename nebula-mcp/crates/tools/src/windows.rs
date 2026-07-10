@@ -63,7 +63,8 @@ impl Tool for WinService {
         CATEGORY
     }
     fn description(&self) -> &str {
-        "Query or control a Windows service (query/start/stop/restart) via sc.exe. Windows only."
+        "Query or control a Windows service (query/start/stop/restart/create/delete/config) via \
+         sc.exe. create/delete/config require elevation; stop/restart/delete are destructive. Windows only."
     }
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
@@ -71,7 +72,26 @@ impl Tool for WinService {
             .enumerated(
                 "action",
                 "Action.",
-                &["query", "start", "stop", "restart"],
+                &[
+                    "query", "start", "stop", "restart", "create", "delete", "config",
+                ],
+                false,
+            )
+            .string(
+                "binPath",
+                "Executable/driver path (for create/config).",
+                false,
+            )
+            .enumerated(
+                "serviceType",
+                "Service type (for create/config).",
+                &["own", "share", "kernel", "filesys"],
+                false,
+            )
+            .enumerated(
+                "startType",
+                "Start type (for create/config).",
+                &["boot", "system", "auto", "demand", "disabled"],
                 false,
             )
             .build()
@@ -120,13 +140,63 @@ impl Tool for WinService {
             "restart" => {
                 ctx.policy
                     .ensure_destructive_allowed("windows.service restart")?;
-                // sc has no restart; use PowerShell Restart-Service.
                 let script = format!(
                     "Restart-Service -Name '{}' -Force -PassThru | ConvertTo-Json",
                     name.replace('\'', "''")
                 );
                 let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
                 Ok(exec_result("Restart-Service", &r))
+            }
+            "create" => {
+                ctx.policy.ensure_elevation_allowed()?;
+                let bin = a.opt_str("binPath")?.ok_or_else(|| {
+                    ToolError::InvalidArguments("create requires 'binPath'".into())
+                })?;
+                let mut v = vec![
+                    "create".to_string(),
+                    name.clone(),
+                    "binPath=".into(),
+                    bin.into(),
+                ];
+                if let Some(t) = a.opt_str("serviceType")? {
+                    v.push("type=".into());
+                    v.push(t.into());
+                }
+                if let Some(st) = a.opt_str("startType")? {
+                    v.push("start=".into());
+                    v.push(st.into());
+                }
+                run_cmd(ctx, "sc", v, "sc create", None).await
+            }
+            "config" => {
+                ctx.policy.ensure_elevation_allowed()?;
+                let mut v = vec!["config".to_string(), name.clone()];
+                if let Some(b) = a.opt_str("binPath")? {
+                    v.push("binPath=".into());
+                    v.push(b.into());
+                }
+                if let Some(t) = a.opt_str("serviceType")? {
+                    v.push("type=".into());
+                    v.push(t.into());
+                }
+                if let Some(st) = a.opt_str("startType")? {
+                    v.push("start=".into());
+                    v.push(st.into());
+                }
+                run_cmd(ctx, "sc", v, "sc config", None).await
+            }
+            "delete" => {
+                ctx.policy.ensure_elevation_allowed()?;
+                ctx.policy
+                    .ensure_destructive_allowed("windows.service delete")?;
+                run_cmd(
+                    ctx,
+                    "sc",
+                    vec!["delete".into(), name.clone()],
+                    "sc delete",
+                    None,
+                )
+                .await
             }
             other => Err(ToolError::InvalidArguments(format!(
                 "unknown action '{other}'"

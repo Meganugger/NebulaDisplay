@@ -24,7 +24,7 @@ software-development environment to autonomous agents.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **138 tools** (`nebula-mcp-tools`) across 16 categories:
+- **140 tools** (`nebula-mcp-tools`) across 16 categories:
   - **filesystem** (14): read/write/edit/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
@@ -38,10 +38,12 @@ software-development environment to autonomous agents.
     sampling, native TLS inspection, WebSocket, ping, iperf3, packet capture,
     QUIC/HTTP3 probe.
   - **powershell** (3): non-interactive, elevated, and remote execution.
-  - **windows** (8): services, registry, event log, performance counters,
-    scheduled tasks, environment, firewall, network adapters.
-  - **driver** (11): MSBuild, inf2cat, signtool, pnputil, devcon, Driver
-    Verifier, IddCx diagnostics, display restart, install/uninstall, logs.
+  - **windows** (8): services (query/start/stop/restart/create/delete/config),
+    registry, event log, performance counters, scheduled tasks, environment,
+    firewall, network adapters.
+  - **driver** (13): MSBuild, inf2cat, signtool, signtool-verify, test-cert
+    creation, pnputil, devcon, Driver Verifier, IddCx diagnostics, display
+    restart, install/uninstall, logs.
   - **display** (10): native QueryDisplayConfig, DXGI adapters/outputs, monitor
     topology, DWM info, present/timing statistics, HDR/advanced-colour
     detection, coordinate-to-monitor mapping, virtual-display enumeration,

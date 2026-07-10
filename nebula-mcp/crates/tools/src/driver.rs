@@ -28,6 +28,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(DriverBuild),
         Arc::new(Inf2Cat),
         Arc::new(SignTool),
+        Arc::new(SignToolVerify),
+        Arc::new(CreateTestCert),
         Arc::new(PnpUtil),
         Arc::new(DevCon),
         Arc::new(DriverVerifier),
@@ -198,6 +200,133 @@ impl Tool for SignTool {
         }
         st_args.push(file.display().to_string());
         run_cmd(ctx, "signtool", st_args, "signtool sign", None).await
+    }
+}
+
+/// Verify a signature with signtool.
+struct SignToolVerify;
+
+#[async_trait]
+impl Tool for SignToolVerify {
+    fn name(&self) -> &str {
+        "driver.signtool_verify"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Verify a file's Authenticode signature with signtool. Set kernelPolicy for the driver \
+         signing policy (/kp), otherwise the default policy (/pa) is used. Windows only."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .string("file", "Signed file to verify.", true)
+            .boolean(
+                "kernelPolicy",
+                "Use the kernel-mode driver signing policy (/kp).",
+                false,
+            )
+            .build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            ..Default::default()
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        ensure_windows(self.name())?;
+        let a = Args::new(&args)?;
+        let file = ctx.resolve_path(a.str("file")?)?;
+        let policy = if a.bool_or("kernelPolicy", false)? {
+            "/kp"
+        } else {
+            "/pa"
+        };
+        run_cmd(
+            ctx,
+            "signtool",
+            vec![
+                "verify".into(),
+                "/v".into(),
+                policy.into(),
+                file.display().to_string(),
+            ],
+            "signtool verify",
+            None,
+        )
+        .await
+    }
+}
+
+/// Create a self-signed code-signing certificate for driver test signing.
+struct CreateTestCert;
+
+#[async_trait]
+impl Tool for CreateTestCert {
+    fn name(&self) -> &str {
+        "driver.create_test_cert"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Create a self-signed code-signing certificate (New-SelfSignedCertificate) for driver test \
+         signing and return its thumbprint. Defaults to the CurrentUser store. Windows only."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .string(
+                "subject",
+                "Certificate subject, e.g. 'CN=NebulaDisplay Test'.",
+                true,
+            )
+            .string("friendlyName", "Friendly name for the certificate.", false)
+            .enumerated(
+                "store",
+                "Certificate store scope.",
+                &["CurrentUser", "LocalMachine"],
+                false,
+            )
+            .string(
+                "exportPath",
+                "Optional path to export the public certificate (.cer).",
+                false,
+            )
+            .build()
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        ensure_windows(self.name())?;
+        let a = Args::new(&args)?;
+        let subject = a.str("subject")?.replace('\'', "''");
+        let store = a.str_or("store", "CurrentUser")?;
+        if store == "LocalMachine" {
+            ctx.policy.ensure_elevation_allowed()?;
+        }
+        let friendly = a
+            .str_or("friendlyName", "NebulaDisplay Test Certificate")?
+            .replace('\'', "''");
+        let export = match a.opt_str("exportPath")? {
+            Some(p) => Some(ctx.resolve_path(p)?),
+            None => None,
+        };
+        let export_clause = match &export {
+            Some(path) => format!(
+                "; Export-Certificate -Cert $cert -FilePath '{}' | Out-Null",
+                path.display().to_string().replace('\'', "''")
+            ),
+            None => String::new(),
+        };
+        let script = format!(
+            "$cert = New-SelfSignedCertificate -Type CodeSigningCert \
+             -Subject '{subject}' -FriendlyName '{friendly}' \
+             -CertStoreLocation 'Cert:\\{store}\\My' \
+             -KeyUsage DigitalSignature -KeyExportPolicy Exportable{export_clause}; \
+             [pscustomobject]@{{ Thumbprint = $cert.Thumbprint; Subject = $cert.Subject; \
+             NotAfter = $cert.NotAfter }} | ConvertTo-Json"
+        );
+        let r = run_powershell(ctx, POWERSHELL, &script, None).await?;
+        Ok(exec_result("New-SelfSignedCertificate", &r))
     }
 }
 

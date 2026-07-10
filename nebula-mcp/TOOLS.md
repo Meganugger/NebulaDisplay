@@ -1,6 +1,6 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **138 MCP tools** across 16 categories. Every tool is
+This server exposes **140 MCP tools** across 16 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
 whose text content is (for most tools) a JSON document; `display.duplicate_frame`
 and the browser tools can also return image content.
@@ -17,8 +17,8 @@ Legend:
   supplies a `progressToken` on the call.
 
 The server also implements MCP `resources/*` (incl. subscribe), `prompts/*` and
-`logging/setLevel`, and an optional Prometheus `/metrics` endpoint (see API.md,
-CONFIGURATION.md). Input schemas for each tool are advertised via `tools/list`.
+`logging/setLevel`, and an optional Prometheus `/metrics` endpoint. See API.md
+and RUNBOOK.md. Input schemas for each tool are advertised via `tools/list`.
 
 
 ### `benchmark`
@@ -90,6 +90,8 @@ CONFIGURATION.md). Input schemas for each tool are advertised via `tools/list`.
 | `driver.build` | Build a driver solution/project with MSBuild. Windows only. |
 | `driver.inf2cat` | Create a driver catalog (.cat) from an INF directory with inf2cat. Windows only. |
 | `driver.signtool` | Sign a driver/catalog/binary with signtool using a certificate store thumbprint. Windows only. |
+| `driver.signtool_verify` | Verify a file's Authenticode signature with signtool. Set kernelPolicy for the driver signing policy (/kp), otherwise the default policy (/pa) is used. Windows only. |
+| `driver.create_test_cert` | Create a self-signed code-signing certificate (New-SelfSignedCertificate) for driver test signing and return its thumbprint. Defaults to the CurrentUser store. Windows only. |
 | `driver.pnputil` | Run pnputil with a bounded action set: enum_drivers, add_driver, delete_driver. Windows only. |
 | `driver.devcon` | Run devcon for device management: status, restart, enable, disable. Windows only. |
 | `driver.verifier` | Control Driver Verifier: query, standard (enable standard flags for a driver), or reset. Enabling/resetting requires elevation and destructive policy (takes effect after reboot and can cause bugchecks). Windows only. |
@@ -230,7 +232,7 @@ CONFIGURATION.md). Input schemas for each tool are advertised via `tools/list`.
 
 | Tool | Description |
 | --- | --- |
-| `windows.service` | Query or control a Windows service (query/start/stop/restart) via sc.exe. Windows only. |
+| `windows.service` | Query or control a Windows service (query/start/stop/restart/create/delete/config) via sc.exe. create/delete/config require elevation; stop/restart/delete are destructive. Windows only. |
 | `windows.registry` | Query, set or delete registry keys/values via reg.exe. Delete is destructive. Windows only. |
 | `windows.event_log` | Query a Windows event log (e.g. System, Application) and return recent events as JSON. Windows only. |
 | `windows.perf_counters` | Sample Windows performance counters (e.g. '\Processor(_Total)\% Processor Time') via Get-Counter. Windows only. |
