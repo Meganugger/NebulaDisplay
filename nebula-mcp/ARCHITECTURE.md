@@ -27,7 +27,7 @@
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │  nebula-mcp-tools    │  132 tools in 15 category modules
+                    │  nebula-mcp-tools    │  134 tools in 15 category modules
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
@@ -105,7 +105,10 @@ Windows-specific tools take one of two forms:
 
 ### `nebula-mcp-server`
 
-The dispatch engine and CLI.
+The dispatch engine and CLI. Alongside `tools/*` it implements MCP
+`resources/*` (workspace files exposed under the same path policy), `prompts/*`
+(curated engineering-workflow prompts), progress notifications, and
+`logging/setLevel` (backed by a reloadable tracing filter).
 
 ## Request lifecycle
 

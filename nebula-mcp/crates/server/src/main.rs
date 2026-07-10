@@ -130,7 +130,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let config = load_config(cli.config.as_deref())?;
 
     // Initialise telemetry before building the runtime so early logs are captured.
-    let _telemetry = telemetry::init(&config.snapshot().logging)
+    let (_telemetry, log_control) = telemetry::init(&config.snapshot().logging)
         .map_err(|e| anyhow::anyhow!("telemetry init failed: {e}"))?;
 
     let workdir = cli
@@ -177,6 +177,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             workdir,
             root_cancel.clone(),
         ));
+        server.set_log_control(log_control);
 
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();

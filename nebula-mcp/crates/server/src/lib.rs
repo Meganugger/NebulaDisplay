@@ -5,6 +5,8 @@
 
 #![warn(missing_docs)]
 
+pub mod prompts;
+pub mod resources;
 pub mod server;
 
 pub use server::Server;

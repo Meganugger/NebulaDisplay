@@ -24,6 +24,8 @@ const CATEGORY: &str = "diagnostics";
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(Capabilities),
+        Arc::new(ServerMetrics),
+        Arc::new(EffectiveConfig),
         Arc::new(WerReports),
         Arc::new(CrashDumps),
         Arc::new(CreateDump),
@@ -110,6 +112,99 @@ impl Tool for Capabilities {
             "family": std::env::consts::FAMILY,
             "isWindows": cfg!(windows),
             "tools": available,
+        })))
+    }
+}
+
+/// Live per-tool metrics snapshot.
+struct ServerMetrics;
+
+#[async_trait]
+impl Tool for ServerMetrics {
+    fn name(&self) -> &str {
+        "diagnostics.metrics"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Return live per-tool metrics (call counts, successes, failures, cancellations, mean/max durations, output bytes). Cross-platform."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new().build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            ..Default::default()
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
+        let snapshot = ctx.metrics.snapshot();
+        Ok(json_value_result(json!({
+            "toolCount": snapshot.len(),
+            "tools": snapshot,
+        })))
+    }
+}
+
+/// Effective configuration / policy summary (no secrets).
+struct EffectiveConfig;
+
+#[async_trait]
+impl Tool for EffectiveConfig {
+    fn name(&self) -> &str {
+        "diagnostics.config"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Summarise the server's effective configuration and permission policy (path/command counts, gates, disabled categories/tools). Cross-platform."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new().build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations {
+            read_only_hint: Some(true),
+            ..Default::default()
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, _args: Value) -> Result<CallToolResult> {
+        let c = &ctx.config;
+        let disabled_categories: Vec<&String> = c
+            .categories
+            .iter()
+            .filter(|(_, v)| !v.enabled)
+            .map(|(k, _)| k)
+            .collect();
+        let disabled_tools: Vec<&String> = c
+            .tools
+            .iter()
+            .filter(|(_, v)| v.enabled == Some(false))
+            .map(|(k, _)| k)
+            .collect();
+        Ok(json_value_result(json!({
+            "server": {
+                "name": c.server.name,
+                "version": c.server.version,
+                "maxConcurrentCalls": c.server.max_concurrent_calls,
+            },
+            "security": {
+                "allowedPathCount": c.security.allowed_paths.len(),
+                "deniedPathCount": c.security.denied_paths.len(),
+                "allowedCommandCount": c.security.allowed_commands.len(),
+                "defaultTimeoutSecs": c.security.default_timeout_secs,
+                "maxRuntimeSecs": c.security.max_runtime_secs,
+                "maxOutputBytes": c.security.max_output_bytes,
+                "allowElevated": c.security.allow_elevated,
+                "allowNetwork": c.security.allow_network,
+                "allowDestructive": c.security.allow_destructive,
+            },
+            "workingDir": ctx.working_dir.display().to_string(),
+            "disabledCategories": disabled_categories,
+            "disabledTools": disabled_tools,
         })))
     }
 }
@@ -498,5 +593,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PlatformUnsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn metrics_and_config_are_readonly_cross_platform() {
+        let m = ServerMetrics.call(&ctx(), json!({})).await.unwrap();
+        assert_eq!(m.is_error, Some(false));
+        let c = EffectiveConfig.call(&ctx(), json!({})).await.unwrap();
+        assert_eq!(c.is_error, Some(false));
+        let text = match &c.content[0] {
+            nebula_mcp_protocol::Content::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(text.contains("allowElevated"));
+        assert!(text.contains("maxRuntimeSecs"));
     }
 }

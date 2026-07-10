@@ -1377,6 +1377,7 @@ name = "nebula-mcp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "dashmap",
  "nebula-mcp-core",
@@ -1389,6 +1390,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "walkdir",
  "which",
 ]
 

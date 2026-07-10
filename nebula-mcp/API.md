@@ -31,7 +31,12 @@ Result:
 ```json
 {"jsonrpc":"2.0","id":1,"result":{
   "protocolVersion":"2024-11-05",
-  "capabilities":{"tools":{"listChanged":false},"logging":{}},
+  "capabilities":{
+    "tools":{"listChanged":false},
+    "resources":{"subscribe":false,"listChanged":false},
+    "prompts":{"listChanged":false},
+    "logging":{}
+  },
   "serverInfo":{"name":"nebula-mcp","version":"0.1.0"},
   "instructions":"..."}}
 ```
@@ -75,6 +80,48 @@ Most tools return a single `text` content block containing a JSON document.
 ### `ping`
 
 Request `{"jsonrpc":"2.0","id":4,"method":"ping"}` → result `{}`.
+
+### `resources/list` and `resources/read`
+
+The server exposes files under the workspace root as resources, gated by the
+same path allow/deny policy as the filesystem tools.
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}
+```
+
+Result: `{ "resources": [ { "uri":"file:///…", "name", "mimeType", "size" }, … ] }`.
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"file:///work/src/main.rs"}}
+```
+
+Result: `{ "contents": [ { "uri", "mimeType", "text" | "blob" } ] }`. Text files
+return `text`; binary files return base64 `blob`. Reads are policy-checked and
+truncated to the configured output cap.
+
+### `prompts/list` and `prompts/get`
+
+Curated engineering-workflow prompts (crash-dump triage, build-failure
+investigation, PR review, bisect, display-pipeline diagnosis).
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"prompts/list","params":{}}
+{"jsonrpc":"2.0","id":8,"method":"prompts/get","params":{"name":"triage_crash_dump","arguments":{"dumpPath":"C:/dumps/app.dmp"}}}
+```
+
+`prompts/get` returns `{ "description", "messages":[{"role":"user","content":{"type":"text","text":"…"}}] }`.
+
+### `logging/setLevel`
+
+Adjust the server's log verbosity at runtime (syslog-style levels map onto the
+tracing filter):
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"logging/setLevel","params":{"level":"debug"}}
+```
+
+Result `{}` on success.
 
 ### `notifications/cancelled`
 

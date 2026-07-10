@@ -1,6 +1,6 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **132 MCP tools** across 15 categories. Every tool is
+This server exposes **134 MCP tools** across 15 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
 whose text content is (for most tools) a JSON document; `display.duplicate_frame`
 and the browser tools can also return image content.
@@ -16,8 +16,8 @@ Legend:
 - Any command-wrapping tool streams `notifications/progress` when the client
   supplies a `progressToken` on the call.
 
-Input schemas for each tool are advertised via `tools/list` (the `inputSchema`
-field) and are the authoritative argument reference.
+The server also implements MCP `resources/*`, `prompts/*` and `logging/setLevel`
+(see API.md). Input schemas for each tool are advertised via `tools/list`.
 
 
 ### `benchmark`
@@ -44,6 +44,8 @@ field) and are the authoritative argument reference.
 | Tool | Description |
 | --- | --- |
 | `diagnostics.capabilities` | Report the host platform and availability of external toolchains (git, msbuild, signtool, pnputil, PresentMon, ffmpeg, cdb, ...). Cross-platform. |
+| `diagnostics.metrics` | Return live per-tool metrics (call counts, successes, failures, cancellations, mean/max durations, output bytes). Cross-platform. |
+| `diagnostics.config` | Summarise the server's effective configuration and permission policy (path/command counts, gates, disabled categories/tools). Cross-platform. |
 | `diagnostics.wer_reports` | List recent Windows Error Reporting (application crash) events as JSON. Windows only. |
 | `diagnostics.crash_dumps` | List crash dump (.dmp) files under the local WER CrashDumps directory or a provided directory. Windows only. |
 | `diagnostics.create_dump` | Create a full memory dump of a process with procdump (Sysinternals). Windows only. |

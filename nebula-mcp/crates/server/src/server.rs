@@ -12,10 +12,13 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use nebula_mcp_core::config::ConfigStore;
 use nebula_mcp_core::security::EffectivePolicy;
-use nebula_mcp_core::{Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry};
+use nebula_mcp_core::{
+    LogControl, Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry,
+};
 use nebula_mcp_protocol::{
     error_codes, CallToolParams, CallToolResult, Content, ErrorObject, FrameReader, FrameWriter,
-    Implementation, InitializeResult, ListToolsResult, Request, Response, ServerCapabilities,
+    GetPromptParams, Implementation, InitializeResult, ListToolsResult, PromptsCapability,
+    ReadResourceParams, Request, ResourcesCapability, Response, ServerCapabilities, SetLevelParams,
     ToolsCapability, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -36,6 +39,8 @@ pub struct Server {
     /// Sink for server-initiated notifications (progress). Set for the
     /// duration of `serve`.
     notifier: std::sync::Mutex<Option<UnboundedSender<serde_json::Value>>>,
+    /// Optional runtime log-level control (honours `logging/setLevel`).
+    log_control: std::sync::Mutex<Option<LogControl>>,
 }
 
 impl Server {
@@ -57,7 +62,13 @@ impl Server {
             root_cancel,
             initialized: Arc::new(AtomicBool::new(false)),
             notifier: std::sync::Mutex::new(None),
+            log_control: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install a runtime log-level control so `logging/setLevel` takes effect.
+    pub fn set_log_control(&self, control: LogControl) {
+        *self.log_control.lock().unwrap() = Some(control);
     }
 
     /// Shared metrics registry (for diagnostics/telemetry).
@@ -230,6 +241,14 @@ impl Server {
                 ))
             }
             "tools/call" => Some(self.handle_tool_call(req, request_key, cancel).await),
+            "resources/list" => Some(self.handle_resources_list(id)),
+            "resources/read" => Some(self.handle_resources_read(req)),
+            "prompts/list" => Some(Response::success(
+                id,
+                serde_json::to_value(crate::prompts::list()).unwrap_or_default(),
+            )),
+            "prompts/get" => Some(self.handle_prompts_get(req)),
+            "logging/setLevel" => Some(self.handle_set_level(req)),
             other => Some(Response::error(
                 id,
                 ErrorObject::new(
@@ -241,12 +260,107 @@ impl Server {
         }
     }
 
+    fn handle_resources_list(&self, id: Option<nebula_mcp_protocol::RequestId>) -> Response {
+        let config = self.config.snapshot();
+        match crate::resources::list(&config, &self.working_dir) {
+            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap_or_default()),
+            Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
+        }
+    }
+
+    fn handle_resources_read(&self, req: Request) -> Response {
+        let id = req.id.clone();
+        let params: ReadResourceParams = match req
+            .params
+            .ok_or_else(|| "missing params".to_string())
+            .and_then(|p| serde_json::from_value(p).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::error(id, ErrorObject::new(error_codes::INVALID_PARAMS, e, None))
+            }
+        };
+        let config = self.config.snapshot();
+        match crate::resources::read(&config, &self.working_dir, &params.uri) {
+            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap_or_default()),
+            Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
+        }
+    }
+
+    fn handle_prompts_get(&self, req: Request) -> Response {
+        let id = req.id.clone();
+        let params: GetPromptParams = match req
+            .params
+            .ok_or_else(|| "missing params".to_string())
+            .and_then(|p| serde_json::from_value(p).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::error(id, ErrorObject::new(error_codes::INVALID_PARAMS, e, None))
+            }
+        };
+        match crate::prompts::get(&params.name, &params.arguments) {
+            Ok(result) => Response::success(id, serde_json::to_value(result).unwrap_or_default()),
+            Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
+        }
+    }
+
+    fn handle_set_level(&self, req: Request) -> Response {
+        let id = req.id.clone();
+        let params: SetLevelParams = match req
+            .params
+            .ok_or_else(|| "missing params".to_string())
+            .and_then(|p| serde_json::from_value(p).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::error(id, ErrorObject::new(error_codes::INVALID_PARAMS, e, None))
+            }
+        };
+        // Map MCP syslog-style levels onto tracing filter directives.
+        let level_lc = params.level.to_ascii_lowercase();
+        let directive = match level_lc.as_str() {
+            "debug" => "debug",
+            "info" | "notice" => "info",
+            "warning" | "warn" => "warn",
+            "error" | "critical" | "alert" | "emergency" => "error",
+            other => other,
+        };
+        let control = self.log_control.lock().unwrap().clone();
+        match control {
+            Some(ctl) => match ctl(directive) {
+                Ok(()) => {
+                    tracing::info!(level = %params.level, "log level updated");
+                    Response::success(id, serde_json::json!({}))
+                }
+                Err(e) => {
+                    Response::error(id, ErrorObject::new(error_codes::INVALID_PARAMS, e, None))
+                }
+            },
+            None => Response::error(
+                id,
+                ErrorObject::new(
+                    error_codes::INTERNAL_ERROR,
+                    "runtime log control is not available",
+                    None,
+                ),
+            ),
+        }
+    }
+
     fn initialize_result(&self) -> InitializeResult {
         let config = self.config.snapshot();
         InitializeResult {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
+                    list_changed: Some(false),
+                }),
+                resources: Some(ResourcesCapability {
+                    subscribe: Some(false),
+                    list_changed: Some(false),
+                }),
+                prompts: Some(PromptsCapability {
                     list_changed: Some(false),
                 }),
                 logging: Some(serde_json::json!({})),

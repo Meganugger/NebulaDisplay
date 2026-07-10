@@ -12,13 +12,20 @@
 //! The returned [`TelemetryGuard`] must be kept alive for the process lifetime;
 //! dropping it flushes the non-blocking file writer.
 
+use std::sync::Arc;
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{reload, EnvFilter, Layer};
 
 use crate::config::{LogFormat, LogRotation, LoggingConfig};
 use crate::error::ToolError;
+
+/// A type-erased handle to change the active log filter at runtime.
+///
+/// Returned by [`init`] so the server can honour `logging/setLevel`.
+pub type LogControl = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Keeps background telemetry workers alive. Drop to flush and shut down.
 #[must_use = "dropping the guard immediately shuts telemetry down"]
@@ -28,12 +35,25 @@ pub struct TelemetryGuard {
 
 /// Initialise the global tracing subscriber from `cfg`.
 ///
+/// Returns a guard (keep it alive for the process lifetime) and a [`LogControl`]
+/// that reloads the filter, e.g. from an MCP `logging/setLevel` request.
+///
 /// Safe to call at most once per process; a second call returns an error
 /// because the global default subscriber can only be set once.
-pub fn init(cfg: &LoggingConfig) -> Result<TelemetryGuard, ToolError> {
+pub fn init(cfg: &LoggingConfig) -> Result<(TelemetryGuard, LogControl), ToolError> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.level))
         .map_err(|e| ToolError::Internal(format!("invalid log filter '{}': {e}", cfg.level)))?;
+
+    // Wrap the filter so it can be reloaded at runtime.
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+    let log_control: LogControl = Arc::new(move |level: &str| {
+        let new_filter =
+            EnvFilter::try_new(level).map_err(|e| format!("invalid log level '{level}': {e}"))?;
+        reload_handle
+            .reload(new_filter)
+            .map_err(|e| format!("failed to reload log filter: {e}"))
+    });
 
     // Console layer always writes to stderr to keep stdout clean for MCP.
     let (console_layer, stderr_json) = match cfg.format {
@@ -83,7 +103,7 @@ pub fn init(cfg: &LoggingConfig) -> Result<TelemetryGuard, ToolError> {
     };
 
     let registry = tracing_subscriber::registry()
-        .with(filter)
+        .with(filter_layer)
         .with(console_layer)
         .with(file_layer);
 
@@ -95,9 +115,12 @@ pub fn init(cfg: &LoggingConfig) -> Result<TelemetryGuard, ToolError> {
                 .with(otel_layer)
                 .try_init()
                 .map_err(|e| ToolError::Internal(format!("initialising tracing: {e}")))?;
-            return Ok(TelemetryGuard {
-                _file_guard: file_guard,
-            });
+            return Ok((
+                TelemetryGuard {
+                    _file_guard: file_guard,
+                },
+                log_control,
+            ));
         }
     }
     #[cfg(not(feature = "otel"))]
@@ -114,9 +137,12 @@ pub fn init(cfg: &LoggingConfig) -> Result<TelemetryGuard, ToolError> {
         .try_init()
         .map_err(|e| ToolError::Internal(format!("initialising tracing: {e}")))?;
 
-    Ok(TelemetryGuard {
-        _file_guard: file_guard,
-    })
+    Ok((
+        TelemetryGuard {
+            _file_guard: file_guard,
+        },
+        log_control,
+    ))
 }
 
 /// TTY detection for stderr colouring, via the stable `IsTerminal` trait.

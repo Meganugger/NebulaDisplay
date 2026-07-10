@@ -19,7 +19,10 @@ fn make_server(cancel: CancellationToken) -> Arc<Server> {
     config.logging.level = "error".into();
     let store = ConfigStore::new(config);
     let registry = build_registry(&ToolServices::new());
-    Arc::new(Server::new(registry, store, std::env::temp_dir(), cancel))
+    let server = Arc::new(Server::new(registry, store, std::env::temp_dir(), cancel));
+    // Install a no-op log control so logging/setLevel is exercisable in tests.
+    server.set_log_control(std::sync::Arc::new(|_level: &str| Ok(())));
+    server
 }
 
 /// Feed newline-delimited requests through the server and collect responses.
@@ -183,4 +186,69 @@ async fn progress_notifications_are_emitted() {
         .find(|f| f["id"] == 1)
         .expect("expected the tool response");
     assert_eq!(response["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn resources_list_and_read() {
+    // Create a file under the workspace root (/tmp) that policy allows.
+    let name = format!("nebula_res_{}.txt", uuid_like());
+    let path = std::env::temp_dir().join(&name);
+    std::fs::write(&path, "resource-body").unwrap();
+    let uri = format!("file://{}", path.display());
+
+    let server = make_server(CancellationToken::new());
+    let input = [
+        line(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}})),
+        line(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri": uri}})),
+    ]
+    .concat();
+    let frames = round_trip(server, input).await;
+
+    let list = frames.iter().find(|f| f["id"] == 1).unwrap();
+    assert!(list["result"]["resources"].is_array());
+
+    let read = frames.iter().find(|f| f["id"] == 2).unwrap();
+    assert_eq!(read["result"]["contents"][0]["text"], "resource-body");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn prompts_list_and_get() {
+    let server = make_server(CancellationToken::new());
+    let input = [
+        line(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}})),
+        line(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"triage_crash_dump","arguments":{"dumpPath":"/tmp/x.dmp"}}})),
+    ]
+    .concat();
+    let frames = round_trip(server, input).await;
+
+    let list = frames.iter().find(|f| f["id"] == 1).unwrap();
+    assert!(list["result"]["prompts"].as_array().unwrap().len() >= 5);
+
+    let get = frames.iter().find(|f| f["id"] == 2).unwrap();
+    let text = get["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("/tmp/x.dmp"));
+}
+
+#[tokio::test]
+async fn logging_set_level_succeeds() {
+    let server = make_server(CancellationToken::new());
+    let input = line(serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}
+    }));
+    let frames = round_trip(server, input).await;
+    assert!(frames[0]["result"].is_object());
+    assert!(frames[0]["error"].is_null());
+}
+
+/// Cheap unique-ish suffix without pulling in the uuid crate here.
+fn uuid_like() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }

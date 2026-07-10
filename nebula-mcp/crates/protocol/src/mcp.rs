@@ -71,7 +71,14 @@ pub struct ServerCapabilities {
     /// Tool capability. Presence signals that `tools/*` methods are available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
-    /// Logging capability (server can emit `notifications/message`).
+    /// Resource capability. Presence signals that `resources/*` are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesCapability>,
+    /// Prompt capability. Presence signals that `prompts/*` are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<PromptsCapability>,
+    /// Logging capability (server can emit `notifications/message` and accept
+    /// `logging/setLevel`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<Value>,
 }
@@ -80,6 +87,25 @@ pub struct ServerCapabilities {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsCapability {
     /// Whether the server emits `tools/list_changed` notifications.
+    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Resource capability descriptor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourcesCapability {
+    /// Whether the server supports resource subscriptions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<bool>,
+    /// Whether the server emits `resources/list_changed` notifications.
+    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Prompt capability descriptor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptsCapability {
+    /// Whether the server emits `prompts/list_changed` notifications.
     #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
@@ -271,6 +297,120 @@ pub struct ResourceContents {
     /// Text body, when the resource is textual.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Base64 body, when the resource is binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// A resource descriptor returned by `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resource {
+    /// Resource URI (e.g. `file:///abs/path`).
+    pub uri: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional MIME type.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// Result of `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListResourcesResult {
+    /// Available resources.
+    pub resources: Vec<Resource>,
+    /// Opaque pagination cursor.
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for `resources/read`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResourceParams {
+    /// URI to read.
+    pub uri: String,
+}
+
+/// Result of `resources/read`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResourceResult {
+    /// The resource contents (usually a single entry).
+    pub contents: Vec<ResourceContents>,
+}
+
+/// A prompt descriptor returned by `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Prompt {
+    /// Unique prompt name.
+    pub name: String,
+    /// Human-readable description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Declared arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<PromptArgument>,
+}
+
+/// A declared prompt argument.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptArgument {
+    /// Argument name.
+    pub name: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the argument is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+/// Result of `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListPromptsResult {
+    /// Available prompts.
+    pub prompts: Vec<Prompt>,
+}
+
+/// Parameters for `prompts/get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPromptParams {
+    /// Prompt name.
+    pub name: String,
+    /// Argument values.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// A single message in a prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptMessage {
+    /// Message role (`user` or `assistant`).
+    pub role: String,
+    /// Message content.
+    pub content: Content,
+}
+
+/// Result of `prompts/get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPromptResult {
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The prompt messages.
+    pub messages: Vec<PromptMessage>,
+}
+
+/// Parameters for `logging/setLevel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetLevelParams {
+    /// Requested level (`debug`, `info`, `notice`, `warning`, `error`, ...).
+    pub level: String,
 }
 
 #[cfg(test)]
@@ -286,6 +426,7 @@ mod tests {
                     list_changed: Some(false),
                 }),
                 logging: None,
+                ..Default::default()
             },
             server_info: Implementation {
                 name: "nebula".into(),

@@ -24,7 +24,7 @@ software-development environment to autonomous agents.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **132 tools** (`nebula-mcp-tools`) across 15 categories:
+- **134 tools** (`nebula-mcp-tools`) across 15 categories:
   - **filesystem** (13): read/write/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
@@ -49,7 +49,7 @@ software-development environment to autonomous agents.
     single-frame capture (PNG).
   - **benchmark** (7): cross-platform system sampling, ffmpeg, PresentMon, WPR,
     wpaexporter, GPUView logger, LatencyMon.
-  - **diagnostics** (7): capability probe, WER reports, crash-dump discovery,
+  - **diagnostics** (9): live per-tool metrics and effective-config summary, plus capability probe, WER reports, crash-dump discovery,
     process dump creation, minidump analysis, live stack capture, ETW sessions.
   - **browser** (2): Playwright-driven capture (screenshot/PDF/trace/console/
     network) and a screenshot convenience.
@@ -59,6 +59,13 @@ software-development environment to autonomous agents.
 - **Progress streaming**: any command-wrapping tool emits MCP
   `notifications/progress` when the client supplies a `progressToken`, so the
   agent gets live heartbeats during long builds/tests/captures.
+- **Resources**: `resources/list` and `resources/read` expose workspace files
+  (policy-gated, text or base64 blob) as MCP resources.
+- **Prompts**: `prompts/list` and `prompts/get` provide curated engineering
+  workflows (crash-dump triage, build-failure investigation, PR review, bisect,
+  display-pipeline diagnosis).
+- **Runtime log control**: `logging/setLevel` adjusts verbosity live via a
+  reloadable tracing filter.
 - **Server** (`nebula-mcp-server`): concurrent, cancellable dispatch with
   bounded parallelism, graceful shutdown, and a CLI (`run`, `list-tools`,
   `print-config`, `validate-config`).

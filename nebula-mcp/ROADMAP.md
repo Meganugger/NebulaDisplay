@@ -10,8 +10,9 @@ work around.
   (builds, captures) so the agent sees incremental stdout instead of a single
   final blob. The process engine already captures incrementally; this adds a
   `notifications/progress` channel.
-- **Resources & prompts** — expose build artifacts, logs and traces as MCP
-  `resources` and offer reusable `prompts` (e.g. "triage this crash dump").
+- **Resource subscriptions** — `resources/list` and `resources/read` are
+  implemented; add `resources/subscribe` + `notifications/resources/updated` for
+  live file watching.
 - **Structured tool results** — populate MCP `structuredContent` alongside the
   text JSON so schema-aware clients get typed results.
 - **Richer git** — worktrees, cherry-pick, reflog, and a safe interactive-rebase
