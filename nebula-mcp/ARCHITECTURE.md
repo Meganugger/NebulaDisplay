@@ -27,7 +27,7 @@
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │  nebula-mcp-tools    │  109 tools in 13 category modules
+                    │  nebula-mcp-tools    │  125 tools in 14 category modules
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐

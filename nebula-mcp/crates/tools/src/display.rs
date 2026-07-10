@@ -32,6 +32,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(HdrDetection),
         Arc::new(MouseToMonitor),
         Arc::new(VirtualDisplays),
+        Arc::new(EnumModes),
     ]
 }
 
@@ -152,6 +153,24 @@ display_tool!(
     "List display adapters/devices, flagging indirect (IddCx) virtual displays. Windows only.",
     empty_schema,
     win_virtual_displays
+);
+
+fn enum_modes_schema() -> Value {
+    ObjectSchema::new()
+        .string(
+            "deviceName",
+            "Adapter device name (e.g. \\\\.\\DISPLAY1); omit for the primary adapter.",
+            false,
+        )
+        .integer("maxModes", "Maximum modes to return (default 300).", false)
+        .build()
+}
+display_tool!(
+    EnumModes,
+    "display.enum_modes",
+    "Enumerate the supported display modes (resolution, colour depth, refresh) for an adapter via EnumDisplaySettingsEx. Windows only.",
+    enum_modes_schema,
+    win_enum_modes
 );
 
 // The native implementations are only compiled for Windows.
@@ -478,6 +497,87 @@ mod win {
                 i += 1;
             }
             Ok(json!({ "deviceCount": devices.len(), "devices": devices }))
+        }
+    }
+
+    /// Enumerate supported display modes for an adapter.
+    pub(super) fn win_enum_modes(a: &Args) -> Result<Value> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplaySettingsExW, DEVMODEW, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS,
+            ENUM_DISPLAY_SETTINGS_MODE,
+        };
+
+        let device = a.opt_str("deviceName")?.map(|s| s.to_string());
+        let max_modes = a.opt_i64("maxModes")?.unwrap_or(300).max(1) as usize;
+
+        // Build a wide, NUL-terminated device name if provided.
+        let wide: Option<Vec<u16>> = device
+            .as_ref()
+            .map(|d| d.encode_utf16().chain(std::iter::once(0)).collect());
+        let name_ptr = match &wide {
+            Some(w) => PCWSTR(w.as_ptr()),
+            None => PCWSTR::null(),
+        };
+
+        unsafe {
+            // Current mode first.
+            let mut current = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            let has_current = EnumDisplaySettingsExW(
+                name_ptr,
+                ENUM_CURRENT_SETTINGS,
+                &mut current,
+                ENUM_DISPLAY_SETTINGS_FLAGS(0),
+            )
+            .as_bool();
+            let current_json = if has_current {
+                json!({
+                    "width": current.dmPelsWidth,
+                    "height": current.dmPelsHeight,
+                    "bitsPerPel": current.dmBitsPerPel,
+                    "frequency": current.dmDisplayFrequency,
+                })
+            } else {
+                Value::Null
+            };
+
+            let mut modes = Vec::new();
+            let mut i = 0u32;
+            loop {
+                if modes.len() >= max_modes {
+                    break;
+                }
+                let mut dm = DEVMODEW {
+                    dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                    ..Default::default()
+                };
+                if !EnumDisplaySettingsExW(
+                    name_ptr,
+                    ENUM_DISPLAY_SETTINGS_MODE(i),
+                    &mut dm,
+                    ENUM_DISPLAY_SETTINGS_FLAGS(0),
+                )
+                .as_bool()
+                {
+                    break;
+                }
+                modes.push(json!({
+                    "width": dm.dmPelsWidth,
+                    "height": dm.dmPelsHeight,
+                    "bitsPerPel": dm.dmBitsPerPel,
+                    "frequency": dm.dmDisplayFrequency,
+                }));
+                i += 1;
+            }
+            Ok(json!({
+                "device": device,
+                "current": current_json,
+                "modeCount": modes.len(),
+                "modes": modes,
+            }))
         }
     }
 

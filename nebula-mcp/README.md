@@ -14,7 +14,7 @@ model in front of everything.
 
 - **Language:** Rust (2021 edition, async Tokio).
 - **Transport:** MCP over stdio (newline-delimited JSON-RPC 2.0).
-- **Tools:** 109 across 13 categories (see [TOOLS.md](TOOLS.md)).
+- **Tools:** 125 across 14 categories (see [TOOLS.md](TOOLS.md)).
 - **Platforms:** cross-platform core; Windows-specific subsystems compile
   everywhere and are active on Windows.
 

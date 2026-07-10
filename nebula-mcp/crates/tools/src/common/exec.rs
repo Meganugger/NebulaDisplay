@@ -160,7 +160,35 @@ pub async fn run_checked(
 ) -> Result<ExecResult, ToolError> {
     ctx.policy.check_command(&spec.program)?;
     let timeout = ctx.timeout(requested_timeout_secs);
-    run_raw(ctx, spec, timeout).await
+
+    // When the client asked for progress, emit an immediate "started" update and
+    // a periodic heartbeat for the duration of the process.
+    let heartbeat = if ctx.progress.is_some() {
+        ctx.report_progress(0.0, None, Some(&format!("started: {}", spec.program)));
+        let hctx = ctx.clone();
+        let program = spec.program.clone();
+        let start = Instant::now();
+        Some(tokio::spawn(async move {
+            let mut tick = 1.0_f64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                hctx.report_progress(
+                    tick,
+                    None,
+                    Some(&format!("{program} running {}s", start.elapsed().as_secs())),
+                );
+                tick += 1.0;
+            }
+        }))
+    } else {
+        None
+    };
+
+    let result = run_raw(ctx, spec, timeout).await;
+    if let Some(h) = heartbeat {
+        h.abort();
+    }
+    result
 }
 
 /// Run without the command allowlist check. Only for internal callers that have
@@ -362,6 +390,7 @@ mod tests {
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),
             request_id: "r".into(),
+            progress: None,
         }
     }
 

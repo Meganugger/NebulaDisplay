@@ -74,7 +74,7 @@ TOML strings (`"C:\\src\\**"`) or forward slashes.
 
 Enable/disable a whole category. Categories: `filesystem`, `terminal`,
 `process`, `git`, `github`, `network`, `powershell`, `windows`, `driver`,
-`display`, `benchmark`, `diagnostics`, `browser`.
+`display`, `benchmark`, `diagnostics`, `browser`, `docker`.
 
 ```toml
 [categories.driver]

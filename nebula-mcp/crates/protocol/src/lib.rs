@@ -17,7 +17,7 @@ pub mod transport;
 pub use jsonrpc::{error_codes, ErrorObject, Request, RequestId, Response, JSONRPC_VERSION};
 pub use mcp::{
     CallToolParams, CallToolResult, ClientCapabilities, Content, Implementation, InitializeParams,
-    InitializeResult, ListToolsResult, ResourceContents, ServerCapabilities, Tool, ToolAnnotations,
-    ToolsCapability, PROTOCOL_VERSION,
+    InitializeResult, ListToolsResult, ProgressToken, ResourceContents, ServerCapabilities, Tool,
+    ToolAnnotations, ToolsCapability, PROTOCOL_VERSION,
 };
 pub use transport::{FrameReader, FrameWriter, TransportError};

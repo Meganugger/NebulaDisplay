@@ -87,6 +87,32 @@ Client → server notification to cancel an in-flight request:
 The corresponding tool call is aborted (its child process, if any, is killed)
 and returns an error result with the `cancelled` category.
 
+### `notifications/progress` (server → client)
+
+If a `tools/call` includes a progress token in `_meta`, the server streams
+progress updates for the duration of the call:
+
+Request opting into progress:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"tools/call",
+ "params":{"name":"terminal.run",
+           "arguments":{"program":"cargo","args":["build"]},
+           "_meta":{"progressToken":"build-1"}}}
+```
+
+Server-initiated notifications while it runs:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/progress",
+ "params":{"progressToken":"build-1","progress":0,"message":"started: cargo"}}
+{"jsonrpc":"2.0","method":"notifications/progress",
+ "params":{"progressToken":"build-1","progress":1,"message":"cargo running 3s"}}
+```
+
+Command-wrapping tools emit an immediate `started` update and periodic
+heartbeats; the final result arrives as the normal `tools/call` response.
+
 ## Error model
 
 Two distinct failure channels:

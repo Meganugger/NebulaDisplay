@@ -525,6 +525,7 @@ mod tests {
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),
             request_id: "r".into(),
+            progress: None,
         }
     }
 

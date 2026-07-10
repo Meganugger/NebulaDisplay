@@ -16,6 +16,7 @@ pub mod browser;
 pub mod common;
 pub mod diagnostics;
 pub mod display;
+pub mod docker;
 pub mod driver;
 pub mod filesystem;
 pub mod git;
@@ -89,5 +90,6 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     v.extend(benchmark::tools());
     v.extend(diagnostics::tools());
     v.extend(browser::tools());
+    v.extend(docker::tools());
     v
 }

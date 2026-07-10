@@ -26,6 +26,7 @@ pub mod telemetry;
 pub mod tool;
 
 pub use context::ToolContext;
+pub use context::{ProgressSink, ProgressUpdate};
 pub use error::{Result, ToolError};
 pub use metrics::{Metrics, Outcome};
 pub use tool::{Tool, ToolRegistry};

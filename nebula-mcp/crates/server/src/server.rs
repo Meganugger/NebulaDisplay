@@ -12,13 +12,14 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use nebula_mcp_core::config::ConfigStore;
 use nebula_mcp_core::security::EffectivePolicy;
-use nebula_mcp_core::{Metrics, Outcome, ToolContext, ToolError, ToolRegistry};
+use nebula_mcp_core::{Metrics, Outcome, ProgressSink, ToolContext, ToolError, ToolRegistry};
 use nebula_mcp_protocol::{
     error_codes, CallToolParams, CallToolResult, Content, ErrorObject, FrameReader, FrameWriter,
     Implementation, InitializeResult, ListToolsResult, Request, Response, ServerCapabilities,
     ToolsCapability, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,9 @@ pub struct Server {
     inflight: Arc<DashMap<String, CancellationToken>>,
     root_cancel: CancellationToken,
     initialized: Arc<AtomicBool>,
+    /// Sink for server-initiated notifications (progress). Set for the
+    /// duration of `serve`.
+    notifier: std::sync::Mutex<Option<UnboundedSender<serde_json::Value>>>,
 }
 
 impl Server {
@@ -52,6 +56,7 @@ impl Server {
             inflight: Arc::new(DashMap::new()),
             root_cancel,
             initialized: Arc::new(AtomicBool::new(false)),
+            notifier: std::sync::Mutex::new(None),
         }
     }
 
@@ -69,6 +74,20 @@ impl Server {
         let mut frames = FrameReader::new(reader);
         let writer = FrameWriter::new(writer);
         let mut tasks = tokio::task::JoinSet::new();
+
+        // Server-initiated notifications (e.g. progress) are funnelled through a
+        // channel and written by a dedicated task, so tool handlers never touch
+        // the writer directly.
+        let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        *self.notifier.lock().unwrap() = Some(notif_tx);
+        let notif_writer = writer.clone();
+        let notif_task = tokio::spawn(async move {
+            while let Some(value) = notif_rx.recv().await {
+                if let Err(e) = notif_writer.write_value(&value).await {
+                    tracing::warn!(error = %e, "failed to write notification");
+                }
+            }
+        });
 
         loop {
             let next = tokio::select! {
@@ -152,6 +171,10 @@ impl Server {
                 tracing::warn!(error = %e, "request task panicked during drain");
             }
         }
+
+        // Drop the notifier so the notification task drains and exits.
+        *self.notifier.lock().unwrap() = None;
+        let _ = notif_task.await;
         Ok(())
     }
 
@@ -290,6 +313,9 @@ impl Server {
         };
 
         // Per-request cancellation token was registered by the read loop.
+        // If the client supplied a progress token, wire a progress sink that
+        // forwards updates as `notifications/progress` frames.
+        let progress = self.build_progress_sink(&params);
         let ctx = ToolContext {
             policy: policy.clone(),
             working_dir: self.working_dir.clone(),
@@ -297,6 +323,7 @@ impl Server {
             metrics: self.metrics.clone(),
             config: config.clone(),
             request_id: request_id.clone(),
+            progress,
         };
 
         // Bounded concurrency.
@@ -356,6 +383,24 @@ impl Server {
         );
 
         Response::success(id, serde_json::to_value(result).unwrap_or_default())
+    }
+
+    /// If the call carries a progress token and a notifier is active, build a
+    /// [`ProgressSink`] whose updates are forwarded as `notifications/progress`.
+    fn build_progress_sink(&self, params: &CallToolParams) -> Option<ProgressSink> {
+        let token = params.progress_token()?;
+        let notifier = self.notifier.lock().unwrap().clone()?;
+        let (sink, mut rx) = ProgressSink::channel();
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                let value =
+                    token.notification(update.progress, update.total, update.message.as_deref());
+                if notifier.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(sink)
     }
 }
 

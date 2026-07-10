@@ -16,6 +16,46 @@ use crate::error::ToolError;
 use crate::metrics::Metrics;
 use crate::security::EffectivePolicy;
 
+/// A single progress update emitted by a tool during a long-running call.
+///
+/// * `progress` — monotonically increasing amount of work done.
+/// * `total` — optional total against which `progress` is measured.
+/// * `message` — optional human-readable status.
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    /// Amount of work completed so far.
+    pub progress: f64,
+    /// Optional total amount of work.
+    pub total: Option<f64>,
+    /// Optional status message.
+    pub message: Option<String>,
+}
+
+/// A channel a tool can use to report progress. Cloneable and cheap; sends are
+/// non-blocking and silently dropped if the receiver has gone away.
+#[derive(Clone)]
+pub struct ProgressSink {
+    tx: tokio::sync::mpsc::UnboundedSender<ProgressUpdate>,
+}
+
+impl ProgressSink {
+    /// Create a sink and its receiver.
+    #[must_use]
+    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<ProgressUpdate>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx }, rx)
+    }
+
+    /// Report a progress update (best-effort; never blocks or errors).
+    pub fn report(&self, progress: f64, total: Option<f64>, message: Option<String>) {
+        let _ = self.tx.send(ProgressUpdate {
+            progress,
+            total,
+            message,
+        });
+    }
+}
+
 /// Context for a single tool invocation.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -32,9 +72,19 @@ pub struct ToolContext {
     pub config: Arc<Config>,
     /// Correlation id for logs/traces.
     pub request_id: String,
+    /// Optional progress sink, present when the client supplied a progress
+    /// token on the `tools/call`.
+    pub progress: Option<ProgressSink>,
 }
 
 impl ToolContext {
+    /// Report progress if the client requested it (no-op otherwise).
+    pub fn report_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
+        if let Some(sink) = &self.progress {
+            sink.report(progress, total, message.map(str::to_string));
+        }
+    }
+
     /// Validate a path argument against policy, resolving it relative to the
     /// working directory.
     pub fn resolve_path(&self, path: &str) -> Result<PathBuf, ToolError> {
@@ -93,6 +143,7 @@ mod tests {
             metrics: Metrics::new(),
             config: Arc::new(Config::default()),
             request_id: "req-1".into(),
+            progress: None,
         }
     }
 

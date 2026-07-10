@@ -152,3 +152,35 @@ async fn concurrent_calls_all_answered() {
         assert_eq!(r["result"]["isError"], false);
     }
 }
+
+#[tokio::test]
+async fn progress_notifications_are_emitted() {
+    if which::which("echo").is_err() {
+        return;
+    }
+    let server = make_server(CancellationToken::new());
+    // Supplying a progress token in `_meta` opts the call into progress updates.
+    let input = line(serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{
+            "name":"terminal.run",
+            "arguments":{"program":"echo","args":["progress"]},
+            "_meta":{"progressToken":"tok-42"}
+        }
+    }));
+    let frames = round_trip(server, input).await;
+
+    // There should be a progress notification carrying our token, plus the
+    // final response.
+    let progress = frames
+        .iter()
+        .find(|f| f["method"] == "notifications/progress")
+        .expect("expected a notifications/progress frame");
+    assert_eq!(progress["params"]["progressToken"], "tok-42");
+
+    let response = frames
+        .iter()
+        .find(|f| f["id"] == 1)
+        .expect("expected the tool response");
+    assert_eq!(response["result"]["isError"], false);
+}

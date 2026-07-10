@@ -1,6 +1,6 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **109 MCP tools** across 13 categories. Every tool is
+This server exposes **125 MCP tools** across 14 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
 whose text content is (for most tools) a JSON document.
 
@@ -12,6 +12,8 @@ Legend:
 - Tools that mutate state check the `allow_destructive` policy; tools that need
   admin rights check `allow_elevated`; tools that reach the network check
   `allow_network`.
+- Any command-wrapping tool streams `notifications/progress` when the client
+  supplies a `progressToken` on the call.
 
 Input schemas for each tool are advertised via `tools/list` (the `inputSchema`
 field) and are the authoritative argument reference.
@@ -60,6 +62,21 @@ field) and are the authoritative argument reference.
 | `display.hdr_detection` | Detect advanced colour / HDR capability and current state per display target. Windows only. |
 | `display.mouse_to_monitor` | Map a virtual-desktop coordinate to the monitor containing it and to monitor-local coordinates. Windows only. |
 | `display.virtual_displays` | List display adapters/devices, flagging indirect (IddCx) virtual displays. Windows only. |
+| `display.enum_modes` | Enumerate the supported display modes (resolution, colour depth, refresh) for an adapter via EnumDisplaySettingsEx. Windows only. |
+
+### `docker`
+
+| Tool | Description |
+| --- | --- |
+| `docker.ps` | List Docker containers (JSON lines). Set all=true to include stopped containers. |
+| `docker.images` | List Docker images (JSON lines). |
+| `docker.build` | Build a Docker image from a build context directory (within an allowed root). |
+| `docker.run` | Run a container from an image. Supports detach, name, env, published ports and a command. |
+| `docker.stop` | Stop a running container by name or id. |
+| `docker.rm` | Remove a container (optionally forcing). Destructive. |
+| `docker.logs` | Fetch a container's logs (last N lines). |
+| `docker.exec` | Execute a command inside a running container and capture its output. |
+| `docker.compose` | Run docker compose actions (up/down/ps/logs/build) against a compose file (within an allowed root). |
 
 ### `driver`
 
@@ -117,6 +134,12 @@ field) and are the authoritative argument reference.
 | `git.reset` | Reset current HEAD. Modes: soft, mixed (default), hard. 'hard' is destructive. |
 | `git.clean` | Remove untracked files. Requires 'force'; add 'directories' for -d. Destructive. |
 | `git.submodule` | Run a submodule action: status (default), update, init, sync. |
+| `git.worktree` | Manage worktrees: list (default), add (needs 'path' and optional 'ref'), remove (needs 'path'). |
+| `git.cherry_pick` | Apply the changes of an existing commit. Provide 'commit'. |
+| `git.revert` | Revert a commit, creating a new commit. Provide 'commit'; set 'noEdit' to skip the editor. |
+| `git.reflog` | Show the reference log. Optional 'maxCount' (default 30). |
+| `git.show` | Show an object (commit/tree/blob). Provide 'object' (default HEAD) and optional 'path'. |
+| `git.apply` | Apply a patch file to the working tree. Provide 'patch' (path, relative to repo). Set 'check' to only validate. |
 
 ### `github`
 

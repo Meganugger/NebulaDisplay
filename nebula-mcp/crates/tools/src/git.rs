@@ -235,6 +235,57 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
             ro = false,
             dstr = false
         ),
+        git_tool!(
+            "git.worktree",
+            "Manage worktrees: list (default), add (needs 'path' and optional 'ref'), remove (needs 'path').",
+            schema_worktree,
+            build_worktree,
+            ro = false,
+            dstr = false
+        ),
+        git_tool!(
+            "git.cherry_pick",
+            "Apply the changes of an existing commit. Provide 'commit'.",
+            schema_commit_ref,
+            |a| Ok(vec!["cherry-pick".into(), a.str("commit")?.into()]),
+            ro = false,
+            dstr = false
+        ),
+        git_tool!(
+            "git.revert",
+            "Revert a commit, creating a new commit. Provide 'commit'; set 'noEdit' to skip the editor.",
+            schema_revert,
+            build_revert,
+            ro = false,
+            dstr = false
+        ),
+        git_tool!(
+            "git.reflog",
+            "Show the reference log. Optional 'maxCount' (default 30).",
+            schema_reflog,
+            |a| Ok(vec![
+                "reflog".into(),
+                format!("--max-count={}", a.u64_or("maxCount", 30)?),
+            ]),
+            ro = true,
+            dstr = false
+        ),
+        git_tool!(
+            "git.show",
+            "Show an object (commit/tree/blob). Provide 'object' (default HEAD) and optional 'path'.",
+            schema_show,
+            build_show,
+            ro = true,
+            dstr = false
+        ),
+        git_tool!(
+            "git.apply",
+            "Apply a patch file to the working tree. Provide 'patch' (path, relative to repo). Set 'check' to only validate.",
+            schema_apply,
+            build_apply,
+            ro = false,
+            dstr = false
+        ),
     ]
 }
 
@@ -409,6 +460,100 @@ fn schema_submodule() -> Value {
 }
 
 // ---- arg builders ----
+
+fn schema_worktree() -> Value {
+    repo_field(
+        ObjectSchema::new()
+            .enumerated(
+                "action",
+                "Worktree action.",
+                &["list", "add", "remove"],
+                false,
+            )
+            .string("path", "Worktree path (for add/remove).", false)
+            .string("ref", "Ref to check out (for add).", false),
+    )
+    .build()
+}
+fn schema_commit_ref() -> Value {
+    repo_field(ObjectSchema::new().string("commit", "Commit to operate on.", true)).build()
+}
+fn schema_revert() -> Value {
+    repo_field(
+        ObjectSchema::new()
+            .string("commit", "Commit to revert.", true)
+            .boolean("noEdit", "Skip the commit-message editor.", false),
+    )
+    .build()
+}
+fn schema_reflog() -> Value {
+    repo_field(ObjectSchema::new().integer("maxCount", "Maximum entries (default 30).", false))
+        .build()
+}
+fn schema_show() -> Value {
+    repo_field(
+        ObjectSchema::new()
+            .string("object", "Object/ref to show (default HEAD).", false)
+            .string("path", "Limit to a path.", false),
+    )
+    .build()
+}
+fn schema_apply() -> Value {
+    repo_field(
+        ObjectSchema::new()
+            .string("patch", "Patch file path (relative to repo).", true)
+            .boolean("check", "Only check whether the patch applies.", false),
+    )
+    .build()
+}
+
+fn build_worktree(a: &Args) -> Result<Vec<String>> {
+    match a.str_or("action", "list")? {
+        "list" => Ok(vec!["worktree".into(), "list".into(), "--porcelain".into()]),
+        "add" => {
+            let mut v = vec!["worktree".into(), "add".into(), a.str("path")?.into()];
+            if let Some(r) = a.opt_str("ref")? {
+                v.push(r.into());
+            }
+            Ok(v)
+        }
+        "remove" => Ok(vec![
+            "worktree".into(),
+            "remove".into(),
+            a.str("path")?.into(),
+        ]),
+        other => Err(ToolError::InvalidArguments(format!(
+            "unknown worktree action '{other}'"
+        ))),
+    }
+}
+
+fn build_revert(a: &Args) -> Result<Vec<String>> {
+    let mut v = vec!["revert".to_string()];
+    if a.bool_or("noEdit", true)? {
+        v.push("--no-edit".into());
+    }
+    v.push(a.str("commit")?.into());
+    Ok(v)
+}
+
+fn build_show(a: &Args) -> Result<Vec<String>> {
+    let mut v = vec!["show".to_string(), a.str_or("object", "HEAD")?.into()];
+    if let Some(path) = a.opt_str("path")? {
+        v.push("--".into());
+        v.push(path.into());
+    }
+    Ok(v)
+}
+
+fn build_apply(a: &Args) -> Result<Vec<String>> {
+    let mut v = vec!["apply".to_string()];
+    if a.bool_or("check", false)? {
+        v.push("--check".into());
+    }
+    v.push(a.str("patch")?.into());
+    Ok(v)
+}
 
 fn build_diff(a: &Args) -> Result<Vec<String>> {
     let mut v = vec!["diff".to_string()];
@@ -664,6 +809,7 @@ mod tests {
             metrics: Metrics::new(),
             config: Arc::new(Default::default()),
             request_id: "r".into(),
+            progress: None,
         }
     }
 

@@ -139,6 +139,61 @@ pub struct CallToolParams {
     /// Arguments object matching the tool's input schema.
     #[serde(default)]
     pub arguments: Value,
+    /// Optional request metadata. MCP places the `progressToken` here when the
+    /// client wants progress notifications for this call.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl CallToolParams {
+    /// Extract the client's progress token, if any.
+    #[must_use]
+    pub fn progress_token(&self) -> Option<ProgressToken> {
+        let tok = self.meta.as_ref()?.get("progressToken")?;
+        match tok {
+            Value::Number(n) => n.as_i64().map(ProgressToken::Number),
+            Value::String(s) => Some(ProgressToken::String(s.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// An opaque progress token supplied by the client and echoed in
+/// `notifications/progress`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgressToken {
+    /// Numeric token.
+    Number(i64),
+    /// String token.
+    String(String),
+}
+
+impl ProgressToken {
+    /// Build a `notifications/progress` JSON-RPC message carrying this token.
+    #[must_use]
+    pub fn notification(&self, progress: f64, total: Option<f64>, message: Option<&str>) -> Value {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "progressToken".to_string(),
+            match self {
+                ProgressToken::Number(n) => Value::from(*n),
+                ProgressToken::String(s) => Value::from(s.clone()),
+            },
+        );
+        params.insert("progress".to_string(), Value::from(progress));
+        if let Some(t) = total {
+            params.insert("total".to_string(), Value::from(t));
+        }
+        if let Some(m) = message {
+            params.insert("message".to_string(), Value::from(m));
+        }
+        serde_json::json!({
+            "jsonrpc": crate::jsonrpc::JSONRPC_VERSION,
+            "method": "notifications/progress",
+            "params": Value::Object(params),
+        })
+    }
 }
 
 /// Result of `tools/call`.
