@@ -24,7 +24,7 @@ software-development environment to autonomous agents.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **134 tools** (`nebula-mcp-tools`) across 15 categories:
+- **137 tools** (`nebula-mcp-tools`) across 16 categories:
   - **filesystem** (13): read/write/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
@@ -56,6 +56,9 @@ software-development environment to autonomous agents.
   - **docker** (9): ps, images, build, run, stop, rm, logs, exec, and compose.
   - **scheduler** (5): run allowlisted commands after a delay or on an interval
     and poll their captured results (after, every, list, results, cancel).
+  - **security** (3): dry-run the permission engine — `check_path`,
+    `check_command` and `effective_policy` — so an agent can verify what is
+    permitted before acting.
 - **Progress streaming**: any command-wrapping tool emits MCP
   `notifications/progress` when the client supplies a `progressToken`, so the
   agent gets live heartbeats during long builds/tests/captures.
@@ -69,8 +72,9 @@ software-development environment to autonomous agents.
 - **Server** (`nebula-mcp-server`): concurrent, cancellable dispatch with
   bounded parallelism, graceful shutdown, and a CLI (`run`, `list-tools`,
   `print-config`, `validate-config`).
-- **Tests**: 81 unit + integration tests, including permission enforcement,
-  process timeout/cancellation, and concurrent-dispatch coverage.
+- **Tests**: 100+ unit + integration tests, including permission enforcement,
+  process timeout/cancellation, concurrent-dispatch stress (200 calls),
+  JSON-RPC decoder robustness, and resources/prompts/logging coverage.
 - **CI**: Linux (build, test, clippy `-D warnings`, fmt) and Windows (build,
   test) workflows.
 - **Docs**: README, ARCHITECTURE, SECURITY, CONFIGURATION, TOOLS, API, ROADMAP.

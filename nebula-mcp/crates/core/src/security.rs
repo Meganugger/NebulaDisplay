@@ -28,6 +28,7 @@ pub struct EffectivePolicy {
     allowed: GlobSet,
     denied: GlobSet,
     allowed_has_patterns: bool,
+    allowed_pattern_count: usize,
     allowed_commands: Vec<String>,
     timeout: Duration,
     max_runtime: Duration,
@@ -88,6 +89,7 @@ impl EffectivePolicy {
             allowed,
             denied,
             allowed_has_patterns: !allowed_patterns.is_empty(),
+            allowed_pattern_count: allowed_patterns.len(),
             allowed_commands,
             timeout,
             max_runtime,
@@ -142,6 +144,24 @@ impl EffectivePolicy {
     #[must_use]
     pub fn allow_destructive(&self) -> bool {
         self.allow_destructive
+    }
+
+    /// Whether elevated execution is permitted.
+    #[must_use]
+    pub fn allow_elevated(&self) -> bool {
+        self.allow_elevated
+    }
+
+    /// The command allowlist (executable basenames).
+    #[must_use]
+    pub fn allowed_commands(&self) -> &[String] {
+        &self.allowed_commands
+    }
+
+    /// Number of configured allowed-path glob patterns.
+    #[must_use]
+    pub fn allowed_pattern_count(&self) -> usize {
+        self.allowed_pattern_count
     }
 
     /// Ensure elevation is permitted, returning an error otherwise.

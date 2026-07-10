@@ -1,6 +1,6 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **134 MCP tools** across 15 categories. Every tool is
+This server exposes **137 MCP tools** across 16 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
 whose text content is (for most tools) a JSON document; `display.duplicate_frame`
 and the browser tools can also return image content.
@@ -12,7 +12,7 @@ Legend:
   client can discover them.
 - Tools that mutate state check the `allow_destructive` policy; tools that need
   admin rights check `allow_elevated`; tools that reach the network check
-  `allow_network`.
+  `allow_network`. The `security` tools let an agent dry-run these checks.
 - Any command-wrapping tool streams `notifications/progress` when the client
   supplies a `progressToken` on the call.
 
@@ -204,6 +204,14 @@ The server also implements MCP `resources/*`, `prompts/*` and `logging/setLevel`
 | `scheduler.list` | List scheduled jobs and their run counts. |
 | `scheduler.results` | Fetch the captured results (stdout/stderr/exit) of a scheduled job's recent runs. |
 | `scheduler.cancel` | Cancel a scheduled job (aborts any in-progress run). |
+
+### `security`
+
+| Tool | Description |
+| --- | --- |
+| `security.check_path` | Dry-run the path policy: report whether a path would be allowed (and its normalised form) or why it is denied. Optionally evaluate against a specific tool's policy. |
+| `security.check_command` | Dry-run the command allowlist: report whether a program would be permitted for execution. Optionally evaluate against a specific tool's policy. |
+| `security.effective_policy` | Report the effective permission policy for a tool: timeouts, output cap, gates and the command allowlist. |
 
 ### `terminal`
 

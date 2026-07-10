@@ -96,6 +96,17 @@ fn validate_config(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let store =
         ConfigStore::from_path(path).with_context(|| format!("loading {}", path.display()))?;
     let config = store.snapshot();
+
+    // Compile the baseline and every per-tool override so bad glob patterns are
+    // caught here rather than at first use.
+    use nebula_mcp_core::security::EffectivePolicy;
+    EffectivePolicy::resolve(&config, "validate.baseline")
+        .map_err(|e| anyhow::anyhow!("invalid [security] configuration: {e}"))?;
+    for tool_name in config.tools.keys() {
+        EffectivePolicy::resolve(&config, tool_name)
+            .map_err(|e| anyhow::anyhow!("invalid policy for [tools.\"{tool_name}\"]: {e}"))?;
+    }
+
     println!("Configuration at {} is valid.", path.display());
     println!("  server.name          = {}", config.server.name);
     println!(
@@ -123,6 +134,34 @@ fn validate_config(path: Option<&std::path::Path>) -> anyhow::Result<()> {
         "  max_runtime_secs     = {}",
         config.security.max_runtime_secs
     );
+    println!("  tool_overrides       = {}", config.tools.len());
+
+    let mut warnings = Vec::new();
+    if config.security.allowed_paths.is_empty() {
+        warnings.push("allowed_paths is empty: all filesystem access is denied.".to_string());
+    }
+    if config.security.allowed_commands.is_empty() {
+        warnings.push("allowed_commands is empty: all command execution is denied.".to_string());
+    }
+    if config.security.allow_elevated && config.security.allow_destructive {
+        warnings.push(
+            "allow_elevated and allow_destructive are both enabled globally: consider scoping \
+             these to specific tools via [tools.\"...\"] overrides."
+                .to_string(),
+        );
+    }
+    if config.security.max_runtime_secs < config.security.default_timeout_secs {
+        warnings.push(
+            "max_runtime_secs is below default_timeout_secs; per-call timeouts will be clamped down."
+                .to_string(),
+        );
+    }
+    if !warnings.is_empty() {
+        println!("\nWarnings:");
+        for w in warnings {
+            println!("  - {w}");
+        }
+    }
     Ok(())
 }
 

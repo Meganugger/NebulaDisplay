@@ -252,3 +252,35 @@ fn uuid_like() -> u128 {
         .unwrap()
         .as_nanos()
 }
+
+#[tokio::test]
+async fn stress_many_concurrent_calls() {
+    // Fire a large batch of fast calls and confirm every one is answered
+    // exactly once (exercises the bounded-concurrency JoinSet + semaphore).
+    let server = make_server(CancellationToken::new());
+    let mut lines = Vec::new();
+    const N: i64 = 200;
+    for i in 0..N {
+        lines.push(line(serde_json::json!({
+            "jsonrpc":"2.0","id": i,"method":"tools/call",
+            "params":{"name":"terminal.run","arguments":{"program":"echo","args":[format!("s{i}")]}}
+        })));
+    }
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        round_trip(server, lines.concat()),
+    )
+    .await
+    .expect("stress batch should complete well within the timeout");
+
+    let answered: std::collections::HashSet<i64> =
+        responses.iter().filter_map(|r| r["id"].as_i64()).collect();
+    assert_eq!(
+        answered.len() as i64,
+        N,
+        "every request must be answered once"
+    );
+    for r in &responses {
+        assert_eq!(r["result"]["isError"], false);
+    }
+}

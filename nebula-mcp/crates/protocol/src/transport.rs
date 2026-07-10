@@ -147,4 +147,44 @@ mod tests {
         assert!(text.ends_with('\n'));
         assert!(text.contains("\"ok\":true"));
     }
+
+    #[tokio::test]
+    async fn decoder_is_robust_to_garbage() {
+        // Interleave valid frames with malformed lines; valid ones must decode,
+        // malformed ones must surface as errors without panicking, and the
+        // reader must recover and continue on the next line.
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ok1\"}\n",
+            "this is not json\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ok2\"}\n",
+            "{\"jsonrpc\": 2.0, bad}\n",
+            "\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ok3\"}\n",
+        );
+        let mut reader = FrameReader::new(input.as_bytes());
+
+        let mut ok = Vec::new();
+        let mut errors = 0;
+        loop {
+            match reader.next_frame().await {
+                Ok(Some(req)) => ok.push(req.method),
+                Ok(None) => break,
+                Err(_) => errors += 1,
+            }
+        }
+        assert_eq!(ok, vec!["ok1", "ok2", "ok3"]);
+        assert_eq!(errors, 2);
+    }
+
+    #[tokio::test]
+    async fn long_and_unicode_frames_decode() {
+        let big = "x".repeat(200_000);
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"café\",\"method\":\"m\",\"params\":{{\"s\":\"{big}\"}}}}\n"
+        );
+        let mut reader = FrameReader::new(line.as_bytes());
+        let req = reader.next_frame().await.unwrap().unwrap();
+        assert_eq!(req.method, "m");
+        assert_eq!(req.id, Some(RequestId::String("café".into())));
+    }
 }

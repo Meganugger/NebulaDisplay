@@ -25,6 +25,7 @@ pub mod network;
 pub mod powershell;
 pub mod process;
 pub mod scheduler;
+pub mod security;
 pub mod terminal;
 pub mod windows;
 
@@ -97,5 +98,6 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     v.extend(browser::tools());
     v.extend(docker::tools());
     v.extend(scheduler::tools(services));
+    v.extend(security::tools());
     v
 }

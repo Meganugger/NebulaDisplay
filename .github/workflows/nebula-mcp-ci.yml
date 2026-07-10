@@ -38,6 +38,8 @@ jobs:
         run: cargo test --workspace
       - name: Build with otel feature
         run: cargo build -p nebula-mcp-server --features otel
+      - name: Release build
+        run: cargo build --workspace --release
 
   windows-cross-check:
     name: Linux → Windows cross-check
