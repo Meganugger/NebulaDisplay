@@ -284,3 +284,81 @@ async fn stress_many_concurrent_calls() {
         assert_eq!(r["result"]["isError"], false);
     }
 }
+
+#[tokio::test]
+async fn resource_subscription_emits_update_on_change() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // A file under the workspace root (/tmp) to watch.
+    let path = std::env::temp_dir().join(format!("nebula_sub_{}.txt", uuid_like()));
+    std::fs::write(&path, "initial").unwrap();
+    let uri = format!("file://{}", path.display());
+
+    let server = make_server(CancellationToken::new());
+
+    // Wire the server to duplex streams so we can interact over time.
+    let (mut client_to_server, server_reader) = tokio::io::duplex(1 << 16);
+    let (server_writer, client_from_server) = tokio::io::duplex(1 << 16);
+    let serve = tokio::spawn(async move { server.serve(server_reader, server_writer).await });
+
+    // Subscribe.
+    let sub = format!(
+        "{}\n",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri": uri}})
+    );
+    client_to_server.write_all(sub.as_bytes()).await.unwrap();
+    client_to_server.flush().await.unwrap();
+
+    let mut reader = BufReader::new(client_from_server);
+    let mut got_sub_ack = false;
+    let mut got_update = false;
+
+    // Read the subscribe ack, then mutate the file and await the update.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut line = String::new();
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            break;
+        }
+        line.clear();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut line),
+        )
+        .await;
+        match read {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v["id"] == 1 && v["result"]["subscribed"].is_string() {
+                    got_sub_ack = true;
+                    // Now change the file to trigger a watch event.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::fs::write(&path, "changed").unwrap();
+                }
+                if v["method"] == "notifications/resources/updated"
+                    && v["params"]["uri"] == serde_json::Value::String(uri.clone())
+                {
+                    got_update = true;
+                    break;
+                }
+            }
+            _ => {
+                // Timed out waiting for a line; nudge the file again.
+                if got_sub_ack {
+                    let _ = std::fs::write(&path, format!("changed-{}", uuid_like()));
+                }
+            }
+        }
+    }
+
+    drop(client_to_server); // EOF -> server shuts down
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), serve).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert!(got_sub_ack, "did not receive subscribe acknowledgement");
+    assert!(got_update, "did not receive resources/updated notification");
+}

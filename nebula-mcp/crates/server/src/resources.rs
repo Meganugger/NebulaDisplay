@@ -1,12 +1,19 @@
 //! MCP `resources/*` support: expose files under the workspace root as
-//! resources, gated by the same path allow/deny policy as the filesystem tools.
+//! resources, gated by the same path allow/deny policy as the filesystem tools,
+//! plus subscriptions that emit `notifications/resources/updated` on change.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use nebula_mcp_core::config::Config;
 use nebula_mcp_core::security::EffectivePolicy;
 use nebula_mcp_core::ToolError;
 use nebula_mcp_protocol::{ListResourcesResult, ReadResourceResult, Resource, ResourceContents};
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Maximum resources returned by a single `resources/list`.
 const MAX_RESOURCES: usize = 500;
@@ -138,6 +145,90 @@ fn guess_mime(path: &Path) -> String {
         _ => "text/plain",
     };
     mime.to_string()
+}
+
+/// Manages `resources/subscribe` watches. Each subscription watches a path and
+/// emits `notifications/resources/updated` (via the server's notification
+/// channel) when the file or directory changes.
+#[derive(Default)]
+pub struct SubscriptionManager {
+    watchers: Mutex<HashMap<String, Debouncer<RecommendedWatcher>>>,
+}
+
+impl SubscriptionManager {
+    /// Create an empty subscription manager.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Subscribe to a resource URI. The `notifier` receives a
+    /// `notifications/resources/updated` frame whenever the target changes.
+    pub fn subscribe(
+        &self,
+        config: &Config,
+        root: &Path,
+        uri: &str,
+        notifier: UnboundedSender<serde_json::Value>,
+    ) -> Result<(), ToolError> {
+        let policy = resource_policy(config)?;
+        let path = uri_to_path(uri)?;
+        let checked = policy.check_path(&path, root)?;
+
+        let uri_owned = uri.to_string();
+        let mut debouncer = new_debouncer(
+            Duration::from_millis(300),
+            move |res: DebounceEventResult| {
+                if res.is_ok() {
+                    let msg = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/resources/updated",
+                        "params": { "uri": uri_owned },
+                    });
+                    let _ = notifier.send(msg);
+                }
+            },
+        )
+        .map_err(|e| ToolError::Internal(format!("creating watcher: {e}")))?;
+
+        let mode = if checked.is_dir() {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        debouncer
+            .watcher()
+            .watch(&checked, mode)
+            .map_err(|e| ToolError::Io(format!("watching {}: {e}", checked.display())))?;
+
+        self.watchers
+            .lock()
+            .unwrap()
+            .insert(uri.to_string(), debouncer);
+        Ok(())
+    }
+
+    /// Unsubscribe from a URI. Returns whether a subscription existed.
+    pub fn unsubscribe(&self, uri: &str) -> bool {
+        self.watchers.lock().unwrap().remove(uri).is_some()
+    }
+
+    /// Drop all subscriptions (used on shutdown).
+    pub fn clear(&self) {
+        self.watchers.lock().unwrap().clear();
+    }
+
+    /// Number of active subscriptions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.watchers.lock().unwrap().len()
+    }
+
+    /// Whether there are no active subscriptions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]

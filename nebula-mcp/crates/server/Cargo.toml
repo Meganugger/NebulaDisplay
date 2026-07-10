@@ -38,6 +38,8 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 base64 = "0.22"
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

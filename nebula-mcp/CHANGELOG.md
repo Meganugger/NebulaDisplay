@@ -62,7 +62,8 @@ software-development environment to autonomous agents.
 - **Progress streaming**: any command-wrapping tool emits MCP
   `notifications/progress` when the client supplies a `progressToken`, so the
   agent gets live heartbeats during long builds/tests/captures.
-- **Resources**: `resources/list` and `resources/read` expose workspace files
+- **Resources**: `resources/list`, `resources/read`, and `resources/subscribe` (with
+  `notifications/resources/updated` via a debounced file watcher) expose workspace files
   (policy-gated, text or base64 blob) as MCP resources.
 - **Prompts**: `prompts/list` and `prompts/get` provide curated engineering
   workflows (crash-dump triage, build-failure investigation, PR review, bisect,

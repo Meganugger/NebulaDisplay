@@ -33,7 +33,7 @@ Result:
   "protocolVersion":"2024-11-05",
   "capabilities":{
     "tools":{"listChanged":false},
-    "resources":{"subscribe":false,"listChanged":false},
+    "resources":{"subscribe":true,"listChanged":false},
     "prompts":{"listChanged":false},
     "logging":{}
   },
@@ -99,6 +99,19 @@ Result: `{ "resources": [ { "uri":"file:///â€¦", "name", "mimeType", "size" }, â
 Result: `{ "contents": [ { "uri", "mimeType", "text" | "blob" } ] }`. Text files
 return `text`; binary files return base64 `blob`. Reads are policy-checked and
 truncated to the configured output cap.
+
+Subscribe to change notifications for a resource:
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"resources/subscribe","params":{"uri":"file:///work/build.log"}}
+{"jsonrpc":"2.0","id":7,"method":"resources/unsubscribe","params":{"uri":"file:///work/build.log"}}
+```
+
+While subscribed, the server emits (whenever the file/dir changes, debounced):
+
+```json
+{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///work/build.log"}}
+```
 
 ### `prompts/list` and `prompts/get`
 

@@ -1383,6 +1383,8 @@ dependencies = [
  "nebula-mcp-core",
  "nebula-mcp-protocol",
  "nebula-mcp-tools",
+ "notify",
+ "notify-debouncer-mini",
  "serde",
  "serde_json",
  "tempfile",

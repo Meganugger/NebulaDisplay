@@ -41,6 +41,8 @@ pub struct Server {
     notifier: std::sync::Mutex<Option<UnboundedSender<serde_json::Value>>>,
     /// Optional runtime log-level control (honours `logging/setLevel`).
     log_control: std::sync::Mutex<Option<LogControl>>,
+    /// Active `resources/subscribe` watches.
+    subscriptions: crate::resources::SubscriptionManager,
 }
 
 impl Server {
@@ -63,6 +65,7 @@ impl Server {
             initialized: Arc::new(AtomicBool::new(false)),
             notifier: std::sync::Mutex::new(None),
             log_control: std::sync::Mutex::new(None),
+            subscriptions: crate::resources::SubscriptionManager::new(),
         }
     }
 
@@ -183,7 +186,9 @@ impl Server {
             }
         }
 
-        // Drop the notifier so the notification task drains and exits.
+        // Stop all resource watches and drop the notifier so the notification
+        // task drains and exits.
+        self.subscriptions.clear();
         *self.notifier.lock().unwrap() = None;
         let _ = notif_task.await;
         Ok(())
@@ -243,6 +248,8 @@ impl Server {
             "tools/call" => Some(self.handle_tool_call(req, request_key, cancel).await),
             "resources/list" => Some(self.handle_resources_list(id)),
             "resources/read" => Some(self.handle_resources_read(req)),
+            "resources/subscribe" => Some(self.handle_resources_subscribe(req, true)),
+            "resources/unsubscribe" => Some(self.handle_resources_subscribe(req, false)),
             "prompts/list" => Some(Response::success(
                 id,
                 serde_json::to_value(crate::prompts::list()).unwrap_or_default(),
@@ -283,6 +290,43 @@ impl Server {
         let config = self.config.snapshot();
         match crate::resources::read(&config, &self.working_dir, &params.uri) {
             Ok(result) => Response::success(id, serde_json::to_value(result).unwrap_or_default()),
+            Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
+        }
+    }
+
+    fn handle_resources_subscribe(&self, req: Request, subscribe: bool) -> Response {
+        let id = req.id.clone();
+        let params: ReadResourceParams = match req
+            .params
+            .ok_or_else(|| "missing params".to_string())
+            .and_then(|p| serde_json::from_value(p).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Response::error(id, ErrorObject::new(error_codes::INVALID_PARAMS, e, None))
+            }
+        };
+        if !subscribe {
+            let existed = self.subscriptions.unsubscribe(&params.uri);
+            return Response::success(id, serde_json::json!({ "unsubscribed": existed }));
+        }
+        let notifier = self.notifier.lock().unwrap().clone();
+        let Some(notifier) = notifier else {
+            return Response::error(
+                id,
+                ErrorObject::new(
+                    error_codes::INTERNAL_ERROR,
+                    "notifications are not active",
+                    None,
+                ),
+            );
+        };
+        let config = self.config.snapshot();
+        match self
+            .subscriptions
+            .subscribe(&config, &self.working_dir, &params.uri, notifier)
+        {
+            Ok(()) => Response::success(id, serde_json::json!({ "subscribed": params.uri })),
             Err(e) => Response::error(id, ErrorObject::new(e.json_rpc_code(), e.to_string(), None)),
         }
     }
@@ -357,7 +401,7 @@ impl Server {
                     list_changed: Some(false),
                 }),
                 resources: Some(ResourcesCapability {
-                    subscribe: Some(false),
+                    subscribe: Some(true),
                     list_changed: Some(false),
                 }),
                 prompts: Some(PromptsCapability {
