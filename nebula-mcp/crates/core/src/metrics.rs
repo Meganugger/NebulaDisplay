@@ -1,0 +1,159 @@
+//! Lightweight, lock-free per-tool metrics.
+//!
+//! Metrics are kept in a [`DashMap`] keyed by tool name and updated with atomic
+//! counters, so recording is cheap even under heavy concurrency. The server
+//! periodically logs a snapshot when `logging.emit_metrics` is enabled and can
+//! expose the same data via a diagnostics tool.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use serde::Serialize;
+
+/// Atomic counters for a single tool.
+#[derive(Debug, Default)]
+struct ToolCounters {
+    calls: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    cancellations: AtomicU64,
+    total_duration_us: AtomicU64,
+    max_duration_us: AtomicU64,
+    output_bytes: AtomicU64,
+}
+
+/// A point-in-time, serialisable snapshot of one tool's metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolMetricsSnapshot {
+    /// Tool name.
+    pub tool: String,
+    /// Total invocations.
+    pub calls: u64,
+    /// Invocations that returned success.
+    pub successes: u64,
+    /// Invocations that returned an error.
+    pub failures: u64,
+    /// Invocations cancelled or timed out.
+    pub cancellations: u64,
+    /// Mean duration across all completed calls, in microseconds.
+    pub mean_duration_us: u64,
+    /// Worst observed duration, in microseconds.
+    pub max_duration_us: u64,
+    /// Total captured output bytes.
+    pub output_bytes: u64,
+}
+
+/// Shared metrics registry.
+#[derive(Clone, Default)]
+pub struct Metrics {
+    tools: Arc<DashMap<String, ToolCounters>>,
+}
+
+impl Metrics {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a completed tool call.
+    pub fn record(
+        &self,
+        tool: &str,
+        outcome: Outcome,
+        duration: std::time::Duration,
+        output_bytes: u64,
+    ) {
+        let entry = self.tools.entry(tool.to_string()).or_default();
+        entry.calls.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            Outcome::Success => {
+                entry.successes.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::Failure => {
+                entry.failures.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::Cancelled => {
+                entry.cancellations.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let us = duration.as_micros() as u64;
+        entry.total_duration_us.fetch_add(us, Ordering::Relaxed);
+        entry
+            .output_bytes
+            .fetch_add(output_bytes, Ordering::Relaxed);
+        // Update max via compare-and-swap loop.
+        let mut cur = entry.max_duration_us.load(Ordering::Relaxed);
+        while us > cur {
+            match entry.max_duration_us.compare_exchange_weak(
+                cur,
+                us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Snapshot metrics for every tool, sorted by name.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<ToolMetricsSnapshot> {
+        let mut out: Vec<ToolMetricsSnapshot> = self
+            .tools
+            .iter()
+            .map(|kv| {
+                let c = kv.value();
+                let calls = c.calls.load(Ordering::Relaxed);
+                let total = c.total_duration_us.load(Ordering::Relaxed);
+                ToolMetricsSnapshot {
+                    tool: kv.key().clone(),
+                    calls,
+                    successes: c.successes.load(Ordering::Relaxed),
+                    failures: c.failures.load(Ordering::Relaxed),
+                    cancellations: c.cancellations.load(Ordering::Relaxed),
+                    mean_duration_us: total.checked_div(calls).unwrap_or(0),
+                    max_duration_us: c.max_duration_us.load(Ordering::Relaxed),
+                    output_bytes: c.output_bytes.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.tool.cmp(&b.tool));
+        out
+    }
+}
+
+/// Outcome classification for a completed call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The tool returned success.
+    Success,
+    /// The tool returned an error.
+    Failure,
+    /// The tool was cancelled or timed out.
+    Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn records_and_aggregates() {
+        let m = Metrics::new();
+        m.record("fs.read", Outcome::Success, Duration::from_micros(100), 10);
+        m.record("fs.read", Outcome::Failure, Duration::from_micros(300), 0);
+        let snap = m.snapshot();
+        assert_eq!(snap.len(), 1);
+        let s = &snap[0];
+        assert_eq!(s.calls, 2);
+        assert_eq!(s.successes, 1);
+        assert_eq!(s.failures, 1);
+        assert_eq!(s.mean_duration_us, 200);
+        assert_eq!(s.max_duration_us, 300);
+        assert_eq!(s.output_bytes, 10);
+    }
+}

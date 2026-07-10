@@ -1,0 +1,104 @@
+# NebulaDisplay MCP server configuration.
+#
+# This is a complete, documented example. Copy it, tighten the allowlists to
+# your environment, and launch with:
+#
+#     nebula-mcp run --config path/to/nebula-mcp.toml
+#
+# Security note: the allowlists below are EMPTY-DENY by default. A tool can only
+# touch a path that matches `allowed_paths` (and not `denied_paths`), and can
+# only execute a program named in `allowed_commands`. There is no wildcard
+# "allow everything" switch by design.
+
+[server]
+# Advertised over the MCP `initialize` handshake.
+name = "nebula-mcp"
+# `version` defaults to the crate version; override only if you must.
+# version = "0.1.0"
+# Instructions surfaced to the model on initialize.
+instructions = "NebulaDisplay Windows autonomous-engineering MCP server."
+# Maximum tool calls executed concurrently.
+max_concurrent_calls = 16
+
+[logging]
+# error | warn | info | debug | trace, or an env-filter directive such as
+# "nebula_mcp=debug,info".
+level = "info"
+# json | pretty. JSON is recommended for machine ingestion.
+format = "json"
+# Directory for rotating file logs. Comment out to log only to stderr.
+# directory = "C:\\ProgramData\\nebula-mcp\\logs"
+file_prefix = "nebula-mcp"
+# minutely | hourly | daily | never
+rotation = "daily"
+# OTLP/gRPC endpoint for OpenTelemetry trace export. Requires the `otel` build
+# feature; ignored (with a warning) otherwise.
+# otel_endpoint = "http://127.0.0.1:4317"
+emit_metrics = true
+
+[security]
+# Glob patterns of paths tools may access. `**` spans path separators.
+# Examples (Windows): ["C:\\src\\**", "C:\\builds\\**"]
+allowed_paths = [
+    # "C:\\src\\**",
+    # "C:\\builds\\**",
+]
+# Patterns always denied, even if matched by allowed_paths. Sensible secret
+# patterns are denied out of the box; add your own.
+denied_paths = [
+    "**/.ssh/**",
+    "**/.aws/**",
+    "**/.gnupg/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/.env",
+]
+# Executables permitted for terminal/process tools. Matched by basename
+# (case-insensitive on Windows, `.exe` stripped). Examples:
+#   ["git", "cargo", "msbuild", "signtool", "pnputil", "powershell", "node"]
+allowed_commands = [
+    # "git",
+    # "cargo",
+    # "powershell",
+    # "msbuild",
+    # "signtool",
+    # "pnputil",
+    # "node",
+]
+# Default per-call timeout in seconds.
+default_timeout_secs = 120
+# Absolute ceiling for any single call, in seconds.
+max_runtime_secs = 3600
+# Maximum captured output per stream, in bytes (8 MiB).
+max_output_bytes = 8388608
+# Whether tools may request elevated (admin) execution.
+allow_elevated = false
+# Whether tools that reach external networks are permitted.
+allow_network = true
+# Whether destructive operations (delete, reset --hard, driver uninstall) are
+# permitted at all.
+allow_destructive = false
+
+# ---------------------------------------------------------------------------
+# Per-category enable switches. Disabling a category disables all of its tools.
+# Categories: filesystem, terminal, process, git, github, network, powershell,
+#             windows, driver, display, benchmark, diagnostics, browser
+# ---------------------------------------------------------------------------
+# [categories.driver]
+# enabled = false
+
+# ---------------------------------------------------------------------------
+# Per-tool overrides. Any field is optional and layers on top of [security].
+# ---------------------------------------------------------------------------
+# [tools."git.push"]
+# enabled = true
+#
+# [tools."driver.install"]
+# enabled = true
+# allow_destructive = true
+#
+# [tools."terminal.run"]
+# timeout_secs = 600
+# max_output_bytes = 16777216
+# allowed_commands = ["cargo", "npm"]

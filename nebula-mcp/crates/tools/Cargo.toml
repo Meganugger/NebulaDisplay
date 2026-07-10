@@ -1,0 +1,62 @@
+[package]
+name = "nebula-mcp-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tool implementations (filesystem, git, process, network, Windows subsystems) for the NebulaDisplay MCP server."
+
+[dependencies]
+nebula-mcp-protocol = { path = "../protocol" }
+nebula-mcp-core = { path = "../core" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+globset = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true }
+which = { workspace = true }
+shell-words = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+sysinfo = "0.32"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = "1.10"
+webpki-roots = "0.26"
+x509-parser = "0.16"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+# Native Windows APIs are only pulled in when building for Windows. Cross-
+# platform code paths never touch these; Windows-only tools use them under
+# #[cfg(windows)] and fall back to PlatformUnsupported errors elsewhere.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }

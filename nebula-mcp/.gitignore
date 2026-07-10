@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+target/
+**/*.rs.bk
+*.pdb
+
+# Local config overrides
+nebula-mcp.local.toml

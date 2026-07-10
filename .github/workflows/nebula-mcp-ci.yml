@@ -1,0 +1,73 @@
+name: nebula-mcp CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["nebula-mcp/**", ".github/workflows/nebula-mcp-ci.yml"]
+  pull_request:
+    paths: ["nebula-mcp/**", ".github/workflows/nebula-mcp-ci.yml"]
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    working-directory: nebula-mcp
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux:
+    name: Linux (build, test, lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nebula-mcp
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+      - name: Build with otel feature
+        run: cargo build -p nebula-mcp-server --features otel
+
+  windows-cross-check:
+    name: Linux → Windows cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nebula-mcp
+      - name: Cross-check Windows-native code paths
+        env:
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+        run: cargo check --workspace --target x86_64-pc-windows-gnu
+
+  windows:
+    name: Windows (build, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nebula-mcp
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
