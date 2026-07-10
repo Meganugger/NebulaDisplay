@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use nebula_mcp_core::{Result, Tool, ToolContext, ToolError};
 use nebula_mcp_protocol::mcp::ToolAnnotations;
 use nebula_mcp_protocol::{CallToolResult, Content};
@@ -51,7 +52,7 @@ impl Tool for ReadFile {
         CATEGORY
     }
     fn description(&self) -> &str {
-        "Read a text file. Supports byte offset and maxBytes for streaming large files in chunks."
+        "Read a file. Supports byte offset and maxBytes for streaming large files in chunks, and encoding=base64 for binary files."
     }
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
@@ -68,6 +69,12 @@ impl Tool for ReadFile {
             .integer(
                 "maxBytes",
                 "Maximum bytes to read (default: policy output limit).",
+                false,
+            )
+            .enumerated(
+                "encoding",
+                "How to encode returned content: utf8 (default) or base64 (binary-safe).",
+                &["utf8", "base64"],
                 false,
             )
             .build()
@@ -117,12 +124,17 @@ impl Tool for ReadFile {
             read += n;
         }
         buf.truncate(read);
-        let content = String::from_utf8_lossy(&buf).into_owned();
+        let encoding = a.str_or("encoding", "utf8")?;
+        let content = match encoding {
+            "base64" => base64::engine::general_purpose::STANDARD.encode(&buf),
+            _ => String::from_utf8_lossy(&buf).into_owned(),
+        };
         let end = offset + read as u64;
 
         Ok(json_value_result(json!({
             "path": path.display().to_string(),
             "content": content,
+            "encoding": encoding,
             "bytesRead": read,
             "offset": offset,
             "endOffset": end,
@@ -144,12 +156,22 @@ impl Tool for WriteFile {
         CATEGORY
     }
     fn description(&self) -> &str {
-        "Create or overwrite a text file with the given content, creating parent directories."
+        "Create or overwrite a file, creating parent directories. Use encoding=base64 to write binary content."
     }
     fn input_schema(&self) -> Value {
         ObjectSchema::new()
             .string("path", "File path.", true)
-            .string("content", "UTF-8 text content to write.", true)
+            .string(
+                "content",
+                "Content to write (UTF-8 text, or base64 when encoding=base64).",
+                true,
+            )
+            .enumerated(
+                "encoding",
+                "Interpretation of content: utf8 (default) or base64.",
+                &["utf8", "base64"],
+                false,
+            )
             .boolean("createParents", "Create missing parent directories.", true)
             .build()
     }
@@ -157,6 +179,12 @@ impl Tool for WriteFile {
         let a = Args::new(&args)?;
         let path = ctx.resolve_path(a.str("path")?)?;
         let content = a.str("content")?;
+        let bytes = match a.str_or("encoding", "utf8")? {
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(content.trim())
+                .map_err(|e| ToolError::InvalidArguments(format!("invalid base64 content: {e}")))?,
+            _ => content.as_bytes().to_vec(),
+        };
         if a.bool_or("createParents", true)? {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -164,12 +192,12 @@ impl Tool for WriteFile {
                     .map_err(|e| map_io("create parent of", parent, e))?;
             }
         }
-        tokio::fs::write(&path, content.as_bytes())
+        tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| map_io("write", &path, e))?;
         Ok(json_value_result(json!({
             "path": path.display().to_string(),
-            "bytesWritten": content.len(),
+            "bytesWritten": bytes.len(),
         })))
     }
 }

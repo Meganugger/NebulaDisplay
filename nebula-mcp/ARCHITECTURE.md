@@ -27,7 +27,7 @@
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │  nebula-mcp-tools    │  125 tools in 14 category modules
+                    │  nebula-mcp-tools    │  132 tools in 15 category modules
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
@@ -84,6 +84,8 @@ building blocks live in `common`:
 - **session** — a `SessionManager` for persistent interactive processes (shells,
   REPLs) with a bounded output ring buffer, shared across calls via
   `ToolServices`.
+- **scheduler** — a `SchedulerManager` for deferred/recurring command execution
+  with captured results, also shared via `ToolServices`.
 - **args / schema / output** — typed argument extraction with precise errors, a
   small JSON-Schema builder, and result formatting.
 - **platform** — `ensure_windows()` gating and a shared PowerShell runner.
@@ -97,8 +99,9 @@ Windows-specific tools take one of two forms:
 2. **Native Win32/DXGI/DWM calls** (the `display` module) using the `windows`
    crate, compiled only for Windows targets (`#[cfg(windows)]`). QueryDisplay
    Config, DXGI adapter/output enumeration, DWM composition/timing, advanced-
-   colour/HDR detection, monitor topology and coordinate conversion are all
-   real native API calls.
+   colour/HDR detection, monitor topology, coordinate conversion, display-mode
+   enumeration and DXGI Desktop Duplication single-frame capture are all real
+   native API calls.
 
 ### `nebula-mcp-server`
 

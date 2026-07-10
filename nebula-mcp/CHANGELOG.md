@@ -24,26 +24,29 @@ software-development environment to autonomous agents.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **125 tools** (`nebula-mcp-tools`) across 14 categories:
+- **132 tools** (`nebula-mcp-tools`) across 15 categories:
   - **filesystem** (13): read/write/append/rename/delete/move/copy, content
-    search, glob, tree, hash, metadata, permissions, with large-file streaming.
+    search, glob, tree, hash, metadata, permissions, with large-file streaming
+    and binary-safe base64 read/write.
   - **terminal** (6): one-shot run plus persistent interactive sessions.
   - **process** (3): list/info/kill via `sysinfo`.
   - **git** (24): the full everyday command surface plus worktree,
     cherry-pick, revert, reflog, show and apply.
   - **github** (13): clone, a generic authenticated REST tool, and convenience
     tools for PRs, issues, forks, releases, actions, branches, reviews, labels.
-  - **network** (10): HTTP(S), DNS, TCP connect, latency sampling, native TLS
-    inspection, WebSocket, ping, iperf3, packet capture, QUIC/HTTP3 probe.
+  - **network** (11): HTTP(S), file download, DNS, TCP connect, latency
+    sampling, native TLS inspection, WebSocket, ping, iperf3, packet capture,
+    QUIC/HTTP3 probe.
   - **powershell** (3): non-interactive, elevated, and remote execution.
   - **windows** (8): services, registry, event log, performance counters,
     scheduled tasks, environment, firewall, network adapters.
   - **driver** (11): MSBuild, inf2cat, signtool, pnputil, devcon, Driver
     Verifier, IddCx diagnostics, display restart, install/uninstall, logs.
-  - **display** (9): native QueryDisplayConfig, DXGI adapters/outputs, monitor
+  - **display** (10): native QueryDisplayConfig, DXGI adapters/outputs, monitor
     topology, DWM info, present/timing statistics, HDR/advanced-colour
-    detection, coordinate-to-monitor mapping, virtual-display enumeration, and
-    EnumDisplaySettings mode enumeration.
+    detection, coordinate-to-monitor mapping, virtual-display enumeration,
+    EnumDisplaySettings mode enumeration, and DXGI Desktop Duplication
+    single-frame capture (PNG).
   - **benchmark** (7): cross-platform system sampling, ffmpeg, PresentMon, WPR,
     wpaexporter, GPUView logger, LatencyMon.
   - **diagnostics** (7): capability probe, WER reports, crash-dump discovery,
@@ -51,6 +54,8 @@ software-development environment to autonomous agents.
   - **browser** (2): Playwright-driven capture (screenshot/PDF/trace/console/
     network) and a screenshot convenience.
   - **docker** (9): ps, images, build, run, stop, rm, logs, exec, and compose.
+  - **scheduler** (5): run allowlisted commands after a delay or on an interval
+    and poll their captured results (after, every, list, results, cancel).
 - **Progress streaming**: any command-wrapping tool emits MCP
   `notifications/progress` when the client supplies a `progressToken`, so the
   agent gets live heartbeats during long builds/tests/captures.

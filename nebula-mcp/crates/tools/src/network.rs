@@ -28,6 +28,9 @@ pub fn tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
         Arc::new(HttpRequest {
             http: services.http.clone(),
         }),
+        Arc::new(Download {
+            http: services.http.clone(),
+        }),
         Arc::new(DnsLookup),
         Arc::new(TcpConnect),
         Arc::new(LatencySample),
@@ -130,6 +133,112 @@ impl Tool for HttpRequest {
         };
         let v = ctx.guarded(timeout, fut).await?;
         Ok(json_value_result(v))
+    }
+}
+
+/// Stream a URL to a file on disk with a size cap.
+struct Download {
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl Tool for Download {
+    fn name(&self) -> &str {
+        "net.download"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Download a URL to a file (within an allowed root), streaming with a maximum size cap."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .string("url", "URL to download.", true)
+            .string(
+                "outputPath",
+                "Destination file path (within an allowed root).",
+                true,
+            )
+            .integer(
+                "maxBytes",
+                "Maximum bytes to write (default 104857600 = 100 MiB).",
+                false,
+            )
+            .integer("timeoutSecs", "Timeout override.", false)
+            .build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations {
+            open_world_hint: Some(true),
+            ..Default::default()
+        })
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let a = Args::new(&args)?;
+        ctx.policy.ensure_network_allowed()?;
+        let url = a.str("url")?.to_string();
+        let out = ctx.resolve_path(a.str("outputPath")?)?;
+        let max_bytes = a.u64_or("maxBytes", 100 * 1024 * 1024)?;
+        let timeout = ctx.timeout(a.opt_u64("timeoutSecs")?);
+        let http = self.http.clone();
+
+        let fut = async move {
+            if let Some(parent) = out.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ToolError::Io(format!("creating parent dir: {e}")))?;
+            }
+            let resp = http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| ToolError::Execution(format!("request failed: {e}")))?;
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                return Err(ToolError::Execution(format!(
+                    "download failed with HTTP {status}"
+                )));
+            }
+            let mut file = tokio::fs::File::create(&out)
+                .await
+                .map_err(|e| ToolError::Io(format!("creating {}: {e}", out.display())))?;
+            let mut written: u64 = 0;
+            let mut truncated = false;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|e| ToolError::Execution(format!("stream error: {e}")))?;
+                let remaining = max_bytes.saturating_sub(written);
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let take = (chunk.len() as u64).min(remaining) as usize;
+                file.write_all(&chunk[..take])
+                    .await
+                    .map_err(|e| ToolError::Io(format!("writing output: {e}")))?;
+                written += take as u64;
+                if take < chunk.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| ToolError::Io(format!("flushing output: {e}")))?;
+            Ok::<_, ToolError>(json!({
+                "url": url,
+                "outputPath": out.display().to_string(),
+                "status": status,
+                "bytesWritten": written,
+                "truncated": truncated,
+            }))
+        };
+        Ok(json_value_result(ctx.guarded(timeout, fut).await?))
     }
 }
 

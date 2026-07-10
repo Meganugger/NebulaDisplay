@@ -23,9 +23,9 @@ work around.
 
 - **Native services/registry** via the `windows` crate as an alternative to the
   `sc.exe`/`reg.exe` wrappers, for callers that want to avoid spawning.
-- **Desktop Duplication capture** — a `display.duplicate_frame` tool that grabs a
-  frame via DXGI `IDXGIOutputDuplication` and returns it as an image content
-  block (needs a D3D device; larger native surface).
+- **Continuous Desktop Duplication streaming** — single-frame capture
+  (`display.duplicate_frame`) is implemented; a streaming/`ffmpeg`-piped variant
+  for continuous capture is the next step.
 - **ETW consumption in-process** — parse ETW/PresentMon events natively rather
   than shelling out, for lower-latency frame analysis.
 - **IddCx virtual-display control** — once NebulaDisplay's IddCx driver exposes

@@ -33,6 +33,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(MouseToMonitor),
         Arc::new(VirtualDisplays),
         Arc::new(EnumModes),
+        Arc::new(DuplicateFrame),
     ]
 }
 
@@ -172,6 +173,49 @@ display_tool!(
     enum_modes_schema,
     win_enum_modes
 );
+
+/// Capture a single desktop frame via DXGI Desktop Duplication.
+struct DuplicateFrame;
+
+#[async_trait]
+impl Tool for DuplicateFrame {
+    fn name(&self) -> &str {
+        "display.duplicate_frame"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Capture one frame of the primary output via DXGI Desktop Duplication. Returns a PNG image \
+         (optionally downscaled), or writes it to outputPath. Requires an interactive desktop session. Windows only."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .integer("maxDimension", "Downscale so the longest side is at most this many pixels (default 1920; 0 = no downscale).", false)
+            .integer("acquireTimeoutMs", "Timeout waiting for a new frame (default 700).", false)
+            .string("outputPath", "If set, write the PNG here (within an allowed root) and return metadata instead of embedding the image.", false)
+            .build()
+    }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        ro()
+    }
+    #[allow(unused_variables)]
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        ensure_windows(self.name())?;
+        let a = Args::new(&args)?;
+        #[cfg(windows)]
+        {
+            return win_duplicate_frame(ctx, &a);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = &a;
+            Err(nebula_mcp_core::ToolError::PlatformUnsupported(
+                "display.duplicate_frame".to_string(),
+            ))
+        }
+    }
+}
 
 // The native implementations are only compiled for Windows.
 #[cfg(windows)]
@@ -582,4 +626,202 @@ mod win {
     }
 
     use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+
+    /// Capture one desktop frame via DXGI Desktop Duplication and return it as a
+    /// PNG (embedded base64 or written to `outputPath`).
+    pub(super) fn win_duplicate_frame(
+        ctx: &ToolContext,
+        a: &Args,
+    ) -> Result<nebula_mcp_protocol::CallToolResult> {
+        use base64::Engine as _;
+        use nebula_mcp_protocol::{CallToolResult, Content};
+        use windows::core::Interface;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+            D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE,
+            D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+            DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+        };
+
+        let max_dim = a.opt_i64("maxDimension")?.unwrap_or(1920).max(0) as u32;
+        let acquire_timeout = a.opt_i64("acquireTimeoutMs")?.unwrap_or(700).max(1) as u32;
+        let output_path = match a.opt_str("outputPath")? {
+            Some(p) => Some(ctx.resolve_path(p)?),
+            None => None,
+        };
+        let max_output = ctx.policy.max_output_bytes();
+
+        unsafe {
+            // Create a D3D11 device.
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            let mut level = D3D_FEATURE_LEVEL::default();
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                Some(&mut level),
+                Some(&mut context),
+            )
+            .map_err(|e| win_err("D3D11CreateDevice", e))?;
+            let device = device.ok_or_else(|| ToolError::Execution("no D3D11 device".into()))?;
+            let context = context.ok_or_else(|| ToolError::Execution("no D3D11 context".into()))?;
+
+            // Reach the primary output and start duplication.
+            let dxgi_device: IDXGIDevice =
+                device.cast().map_err(|e| win_err("cast IDXGIDevice", e))?;
+            let adapter = dxgi_device
+                .GetAdapter()
+                .map_err(|e| win_err("GetAdapter", e))?;
+            let output = adapter
+                .EnumOutputs(0)
+                .map_err(|e| win_err("EnumOutputs", e))?;
+            let output1: IDXGIOutput1 =
+                output.cast().map_err(|e| win_err("cast IDXGIOutput1", e))?;
+            let dupl: IDXGIOutputDuplication = output1
+                .DuplicateOutput(&device)
+                .map_err(|e| win_err("DuplicateOutput", e))?;
+
+            // Acquire a frame (retry across timeouts up to the budget).
+            let mut resource: Option<IDXGIResource> = None;
+            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut acquired = false;
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(acquire_timeout as u64 * 4);
+            while std::time::Instant::now() < deadline {
+                match dupl.AcquireNextFrame(acquire_timeout, &mut frame_info, &mut resource) {
+                    Ok(()) => {
+                        acquired = true;
+                        break;
+                    }
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                        let _ = dupl.ReleaseFrame();
+                        continue;
+                    }
+                    Err(e) => return Err(win_err("AcquireNextFrame", e)),
+                }
+            }
+            if !acquired {
+                let _ = dupl.ReleaseFrame();
+                return Err(ToolError::Execution(
+                    "timed out waiting for a desktop frame (is anything rendering?)".into(),
+                ));
+            }
+            let resource =
+                resource.ok_or_else(|| ToolError::Execution("no frame resource".into()))?;
+            let frame_tex: ID3D11Texture2D = resource
+                .cast()
+                .map_err(|e| win_err("cast ID3D11Texture2D", e))?;
+
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            frame_tex.GetDesc(&mut desc);
+
+            // Staging copy readable by the CPU.
+            let mut staging_desc = desc;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags = 0;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            staging_desc.MiscFlags = 0;
+            let mut staging: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .map_err(|e| win_err("CreateTexture2D", e))?;
+            let staging =
+                staging.ok_or_else(|| ToolError::Execution("no staging texture".into()))?;
+            context.CopyResource(&staging, &frame_tex);
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| win_err("Map", e))?;
+
+            let width = desc.Width as usize;
+            let height = desc.Height as usize;
+            let row_pitch = mapped.RowPitch as usize;
+            let src = mapped.pData as *const u8;
+            let mut rgba = vec![0u8; width * height * 4];
+            for y in 0..height {
+                let row = std::slice::from_raw_parts(src.add(y * row_pitch), width * 4);
+                for x in 0..width {
+                    let i = x * 4;
+                    let o = (y * width + x) * 4;
+                    // Source is BGRA; store as RGBA.
+                    rgba[o] = row[i + 2];
+                    rgba[o + 1] = row[i + 1];
+                    rgba[o + 2] = row[i];
+                    rgba[o + 3] = 255;
+                }
+            }
+            context.Unmap(&staging, 0);
+            let _ = dupl.ReleaseFrame();
+
+            // Build the image, optionally downscaling.
+            let mut img = image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+                .ok_or_else(|| ToolError::Internal("failed to build image buffer".into()))?;
+            let (mut out_w, mut out_h) = (width as u32, height as u32);
+            if max_dim > 0 && out_w.max(out_h) > max_dim {
+                let scale = max_dim as f64 / out_w.max(out_h) as f64;
+                out_w = ((out_w as f64) * scale).round().max(1.0) as u32;
+                out_h = ((out_h as f64) * scale).round().max(1.0) as u32;
+                img = image::imageops::resize(
+                    &img,
+                    out_w,
+                    out_h,
+                    image::imageops::FilterType::Triangle,
+                );
+            }
+
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .map_err(|e| ToolError::Internal(format!("PNG encode failed: {e}")))?;
+
+            if let Some(path) = output_path {
+                std::fs::write(&path, &png)
+                    .map_err(|e| ToolError::Io(format!("writing {}: {e}", path.display())))?;
+                return Ok(CallToolResult {
+                    content: vec![Content::text(
+                        json!({
+                            "outputPath": path.display().to_string(),
+                            "width": out_w,
+                            "height": out_h,
+                            "sourceWidth": width,
+                            "sourceHeight": height,
+                            "bytes": png.len(),
+                        })
+                        .to_string(),
+                    )],
+                    is_error: Some(false),
+                });
+            }
+
+            // Embed as base64. Guard against exceeding the output cap.
+            if png.len() * 4 / 3 > max_output {
+                return Err(ToolError::OutputTooLarge { limit: max_output });
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&png);
+            Ok(CallToolResult {
+                content: vec![
+                    Content::Image {
+                        data,
+                        mime_type: "image/png".to_string(),
+                    },
+                    Content::text(
+                        json!({"width": out_w, "height": out_h, "sourceWidth": width, "sourceHeight": height})
+                            .to_string(),
+                    ),
+                ],
+                is_error: Some(false),
+            })
+        }
+    }
 }

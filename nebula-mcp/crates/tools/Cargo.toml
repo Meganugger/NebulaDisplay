@@ -32,6 +32,7 @@ uuid = { workspace = true }
 time = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+base64 = "0.22"
 reqwest = { workspace = true }
 url = { workspace = true }
 sysinfo = "0.32"
@@ -56,7 +57,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
 ] }
+# Pure-Rust PNG encoding for Desktop Duplication captures (Windows only).
+image = { version = "0.25", default-features = false, features = ["png"] }

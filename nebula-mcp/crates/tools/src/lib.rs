@@ -24,6 +24,7 @@ pub mod github;
 pub mod network;
 pub mod powershell;
 pub mod process;
+pub mod scheduler;
 pub mod terminal;
 pub mod windows;
 
@@ -31,6 +32,7 @@ use std::sync::Arc;
 
 use nebula_mcp_core::{Tool, ToolRegistry};
 
+pub use common::scheduler::SchedulerManager;
 pub use common::session::SessionManager;
 
 /// Stateful services shared across tools for the process lifetime.
@@ -38,6 +40,8 @@ pub use common::session::SessionManager;
 pub struct ToolServices {
     /// Interactive session manager (persistent shells/REPLs).
     pub sessions: Arc<SessionManager>,
+    /// Deferred/recurring job scheduler.
+    pub scheduler: Arc<SchedulerManager>,
     /// Shared HTTP client with connection reuse for network/github tools.
     pub http: reqwest::Client,
 }
@@ -52,6 +56,7 @@ impl ToolServices {
             .unwrap_or_default();
         Self {
             sessions: Arc::new(SessionManager::new()),
+            scheduler: Arc::new(SchedulerManager::new()),
             http,
         }
     }
@@ -91,5 +96,6 @@ pub fn all_tools(services: &ToolServices) -> Vec<Arc<dyn Tool>> {
     v.extend(diagnostics::tools());
     v.extend(browser::tools());
     v.extend(docker::tools());
+    v.extend(scheduler::tools(services));
     v
 }

@@ -1,8 +1,9 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **125 MCP tools** across 14 categories. Every tool is
+This server exposes **132 MCP tools** across 15 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
-whose text content is (for most tools) a JSON document.
+whose text content is (for most tools) a JSON document; `display.duplicate_frame`
+and the browser tools can also return image content.
 
 Legend:
 - **Cross-platform** tools work on Windows, Linux and macOS.
@@ -63,6 +64,7 @@ field) and are the authoritative argument reference.
 | `display.mouse_to_monitor` | Map a virtual-desktop coordinate to the monitor containing it and to monitor-local coordinates. Windows only. |
 | `display.virtual_displays` | List display adapters/devices, flagging indirect (IddCx) virtual displays. Windows only. |
 | `display.enum_modes` | Enumerate the supported display modes (resolution, colour depth, refresh) for an adapter via EnumDisplaySettingsEx. Windows only. |
+| `display.duplicate_frame` | Capture one frame of the primary output via DXGI Desktop Duplication. Returns a PNG image (optionally downscaled), or writes it to outputPath. Requires an interactive desktop session. Windows only. |
 
 ### `docker`
 
@@ -98,8 +100,8 @@ field) and are the authoritative argument reference.
 
 | Tool | Description |
 | --- | --- |
-| `fs.read` | Read a text file. Supports byte offset and maxBytes for streaming large files in chunks. |
-| `fs.write` | Create or overwrite a text file with the given content, creating parent directories. |
+| `fs.read` | Read a file. Supports byte offset and maxBytes for streaming large files in chunks, and encoding=base64 for binary files. |
+| `fs.write` | Create or overwrite a file, creating parent directories. Use encoding=base64 to write binary content. |
 | `fs.append` | Append UTF-8 text to a file, creating it if absent. |
 | `fs.rename` | Rename or move a file/directory (both paths must be within allowed roots). |
 | `fs.delete` | Delete a file or directory. Directory deletion requires recursive=true. Destructive. |
@@ -164,6 +166,7 @@ field) and are the authoritative argument reference.
 | Tool | Description |
 | --- | --- |
 | `net.http_request` | Perform an HTTP/HTTPS request and return status, headers and (capped) body. |
+| `net.download` | Download a URL to a file (within an allowed root), streaming with a maximum size cap. |
 | `net.dns_lookup` | Resolve a hostname to IP addresses. |
 | `net.tcp_connect` | Measure TCP connect latency to host:port. |
 | `net.latency` | Sample TCP connect latency over multiple attempts and report min/avg/max/jitter. |
@@ -189,6 +192,16 @@ field) and are the authoritative argument reference.
 | `process.list` | List running processes (pid, name, cpu, memory), optionally filtered by a name substring. |
 | `process.info` | Return detailed information about a process by pid. |
 | `process.kill` | Terminate a process by pid. Destructive; requires allow_destructive. |
+
+### `scheduler`
+
+| Tool | Description |
+| --- | --- |
+| `scheduler.after` | Schedule an allowlisted command to run once after a delay. Returns a job id; poll with scheduler.results. |
+| `scheduler.every` | Schedule an allowlisted command to run repeatedly on an interval. Returns a job id; cancel with scheduler.cancel. |
+| `scheduler.list` | List scheduled jobs and their run counts. |
+| `scheduler.results` | Fetch the captured results (stdout/stderr/exit) of a scheduled job's recent runs. |
+| `scheduler.cancel` | Cancel a scheduled job (aborts any in-progress run). |
 
 ### `terminal`
 
