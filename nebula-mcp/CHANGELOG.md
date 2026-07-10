@@ -24,8 +24,8 @@ software-development environment to autonomous agents.
     lock-free per-tool metrics.
   - The `Tool` trait, a registry honouring category/tool enable switches, and a
     per-call `ToolContext` with unified timeout + cancellation.
-- **137 tools** (`nebula-mcp-tools`) across 16 categories:
-  - **filesystem** (13): read/write/append/rename/delete/move/copy, content
+- **138 tools** (`nebula-mcp-tools`) across 16 categories:
+  - **filesystem** (14): read/write/edit/append/rename/delete/move/copy, content
     search, glob, tree, hash, metadata, permissions, with large-file streaming
     and binary-safe base64 read/write.
   - **terminal** (6): one-shot run plus persistent interactive sessions.
@@ -70,6 +70,8 @@ software-development environment to autonomous agents.
   display-pipeline diagnosis).
 - **Runtime log control**: `logging/setLevel` adjusts verbosity live via a
   reloadable tracing filter.
+- **Prometheus metrics**: an optional `--metrics-addr` serves per-tool metrics
+  at `http://<addr>/metrics` in Prometheus text format.
 - **Server** (`nebula-mcp-server`): concurrent, cancellable dispatch with
   bounded parallelism, graceful shutdown, and a CLI (`run`, `list-tools`,
   `print-config`, `validate-config`).

@@ -26,6 +26,7 @@ pub fn tools() -> Vec<std::sync::Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFile),
         Arc::new(WriteFile),
+        Arc::new(EditFile),
         Arc::new(AppendFile),
         Arc::new(RenamePath),
         Arc::new(DeletePath),
@@ -198,6 +199,91 @@ impl Tool for WriteFile {
         Ok(json_value_result(json!({
             "path": path.display().to_string(),
             "bytesWritten": bytes.len(),
+        })))
+    }
+}
+
+/// Targeted search-and-replace edit of a text file.
+struct EditFile;
+
+#[async_trait]
+impl Tool for EditFile {
+    fn name(&self) -> &str {
+        "fs.edit"
+    }
+    fn category(&self) -> &str {
+        CATEGORY
+    }
+    fn description(&self) -> &str {
+        "Edit a text file by replacing an exact string. By default the old string must match \
+         exactly once (a safety check); set replaceAll to replace every occurrence."
+    }
+    fn input_schema(&self) -> Value {
+        ObjectSchema::new()
+            .string("path", "File path.", true)
+            .string("oldString", "Exact text to find (must be non-empty).", true)
+            .string("newString", "Replacement text.", true)
+            .boolean(
+                "replaceAll",
+                "Replace every occurrence instead of requiring exactly one.",
+                false,
+            )
+            .integer(
+                "expectedCount",
+                "If set, the number of matches must equal this.",
+                false,
+            )
+            .build()
+    }
+    async fn call(&self, ctx: &ToolContext, args: Value) -> Result<CallToolResult> {
+        let a = Args::new(&args)?;
+        let path = ctx.resolve_path(a.str("path")?)?;
+        let old = a.str("oldString")?;
+        let new = a.str("newString")?;
+        let replace_all = a.bool_or("replaceAll", false)?;
+        let expected = a.opt_u64("expectedCount")?;
+        if old.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "oldString must not be empty".into(),
+            ));
+        }
+        if old == new {
+            return Err(ToolError::InvalidArguments(
+                "oldString and newString are identical".into(),
+            ));
+        }
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| map_io("read", &path, e))?;
+        let count = content.matches(old).count();
+        if let Some(want) = expected {
+            if count as u64 != want {
+                return Err(ToolError::InvalidArguments(format!(
+                    "expected {want} matches of oldString but found {count}"
+                )));
+            }
+        }
+        if count == 0 {
+            return Err(ToolError::Execution("oldString not found in file".into()));
+        }
+        if count > 1 && !replace_all && expected.is_none() {
+            return Err(ToolError::InvalidArguments(format!(
+                "oldString matched {count} times; set replaceAll=true or expectedCount, \
+                 or provide a more specific oldString"
+            )));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, count)
+        };
+        tokio::fs::write(&path, updated.as_bytes())
+            .await
+            .map_err(|e| map_io("write", &path, e))?;
+        Ok(json_value_result(json!({
+            "path": path.display().to_string(),
+            "replacements": count,
         })))
     }
 }
@@ -1013,6 +1099,43 @@ mod tests {
             request_id: "r".into(),
             progress: None,
         }
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_exact_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(dir.path(), false);
+        WriteFile
+            .call(
+                &ctx,
+                json!({"path": "e.txt", "content": "let x = 1;\nlet y = 1;"}),
+            )
+            .await
+            .unwrap();
+        // Ambiguous single-match edit fails (matches twice).
+        let err = EditFile
+            .call(
+                &ctx,
+                json!({"path": "e.txt", "oldString": "= 1", "newString": "= 2"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+        // replaceAll succeeds.
+        EditFile
+            .call(
+                &ctx,
+                json!({"path": "e.txt", "oldString": "= 1", "newString": "= 2", "replaceAll": true}),
+            )
+            .await
+            .unwrap();
+        let res = ReadFile.call(&ctx, json!({"path": "e.txt"})).await.unwrap();
+        let text = match &res.content[0] {
+            Content::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(text.contains("= 2"));
+        assert!(!text.contains("= 1"));
     }
 
     #[tokio::test]

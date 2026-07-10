@@ -118,8 +118,11 @@ allow_destructive = true              # while global allow_destructive stays fal
 ## CLI
 
 ```
-nebula-mcp run              [--config P] [--workdir D]   # serve over stdio (default)
+nebula-mcp run              [--config P] [--workdir D] [--metrics-addr ADDR]
 nebula-mcp list-tools                                    # print every tool
 nebula-mcp print-config                                  # print a default config
 nebula-mcp validate-config  --config P                   # validate and summarise
 ```
+
+`--metrics-addr` (or `NEBULA_MCP_METRICS_ADDR`, e.g. `127.0.0.1:9184`) serves
+per-tool metrics in Prometheus text format at `http://ADDR/metrics`.

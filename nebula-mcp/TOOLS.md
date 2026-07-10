@@ -1,6 +1,6 @@
 # NebulaDisplay MCP — Tool Reference
 
-This server exposes **137 MCP tools** across 16 categories. Every tool is
+This server exposes **138 MCP tools** across 16 categories. Every tool is
 invoked via the standard MCP `tools/call` method and returns a `CallToolResult`
 whose text content is (for most tools) a JSON document; `display.duplicate_frame`
 and the browser tools can also return image content.
@@ -16,8 +16,9 @@ Legend:
 - Any command-wrapping tool streams `notifications/progress` when the client
   supplies a `progressToken` on the call.
 
-The server also implements MCP `resources/*`, `prompts/*` and `logging/setLevel`
-(see API.md). Input schemas for each tool are advertised via `tools/list`.
+The server also implements MCP `resources/*` (incl. subscribe), `prompts/*` and
+`logging/setLevel`, and an optional Prometheus `/metrics` endpoint (see API.md,
+CONFIGURATION.md). Input schemas for each tool are advertised via `tools/list`.
 
 
 ### `benchmark`
@@ -104,6 +105,7 @@ The server also implements MCP `resources/*`, `prompts/*` and `logging/setLevel`
 | --- | --- |
 | `fs.read` | Read a file. Supports byte offset and maxBytes for streaming large files in chunks, and encoding=base64 for binary files. |
 | `fs.write` | Create or overwrite a file, creating parent directories. Use encoding=base64 to write binary content. |
+| `fs.edit` | Edit a text file by replacing an exact string. By default the old string must match exactly once (a safety check); set replaceAll to replace every occurrence. |
 | `fs.append` | Append UTF-8 text to a file, creating it if absent. |
 | `fs.rename` | Rename or move a file/directory (both paths must be within allowed roots). |
 | `fs.delete` | Delete a file or directory. Directory deletion requires recursive=true. Destructive. |

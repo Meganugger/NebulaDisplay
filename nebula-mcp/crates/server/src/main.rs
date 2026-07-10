@@ -28,6 +28,11 @@ struct Cli {
     /// Workspace root directory that relative tool paths resolve against.
     #[arg(short, long, global = true, env = "NEBULA_MCP_WORKDIR")]
     workdir: Option<PathBuf>,
+
+    /// If set, serve Prometheus metrics at `http://<addr>/metrics` (e.g.
+    /// `127.0.0.1:9184`).
+    #[arg(long, global = true, env = "NEBULA_MCP_METRICS_ADDR")]
+    metrics_addr: Option<std::net::SocketAddr>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -217,6 +222,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             root_cancel.clone(),
         ));
         server.set_log_control(log_control);
+
+        // Optional Prometheus metrics endpoint.
+        if let Some(addr) = cli.metrics_addr {
+            match nebula_mcp_server::metrics_endpoint::serve(
+                addr,
+                server.metrics(),
+                root_cancel.clone(),
+            )
+            .await
+            {
+                Ok(bound) => tracing::info!(addr = %bound, "metrics endpoint enabled"),
+                Err(e) => tracing::warn!(error = %e, "failed to start metrics endpoint"),
+            }
+        }
 
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();

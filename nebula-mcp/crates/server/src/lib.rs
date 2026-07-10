@@ -5,6 +5,7 @@
 
 #![warn(missing_docs)]
 
+pub mod metrics_endpoint;
 pub mod prompts;
 pub mod resources;
 pub mod server;

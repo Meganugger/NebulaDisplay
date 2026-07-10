@@ -123,6 +123,80 @@ impl Metrics {
         out.sort_by(|a, b| a.tool.cmp(&b.tool));
         out
     }
+
+    /// Render the current metrics in Prometheus text exposition format.
+    #[must_use]
+    pub fn to_prometheus(&self) -> String {
+        let snap = self.snapshot();
+        let mut s = String::new();
+
+        // Metric families: (name, type, help, extractor).
+        type Extract = fn(&ToolMetricsSnapshot) -> u64;
+        let families: &[(&str, &str, &str, Extract)] = &[
+            (
+                "nebula_mcp_tool_calls_total",
+                "counter",
+                "Total tool invocations.",
+                |m| m.calls,
+            ),
+            (
+                "nebula_mcp_tool_successes_total",
+                "counter",
+                "Tool invocations that succeeded.",
+                |m| m.successes,
+            ),
+            (
+                "nebula_mcp_tool_failures_total",
+                "counter",
+                "Tool invocations that failed.",
+                |m| m.failures,
+            ),
+            (
+                "nebula_mcp_tool_cancellations_total",
+                "counter",
+                "Tool invocations that were cancelled or timed out.",
+                |m| m.cancellations,
+            ),
+            (
+                "nebula_mcp_tool_output_bytes_total",
+                "counter",
+                "Total captured output bytes.",
+                |m| m.output_bytes,
+            ),
+            (
+                "nebula_mcp_tool_duration_microseconds_mean",
+                "gauge",
+                "Mean tool call duration in microseconds.",
+                |m| m.mean_duration_us,
+            ),
+            (
+                "nebula_mcp_tool_duration_microseconds_max",
+                "gauge",
+                "Maximum observed tool call duration in microseconds.",
+                |m| m.max_duration_us,
+            ),
+        ];
+
+        for (name, kind, help, extract) in families {
+            s.push_str(&format!("# HELP {name} {help}\n"));
+            s.push_str(&format!("# TYPE {name} {kind}\n"));
+            for m in &snap {
+                s.push_str(&format!(
+                    "{name}{{tool=\"{}\"}} {}\n",
+                    escape_label(&m.tool),
+                    extract(m)
+                ));
+            }
+        }
+        s
+    }
+}
+
+/// Escape a Prometheus label value (`\`, `"`, newline).
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Outcome classification for a completed call.
@@ -155,5 +229,15 @@ mod tests {
         assert_eq!(s.mean_duration_us, 200);
         assert_eq!(s.max_duration_us, 300);
         assert_eq!(s.output_bytes, 10);
+    }
+
+    #[test]
+    fn prometheus_output_is_well_formed() {
+        let m = Metrics::new();
+        m.record("fs.read", Outcome::Success, Duration::from_micros(50), 5);
+        let text = m.to_prometheus();
+        assert!(text.contains("# TYPE nebula_mcp_tool_calls_total counter"));
+        assert!(text.contains("nebula_mcp_tool_calls_total{tool=\"fs.read\"} 1"));
+        assert!(text.contains("nebula_mcp_tool_duration_microseconds_max{tool=\"fs.read\"}"));
     }
 }

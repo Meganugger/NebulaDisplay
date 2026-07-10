@@ -35,7 +35,9 @@ work around.
 - **Fuzzing** the JSON-RPC frame decoder and argument parsers.
 - **Stress/soak** CI job driving thousands of concurrent calls.
 - **Signed release binaries** and an MSI/winget package.
-- **Metrics export** endpoint (Prometheus) in addition to OTLP traces.
+- **OTLP + Prometheus** — OTLP trace export (the `otel` feature) and a Prometheus
+  `/metrics` endpoint (`--metrics-addr`) are implemented; a richer histogram
+  export is the next step.
 
 ## External limitations (not solvable in software)
 
