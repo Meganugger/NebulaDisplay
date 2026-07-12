@@ -24,6 +24,40 @@ QueryDisplayConfig extend-mode input mapping, multi-monitor & multi-GPU &
 HDR-capable IddCx driver with CI syntax gate, reproducible benchmark
 harness (`viewer/web/tests/bench.mjs`).
 
+Shipped since (v0.5 security & features wave — no longer roadmap items):
+
+* **PAKE pairing (was P1.4)** — NDSP-PAKE v1, a CPace-style balanced PAKE on
+  P-256 (RFC 9380 hash-to-curve): removes the offline-PIN-grinding caveat.
+  Implemented in the Rust host + protocol crate, client SDK, desktop viewer
+  and web viewer (both crypto backends), negotiated via `hello_ack.pake`
+  with transparent legacy fallback (`allow_legacy_pairing = false` refuses
+  it). Cross-stack byte compatibility pinned by RFC 9380 vectors on both
+  stacks + full-handshake CI tests.
+* **Optional HTTPS/WSS (was P1.7)** — `tls = true` / `--tls`: per-install
+  self-signed cert, fingerprint printed at startup + shown in the panel,
+  pinned-fingerprint verification in the client SDK (`Transport::TlsPinned`)
+  and desktop viewer (`--tls-pin`); protects web-viewer *code* integrity on
+  hostile LANs. E2E-tested (pin match streams, pin mismatch refused).
+* **OS keystore at rest (was P1.6, Windows part)** — host trust store and
+  desktop-viewer credentials are DPAPI-protected on Windows with transparent
+  migration from plaintext stores; 0600 files elsewhere (macOS
+  Keychain/secret-service still open, below).
+* **Clipboard sync (was P2.9)** — text clipboard both directions with
+  explicit per-device permission (panel toggle, deny by default,
+  live-revocable `clipboard_grant`), 256 KiB per-event cap (refuse, never
+  truncate), change-only forwarding (nothing pushed on connect), echo
+  suppression, Win32 clipboard backend on Windows + in-memory backend that
+  the Linux CI drives end-to-end. Web viewer UI ships send/receive buttons
+  with insecure-context fallbacks.
+* **Layout-aware keyboard mapping (was P2.13)** — viewers send both
+  `KeyboardEvent.code` and the layout-resolved `key`; the host prefers the
+  character via `VkKeyScanW` against its own layout (Unicode injection for
+  AltGr-only chars), so typing and shortcuts survive layout mismatches.
+* **Encoder ROI hints (was P0.3)** — dirty-rect bounding rectangles feed
+  `MFSampleExtension_ROIRectangle` per-sample hints (negative QP delta) into
+  Media Foundation hardware encoders that report
+  `CODECAPI_AVEncVideoROIEnabled`.
+
 ## P0 — performance & the driver
 
 1. **Driver bring-up** (needs a WDK machine): compile
@@ -33,57 +67,51 @@ harness (`viewer/web/tests/bench.mjs`).
 2. **Hardware encoders — H.264 SHIPPED** (`encode/mf_h264.rs`): MFTEnumEx
    hardware enumeration (NVENC/QuickSync/AMF), async-MFT event loop at queue
    depth ≤1, MF_LOW_LATENCY + CBR + zero B-frames, runtime ICodecAPI bitrate,
-   NV12 dirty-row conversion, static-frame elision, automatic software
-   fallback. Compile-verified by the Windows CI job; **runtime validation
-   needs a real Windows GPU machine** (this sandbox has none — see
-   docs/TESTING.md release gate). Remaining: HEVC output type (trivial
-   variant of the same MFT plumbing) once decoder support is negotiated.
-3. **Encoder ROI from DXGI dirty/move rects**: the pixel-exact row-pair diff
-   already elides static frames and limits color conversion; the remaining
-   step is feeding rectangle hints into encoder rate control (needs the
-   MF/NVENC encoders — OpenH264's ROI support is too limited to matter).
+   NV12 dirty-row conversion, static-frame elision, ROI dirty-rect hints,
+   automatic software fallback. Compile-verified by the Windows CI job;
+   **runtime validation needs a real Windows GPU machine** (this sandbox has
+   none — see docs/TESTING.md release gate). Remaining: HEVC output type
+   (trivial variant of the same MFT plumbing) once decoder support is
+   negotiated.
 
 ## P1 — security & transports
 
-4. **PAKE pairing** (CPace or SPAKE2) replacing PIN-bound HKDF: removes the
-   offline-grinding caveat in SECURITY.md; wire format has room (new
-   `auth.method`).
-5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
+3. **QUIC transport** (quinn) with the same envelopes; datagram mode for
    video, streams for control; WebTransport for the web viewer where
    available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
    LAN (sub-ms RTT, ~zero loss) TCP_NODELAY + latest-only send slots already
    avoid the queueing QUIC would remove, so it does not materially cut
    latency there; the win is head-of-line-blocking removal on lossy Wi-Fi.
-   Kept at P1: real, but smaller than hardware encoders (P0.2). Browser
-   WebTransport additionally requires TLS certs (serverCertificateHashes =
-   Chromium-only today), so the web path stays WS regardless.*
-6. OS keystore for trust tokens (DPAPI / Keychain / Keystore).
-7. Optional HTTPS with self-signed cert + fingerprint pinning for the web
-   viewer's *code* integrity on hostile LANs.
+   Kept at P1: real, but smaller than driver bring-up. Browser WebTransport
+   additionally requires TLS certs (serverCertificateHashes = Chromium-only
+   today), so the web path stays WS regardless.*
+4. PAKE pairing for the **Android/iOS viewers** (the host, SDK, desktop and
+   web viewers already ship it); once they do, flip the default of
+   `allow_legacy_pairing` to `false` after a deprecation window.
+5. macOS Keychain / Linux secret-service backends for at-rest credential
+   protection (DPAPI on Windows is done).
 
 ## P2 — features
 
-8. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
+6. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
    mute/volume; off by default with a visible indicator.
-9. **Clipboard sync** with explicit per-device permission + per-event size
-   caps (protocol slot: control messages).
-10. **File drop** with explicit accept dialog per transfer.
-11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
-    already parameterized by `MaxMonitorsSupported`), per-client monitor
-    assignment, video-wall spanning mode.
-12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
-    clean-room scope; use Windows.Gaming.Input injection when available).
-13. Layout-aware keyboard mapping (send both `code` and `key`, host picks).
-14. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
+7. Clipboard: image/file formats behind the same grant (text shipped);
+   **file drop** with explicit accept dialog per transfer.
+8. **Multi-monitor / multi-client layout**: several virtual monitors (driver
+   already parameterized by `MaxMonitorsSupported`), per-client monitor
+   assignment, video-wall spanning mode.
+9. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
+   clean-room scope; use Windows.Gaming.Input injection when available).
+10. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
     (current fallback maps pen to mouse).
 
 ## P3 — platform breadth
 
-15. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
+11. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
     packaging docs.
-16. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
+12. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
     protocol and viewers are already host-OS-agnostic.
-17. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees
+13. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees
     ciphertext only), separate binary + explicit user action; never on by
     default.
 

@@ -1,7 +1,7 @@
 //! `nebulad` — the NebulaDisplay host service binary.
 
 use clap::Parser;
-use nebulad::{capture, config, discovery, panel, server, state, util};
+use nebulad::{capture, clipboard, config, discovery, panel, server, state, util};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +34,11 @@ pub struct Args {
     /// Force the synthetic test-pattern source even on Windows.
     #[arg(long)]
     pub test_pattern: bool,
+    /// Serve the viewer endpoint over HTTPS/WSS (self-signed certificate;
+    /// the pinnable fingerprint is printed at startup). Equivalent to
+    /// `tls = true` in config.toml.
+    #[arg(long)]
+    pub tls: bool,
     /// Capture size for the test pattern source, e.g. 1280x720.
     #[arg(long, default_value = "1280x720")]
     pub capture_size: String,
@@ -52,6 +57,7 @@ impl From<&Args> for config::LoadArgs {
             name: a.name.clone(),
             data_dir: a.data_dir.clone(),
             web_dir: a.web_dir.clone(),
+            tls: a.tls,
         }
     }
 }
@@ -81,6 +87,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (w, h) = util::parse_size(&args.capture_size)?;
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
+
+    // Host-clipboard → viewers bridge (per-device grants gate delivery).
+    tokio::spawn(clipboard::run_clipboard_loop(state.clone()));
 
     // UDP discovery responder.
     if args.discovery_port != 0 {
@@ -118,13 +127,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     let pin = state.pins.current_pin();
     let ips = util::local_ips();
+    let scheme = if state.cfg.file.tls { "https" } else { "http" };
     println!("\n  NebulaDisplay host ready");
     println!("  ── Viewer URLs ─────────────────────────────");
     for ip in &ips {
-        println!("     http://{ip}:{port}/");
+        println!("     {scheme}://{ip}:{port}/");
     }
     if ips.is_empty() {
-        println!("     http://<this-machine-ip>:{port}/");
+        println!("     {scheme}://<this-machine-ip>:{port}/");
+    }
+    if state.cfg.file.tls {
+        if let Ok(identity) = nebulad::tls::load_or_create(&state.cfg.data_dir) {
+            println!("  ── TLS certificate fingerprint (pin this) ──");
+            println!("     sha256:{}", identity.fingerprint_hex);
+        }
     }
     println!("  ── Pairing PIN (single-use) ────────────────");
     println!("     {pin}");

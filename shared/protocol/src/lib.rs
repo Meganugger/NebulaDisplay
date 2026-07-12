@@ -24,6 +24,12 @@ pub mod discovery;
 pub mod envelope;
 pub mod media;
 pub mod messages;
+pub mod pake;
+
+/// Maximum clipboard payload (UTF-8 bytes) either side accepts per event.
+/// Larger events are dropped with a logged warning — never truncated
+/// (silently corrupting clipboard data would be worse than refusing it).
+pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
 /// Current protocol version. Bump on breaking changes; peers negotiate
 /// `min(client, server)` and refuse to talk below [`MIN_PROTOCOL_VERSION`].

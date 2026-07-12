@@ -17,11 +17,14 @@
 //! session_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-session-v1"||nonce)
 //! ```
 //!
-//! The PIN never crosses the wire. A passive attacker recording the exchange
-//! can offline-brute-force the (short) PIN, which is why PINs are single-use,
-//! short-lived, and rate-limited; a PAKE (SPAKE2/OPAQUE) upgrade is planned —
-//! see `docs/SECURITY.md`. An *active* MITM without the PIN cannot complete
-//! `PairConfirm` and is rejected before any screen data flows.
+//! The PIN never crosses the wire. In this **legacy** pairing derivation a
+//! passive attacker recording the exchange can offline-brute-force the
+//! (short) PIN, which is why PINs are single-use, short-lived, and
+//! rate-limited — and why current clients pair via [`crate::pake`]
+//! (NDSP-PAKE v1), whose transcripts are not offline-grindable. The legacy
+//! path remains for not-yet-updated mobile viewers (hosts may refuse it).
+//! An *active* MITM without the PIN cannot complete `PairConfirm` on either
+//! path and is rejected before any screen data flows.
 //!
 //! ## Returning devices
 //!
@@ -100,6 +103,11 @@ impl SharedSecret {
     pub fn session_key(&self, salt: &[u8], connection_nonce: &[u8]) -> [u8; 32] {
         derive(&self.0, salt, &[SESSION_INFO, connection_nonce])
     }
+}
+
+/// HKDF-SHA256 → 32-byte key (shared by the legacy and PAKE derivations).
+pub(crate) fn derive_key(ikm: &[u8], salt: &[u8], info_parts: &[&[u8]]) -> [u8; 32] {
+    derive(ikm, salt, info_parts)
 }
 
 fn derive(ikm: &[u8], salt: &[u8], info_parts: &[&[u8]]) -> [u8; 32] {

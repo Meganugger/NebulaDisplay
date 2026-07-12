@@ -21,6 +21,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -31,6 +32,8 @@ interface Status {
   port: number;
   pin: string;
   viewer_urls: string[];
+  tls: boolean;
+  tls_fingerprint: string | null;
   mode: { width: number; height: number; refresh_hz: number };
   host_stats: HostStats;
   clients: ClientView[];
@@ -77,6 +80,12 @@ async function refresh(): Promise<void> {
     line("Version", esc(st.version)),
     line("Mode", `${st.mode.width}×${st.mode.height}`),
     line("Identity", `<span class="mono">${esc(st.fingerprint.slice(0, 16))}…</span>`),
+    st.tls
+      ? line(
+          "TLS pin",
+          `<span class="mono" title="sha256:${esc(st.tls_fingerprint ?? "")}">${esc((st.tls_fingerprint ?? "").slice(0, 16))}…</span>`,
+        )
+      : "",
   ].join("");
   $("urls").innerHTML =
     st.viewer_urls.map((u) => `<a href="${esc(u)}" target="_blank">${esc(u)}</a>`).join("<br>") ||
@@ -117,7 +126,10 @@ async function refresh(): Promise<void> {
         <td>${esc(d.platform)}</td>
         <td>${ago(d.last_seen_unix)}</td>
         <td>
-          <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
+          <label class="switch" title="Allow input injection"><input type="checkbox" data-grant="${esc(d.device_id)}" data-capability="input" ${d.input_allowed ? "checked" : ""}><span></span></label>
+        </td>
+        <td>
+          <label class="switch" title="Allow clipboard sync"><input type="checkbox" data-grant="${esc(d.device_id)}" data-capability="clipboard" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
         </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
@@ -130,7 +142,11 @@ async function refresh(): Promise<void> {
       void api("/api/grant", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+        body: JSON.stringify({
+          device_id: el.dataset["grant"],
+          allowed: el.checked,
+          capability: el.dataset["capability"] ?? "input",
+        }),
       }).catch(console.error);
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {

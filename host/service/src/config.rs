@@ -12,6 +12,8 @@ pub struct LoadArgs {
     pub name: Option<String>,
     pub data_dir: Option<std::path::PathBuf>,
     pub web_dir: Option<std::path::PathBuf>,
+    /// `--tls` CLI flag: forces TLS on regardless of config.toml.
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,16 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Accept the legacy (pre-PAKE) PIN-HKDF pairing handshake. On by
+    /// default so the mobile viewers keep pairing; set to `false` to require
+    /// the offline-grinding-resistant PAKE path from every client.
+    pub allow_legacy_pairing: bool,
+    /// Serve the viewer endpoint over HTTPS/WSS with a self-signed,
+    /// per-install certificate (fingerprint printed at startup and shown in
+    /// the panel for pinning). Off by default: on a plain LAN the NDSP layer
+    /// already encrypts everything; TLS additionally protects the *web
+    /// viewer code* against on-path tampering on hostile networks.
+    pub tls: bool,
 }
 
 impl Default for FileConfig {
@@ -40,6 +52,8 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            allow_legacy_pairing: true,
+            tls: false,
         }
     }
 }
@@ -62,7 +76,7 @@ impl Config {
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
         let cfg_path = data_dir.join("config.toml");
-        let file: FileConfig = if cfg_path.exists() {
+        let mut file: FileConfig = if cfg_path.exists() {
             let raw = std::fs::read_to_string(&cfg_path)?;
             toml::from_str(&raw).with_context(|| format!("parsing {}", cfg_path.display()))?
         } else {
@@ -71,6 +85,9 @@ impl Config {
             std::fs::write(&cfg_path, toml::to_string_pretty(&d)?)?;
             d
         };
+        if args.tls {
+            file.tls = true;
+        }
 
         let name = args
             .name

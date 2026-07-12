@@ -9,12 +9,12 @@
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MAPVK_VSC_TO_VK,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -256,6 +256,102 @@ fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
     })
 }
 
+/// A single `KEYEVENTF_UNICODE` (VK_PACKET) event for one UTF-16 code unit.
+fn unicode_key_input(unit: u16, pressed: bool) -> INPUT {
+    let mut flags = KEYEVENTF_UNICODE;
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Layout-aware key injection (docs/ROADMAP.md item 13).
+///
+/// The viewer sends both the physical key (`code`, position-based) and,
+/// when it is a single printable character, the layout-resolved `key`. The
+/// host resolves `key` against **its own** active layout with `VkKeyScanW`:
+///
+/// * resolvable with no modifiers, or with Shift only (Shift travels as its
+///   own key events and is genuinely held when the char required it on the
+///   client) → inject that virtual key. This makes typing *and shortcuts*
+///   (Ctrl+C is Ctrl+<key producing "c">, not Ctrl+<physical position>)
+///   follow the characters the user actually typed, even when client and
+///   host keyboard layouts differ (e.g. QWERTY phone → AZERTY host).
+/// * needs AltGr/Ctrl on the host layout, or has no key at all → inject the
+///   exact character as `KEYEVENTF_UNICODE` (VK_PACKET), which types
+///   correctly regardless of layout.
+/// * no `key` hint (non-printable keys, older viewers) → the physical
+///   scancode path, unchanged.
+fn layout_aware_key_input(code: &str, key: Option<&str>, pressed: bool) -> Option<INPUT> {
+    let Some(k) = key else {
+        return key_input(code, pressed);
+    };
+    let mut chars = k.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return key_input(code, pressed); // multi-char "key" → physical path
+    };
+    if ch.is_control() {
+        return key_input(code, pressed);
+    }
+    // Case comes from Shift (its own events) — resolve the base character.
+    let base = ch.to_lowercase().next().unwrap_or(ch);
+    let mut unit = [0u16; 2];
+    let units = base.encode_utf16(&mut unit);
+    if units.len() != 1 {
+        // Outside the BMP — real keyboards don't produce these as single
+        // keystrokes (IME text arrives via the Text event); physical path.
+        return key_input(code, pressed);
+    }
+    // SAFETY: plain user32 call, no preconditions.
+    let scan_result = unsafe { VkKeyScanW(units[0]) };
+    if scan_result == -1 {
+        // Host layout can't produce it via any key → type the char itself.
+        return Some(unicode_key_input(units[0], pressed));
+    }
+    let vk = (scan_result & 0xFF) as u16;
+    let mods = ((scan_result >> 8) & 0xFF) as u8;
+    if mods & !0x01 != 0 {
+        // Requires Ctrl/Alt (AltGr) on the host layout: injecting the VK
+        // without those modifiers would type the wrong char, and forging
+        // modifier state would corrupt real held modifiers → VK_PACKET.
+        // Use the *typed* char (with its case), since Shift semantics don't
+        // transfer to AltGr combinations.
+        let mut typed = [0u16; 2];
+        let t = ch.encode_utf16(&mut typed);
+        return Some(unicode_key_input(t[0], pressed));
+    }
+    // Plain (or Shift-only) key on the host layout: inject VK + its scancode.
+    let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    // SAFETY: plain user32 call.
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+    Some(INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    })
+}
+
 impl InputSink for WindowsInputSink {
     fn apply(&self, events: &[InputEvent]) {
         let mut batch: Vec<INPUT> = Vec::with_capacity(events.len() + 2);
@@ -292,8 +388,8 @@ impl InputSink for WindowsInputSink {
                         batch.push(mouse_input(0, 0, (dx * 120.0) as i32, MOUSEEVENTF_HWHEEL));
                     }
                 }
-                InputEvent::Key { code, pressed } => {
-                    if let Some(i) = key_input(code, *pressed) {
+                InputEvent::Key { code, pressed, key } => {
+                    if let Some(i) = layout_aware_key_input(code, key.as_deref(), *pressed) {
                         batch.push(i);
                     } else {
                         tracing::debug!(code, "unmapped key code ignored");

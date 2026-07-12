@@ -26,6 +26,7 @@ async fn start_host(tag: &str) -> EmbeddedHost {
         name: format!("e2e-host-{tag}"),
         capture: (320, 240),
         max_fps: 30,
+        ..Default::default()
     })
     .await
     .expect("host starts")
@@ -50,7 +51,15 @@ async fn pairing_streams_video_and_ping_pong_works() {
         session.new_credentials.is_some(),
         "pairing must issue credentials"
     );
+    assert!(
+        session.used_pake,
+        "pairing against a current host must use the PAKE path"
+    );
     assert!(!session.input_allowed, "input must be denied by default");
+    assert!(
+        !session.clipboard_allowed,
+        "clipboard must be denied by default"
+    );
     assert_eq!(session.mode.width, 320);
 
     // Clock sync ping.
@@ -401,6 +410,294 @@ async fn video_keeps_flowing_under_input_flood() {
         "video starved under input flood: only {frames} frames in 3s (expect ~90)"
     );
 
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Legacy PIN-HKDF pairing (what pre-PAKE mobile viewers send) must keep
+/// working against a default host, and the tokens it issues must reconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_still_supported() {
+    let host = start_host("legacy").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Old phone");
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::PinLegacy(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("legacy pairing ok");
+    assert!(!session.used_pake, "PinLegacy must not take the PAKE path");
+    let creds = session.new_credentials.clone().expect("credentials issued");
+    session.close().await;
+
+    // Legacy-issued tokens reconnect exactly like PAKE-issued ones.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info,
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("token reconnect after legacy pairing");
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// With `allow_legacy_pairing = false` the host must refuse the legacy
+/// handshake with an actionable error while PAKE pairing keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_can_be_disabled() {
+    let dir = std::env::temp_dir().join(format!("ndsp-e2e-nolegacy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let host = EmbeddedHost::start(EmbeddedOptions {
+        data_dir: dir,
+        name: "e2e-host-nolegacy".into(),
+        allow_legacy_pairing: false,
+        ..Default::default()
+    })
+    .await
+    .expect("host starts");
+    let pin = host.state.pins.current_pin();
+
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Old phone"),
+            Auth::PinLegacy(&pin),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "legacy pairing against PAKE-only host",
+    );
+    assert!(
+        format!("{err:#}").contains("PAKE"),
+        "error should point at the PAKE requirement: {err:#}"
+    );
+
+    // The PIN is still valid for a PAKE pairing right after.
+    let pin = host.state.pins.current_pin();
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("New phone"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("PAKE pairing ok on PAKE-only host");
+    assert!(session.used_pake);
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Clipboard sync end-to-end: deny by default, grant via panel API, both
+/// directions flow, size cap enforced, echo suppressed.
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_grant_flow() {
+    let host = start_host("clip").await;
+    let pin = host.state.pins.current_pin();
+    let mut info = client_info("Clipboard tablet");
+    info.features = vec!["clipboard".into()];
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    assert!(!session.clipboard_allowed, "deny by default");
+
+    // Without a grant, a client clipboard event must NOT reach the host.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "stolen?".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        host.state.clipboard.get_text(),
+        None,
+        "ungranted clipboard write must be dropped"
+    );
+
+    // Grant clipboard (panel action) → client is notified live.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut granted = false;
+    while !granted {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed }) => granted = allowed,
+            Incoming::Closed => panic!("closed while waiting for clipboard grant"),
+            _ => {}
+        }
+    }
+
+    // Client → host.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "from viewer 📋".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if host.state.clipboard.get_text().as_deref() == Some("from viewer 📋") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "client clipboard never reached the host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The client's own write must not be echoed back at it.
+    let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match tokio::time::timeout_at(echo_deadline, session.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::Clipboard { text }))) => {
+                panic!("clipboard echoed back to its originator: {text:?}")
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Host → client.
+    host.state.clipboard.set_text("from host").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("host clipboard never reached the client")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { text }) => {
+                assert_eq!(text, "from host");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for clipboard"),
+            _ => {}
+        }
+    }
+
+    // Oversized events are refused with an error message, not applied.
+    let huge = "x".repeat(ndsp_protocol::MAX_CLIPBOARD_BYTES + 1);
+    session
+        .send(&ControlMsg::Clipboard { text: huge })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("size-cap error never arrived")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Error { code, .. }) => {
+                assert_eq!(code, "clipboard_too_large");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for size-cap error"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.state.clipboard.get_text().as_deref(),
+        Some("from host"),
+        "oversized clipboard must not be applied"
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// HTTPS/WSS endpoint: pinned-fingerprint TLS connects and streams; a wrong
+/// pin is rejected during the TLS handshake (before any NDSP bytes flow).
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_endpoint_with_fingerprint_pinning() {
+    use ndsp_client::{connect_via, Transport};
+
+    let dir = std::env::temp_dir().join(format!("ndsp-e2e-tls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let host = EmbeddedHost::start(EmbeddedOptions {
+        data_dir: dir.clone(),
+        name: "e2e-host-tls".into(),
+        tls: true,
+        ..Default::default()
+    })
+    .await
+    .expect("tls host starts");
+    let pin = host.state.pins.current_pin();
+    let fingerprint = nebulad::tls::load_or_create(&dir)
+        .expect("identity exists")
+        .fingerprint_hex;
+
+    // Wrong pin → TLS handshake fails, nothing NDSP-level happens.
+    let err = must_fail(
+        connect_via(
+            "127.0.0.1",
+            host.port,
+            client_info("MITM check"),
+            Auth::Pin(&pin),
+            vec![Codec::Jpeg],
+            Transport::TlsPinned {
+                cert_sha256_hex: "00".repeat(32),
+            },
+        )
+        .await,
+        "wrong TLS pin",
+    );
+    assert!(
+        format!("{err:#}").to_lowercase().contains("tls"),
+        "error should mention TLS: {err:#}"
+    );
+
+    // Correct pin → full pairing + frames over WSS.
+    let mut session = connect_via(
+        "127.0.0.1",
+        host.port,
+        client_info("TLS viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+        Transport::TlsPinned {
+            cert_sha256_hex: fingerprint,
+        },
+    )
+    .await
+    .expect("pinned TLS connect + pairing");
+    assert!(session.used_pake);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut frames = 0;
+    while frames < 3 {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("frames over TLS timeout")
+            .unwrap()
+        {
+            Incoming::Video(_) => frames += 1,
+            Incoming::Closed => panic!("closed during TLS streaming"),
+            _ => {}
+        }
+    }
     session.close().await;
     host.shutdown().await;
 }

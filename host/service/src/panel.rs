@@ -50,6 +50,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -73,6 +74,11 @@ struct StatusView {
     port: u16,
     pin: String,
     viewer_urls: Vec<String>,
+    /// True when the viewer endpoint serves HTTPS/WSS.
+    tls: bool,
+    /// SHA-256 fingerprint of the TLS certificate (pin this in native
+    /// viewers); `None` when TLS is off.
+    tls_fingerprint: Option<String>,
     mode: ndsp_protocol::messages::DisplayMode,
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
@@ -113,9 +119,19 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
+    let tls = state.cfg.file.tls;
+    let tls_fingerprint = if tls {
+        crate::tls::load_or_create(&state.cfg.data_dir)
+            .ok()
+            .map(|i| i.fingerprint_hex)
+    } else {
+        None
+    };
+    let scheme = if tls { "https" } else { "http" };
     Json(StatusView {
         name: state.cfg.name.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -124,8 +140,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
         pin: state.pins.current_pin(),
         viewer_urls: local_ips()
             .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
+            .map(|ip| format!("{scheme}://{ip}:{port}/"))
             .collect(),
+        tls,
+        tls_fingerprint,
         mode: *state.mode.lock().unwrap(),
         host_stats: state.host_stats.lock().unwrap().clone(),
         clients,
@@ -138,14 +156,30 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     Json(serde_json::json!({ "pin": pin }))
 }
 
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GrantCapability {
+    #[default]
+    Input,
+    Clipboard,
+}
+
 #[derive(Deserialize)]
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// Which capability to toggle; defaults to `input` (pre-clipboard panel
+    /// builds keep working).
+    #[serde(default)]
+    capability: GrantCapability,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.capability {
+        GrantCapability::Input => state.set_input_grant(&req.device_id, req.allowed),
+        GrantCapability::Clipboard => state.set_clipboard_grant(&req.device_id, req.allowed),
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
@@ -177,8 +211,9 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
+    let scheme = if state.cfg.file.tls { "https" } else { "http" };
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{scheme}://{ip}:{port}/?pin={pin}&fp={}",
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

@@ -54,7 +54,19 @@ pub async fn serve_on(
         }
     }
 
+    let tls_enabled = state.cfg.file.tls;
+    let data_dir = state.cfg.data_dir.clone();
     let app = app.with_state((state, input_sink));
+
+    if tls_enabled {
+        let identity = crate::tls::load_or_create(&data_dir)?;
+        info!(
+            fingerprint = %identity.fingerprint_hex,
+            "viewer endpoint listening on {local} (HTTPS/WSS, self-signed — pin this fingerprint)"
+        );
+        return serve_tls(app, listener, identity).await;
+    }
+
     info!("viewer endpoint listening on {local}");
     // TCP_NODELAY: Nagle would coalesce small control/video writes with up
     // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
@@ -70,6 +82,52 @@ pub async fn serve_on(
     )
     .await?;
     Ok(())
+}
+
+/// TLS accept loop: rustls handshake per connection, then hand the stream to
+/// hyper with WebSocket upgrade support. Mirrors what `axum::serve` does for
+/// plain TCP (including TCP_NODELAY and per-connection tasks).
+async fn serve_tls(
+    app: Router<()>,
+    listener: tokio::net::TcpListener,
+    identity: crate::tls::TlsIdentity,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tower::Service;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(identity.config.clone());
+    let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    loop {
+        let (tcp, remote_addr) = listener.accept().await?;
+        if let Err(e) = tcp.set_nodelay(true) {
+            debug!("set_nodelay failed: {e}");
+        }
+        let tower_service = match make_service.call(remote_addr).await {
+            Ok(svc) => svc,
+            Err(infallible) => match infallible {},
+        };
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(%remote_addr, "TLS handshake failed: {e}");
+                    return;
+                }
+            };
+            let hyper_service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    tower_service.clone().call(request)
+                },
+            );
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(tls_stream), hyper_service)
+                .await
+            {
+                debug!(%remote_addr, "connection error: {e}");
+            }
+        });
+    }
 }
 
 async fn no_viewer_page() -> impl IntoResponse {

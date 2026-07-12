@@ -38,6 +38,11 @@ let pingTimer: number | undefined;
 const clock = new ClockSync();
 let hostStats: HostStats | null = null;
 let inputAllowed = false;
+let clipboardAllowed = false;
+/** Most recent clipboard text received from the host (manual-copy fallback). */
+let hostClipboard: string | null = null;
+/** Cap must match the host (ndsp_protocol::MAX_CLIPBOARD_BYTES). */
+const MAX_CLIPBOARD_BYTES = 256 * 1024;
 /** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
 let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
@@ -134,6 +139,8 @@ async function openSession(host: string, pin: string | null): Promise<void> {
       showToast(`Video error: ${e.message}`, 8000);
     };
     inputAllowed = s.info.inputAllowed;
+    clipboardAllowed = s.info.clipboardAllowed;
+    hostClipboard = null;
     userDisconnected = false; // fresh session — clear any stale flag
     enterViewer(s);
   } catch (e) {
@@ -192,6 +199,32 @@ function onControl(msg: ControlMsg): void {
       inputAllowed = Boolean(msg.allowed);
       refreshInputBadge();
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
+      break;
+    }
+    case "clipboard_grant": {
+      clipboardAllowed = Boolean(msg.allowed);
+      refreshClipboardButtons();
+      showToast(
+        clipboardAllowed ? "Host granted clipboard sync" : "Host revoked clipboard sync",
+      );
+      break;
+    }
+    case "clipboard": {
+      hostClipboard = String(msg.text ?? "");
+      // Best-effort auto-write; browsers may require a user gesture or
+      // permission — the paste button is the reliable path then.
+      const auto = navigator.clipboard?.writeText?.(hostClipboard);
+      if (auto) {
+        auto
+          .then(() => showToast("Host clipboard copied to this device 📋"))
+          .catch(() => {
+            showToast("Host clipboard received — press ⧉ to copy it here");
+            refreshClipboardButtons();
+          });
+      } else {
+        showToast("Host clipboard received — press ⧉ to copy it here");
+        refreshClipboardButtons();
+      }
       break;
     }
     case "cursor_shape": {
@@ -257,6 +290,60 @@ function refreshInputBadge(): void {
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
 }
 
+/** Show/hide the clipboard buttons with the live grant state. */
+function refreshClipboardButtons(): void {
+  $("clip-send-btn").style.display = clipboardAllowed ? "" : "none";
+  $("clip-recv-btn").style.display = clipboardAllowed && hostClipboard !== null ? "" : "none";
+}
+
+/** Read this device's clipboard and send it to the host. */
+async function sendClipboardToHost(): Promise<void> {
+  if (!session || !clipboardAllowed) return;
+  let text: string | null = null;
+  try {
+    if (navigator.clipboard?.readText) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch {
+    /* permission denied / insecure context — fall through to prompt */
+  }
+  if (text === null) {
+    text = window.prompt("Paste the text to send to the host:") ?? null;
+  }
+  if (!text) return;
+  if (new TextEncoder().encode(text).length > MAX_CLIPBOARD_BYTES) {
+    showToast("Clipboard too large to sync (256 KB max)", 6000);
+    return;
+  }
+  await session.send({ type: "clipboard", text });
+  showToast("Clipboard sent to host ⇪");
+}
+
+/** Copy the last received host clipboard locally (user-gesture path). */
+async function copyHostClipboardLocally(): Promise<void> {
+  if (hostClipboard === null) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(hostClipboard);
+      showToast("Copied host clipboard 📋");
+      return;
+    }
+  } catch {
+    /* fall through to execCommand */
+  }
+  // Insecure-context fallback: selection + execCommand inside the gesture.
+  const ta = document.createElement("textarea");
+  ta.value = hostClipboard;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  showToast(ok ? "Copied host clipboard 📋" : "Copy failed — clipboard API unavailable", 6000);
+}
+
 function enterViewer(s: Session): void {
   connectScreen.style.display = "none";
   viewerScreen.classList.add("active");
@@ -272,6 +359,7 @@ function enterViewer(s: Session): void {
   );
   input.attach();
   refreshInputBadge();
+  refreshClipboardButtons();
 
   // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
   // measurable cost.
@@ -330,6 +418,8 @@ function endSession(reason: string): void {
   session = null;
   hostStats = null;
   cursorPos = null;
+  clipboardAllowed = false;
+  hostClipboard = null;
   remoteCursor.style.display = "none";
   remoteCursor.removeAttribute("src");
   viewerScreen.classList.remove("active");
@@ -344,6 +434,8 @@ function round1(n: number): number {
 
 // --- toolbar wiring -------------------------------------------------------
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
+$("clip-send-btn").onclick = () => void sendClipboardToHost();
+$("clip-recv-btn").onclick = () => void copyHostClipboardLocally();
 if (fullscreen.supported) {
   $("fullscreen-btn").onclick = () => {
     if (fullscreen.element()) void fullscreen.exit();

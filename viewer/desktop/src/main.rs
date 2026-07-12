@@ -43,6 +43,11 @@ struct Args {
     /// Quality profile: office | video | drawing | gaming
     #[arg(long, default_value = "office")]
     profile: String,
+    /// Connect over TLS (host runs with `tls = true`), authenticating the
+    /// server by this pinned certificate fingerprint (the `sha256:…` value
+    /// the host prints at startup; the prefix is optional).
+    #[arg(long)]
+    tls_pin: Option<String>,
 }
 
 /// One decoded RGBA frame ready for presentation.
@@ -89,6 +94,7 @@ fn main() -> anyhow::Result<()> {
             pin: args.pin.clone(),
             name: args.name.clone(),
             profile: args.profile.clone(),
+            tls_pin: args.tls_pin.clone(),
         };
         std::thread::spawn(move || net::run(args_net, shared, proxy, input_rx));
     }
@@ -272,9 +278,19 @@ impl ApplicationHandler<UiWake> for App {
                 }
                 let w3c = keycode_to_w3c(code);
                 if let Some(codestr) = w3c {
+                    // Layout hint: the character this key produced under the
+                    // *viewer's* layout — the host resolves it against its
+                    // own layout (layout-aware typing, docs/PROTOCOL.md).
+                    let key = match &event.logical_key {
+                        winit::keyboard::Key::Character(s) if s.chars().count() == 1 => {
+                            Some(s.to_string())
+                        }
+                        _ => None,
+                    };
                     self.send_input(InputEvent::Key {
                         code: codestr.to_string(),
                         pressed: event.state == ElementState::Pressed,
+                        key,
                     });
                 }
             }

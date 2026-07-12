@@ -5,6 +5,9 @@ CryptoKit pairing (P-256 ECDH + HKDF + AES-256-GCM, byte-compatible with the
 Rust host), VideoToolbox hardware H.264 decode (Annex-B → AVCC conversion,
 SPS/PPS harvesting), JPEG fallback, touch forwarding, per-host trust tokens.
 
+> **Note:** this app still pairs via the legacy PIN-HKDF handshake (hosts accept it by default; `allow_legacy_pairing = false` refuses it). Porting NDSP-PAKE v1 here is tracked in docs/ROADMAP.md (P1).
+
+
 > **Honest status:** complete source, **not compiled in this repo's CI** —
 > building requires Xcode on macOS. The protocol/crypto flow is identical to
 > the verified Rust/web clients; expect normal first-build fixes only.

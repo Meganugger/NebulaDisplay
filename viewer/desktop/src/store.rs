@@ -1,9 +1,16 @@
 //! Credential persistence for the desktop viewer (per-host trust tokens).
+//!
+//! At rest the file is DPAPI-protected on Windows (OS keystore, tied to the
+//! user account) and mode-0600 plaintext on unix — matching the host's trust
+//! store policy (see `docs/SECURITY.md`).
 
 use ndsp_client::Credentials;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Magic prefix of DPAPI-protected store files.
+const DPAPI_MAGIC: &[u8] = b"NDSP-DPAPI\x01";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreFile {
@@ -32,10 +39,18 @@ fn store_path() -> PathBuf {
 }
 
 fn load_file() -> StoreFile {
-    std::fs::read_to_string(store_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Ok(raw) = std::fs::read(store_path()) else {
+        return StoreFile::default();
+    };
+    let plain: Vec<u8> = if let Some(blob) = raw.strip_prefix(DPAPI_MAGIC) {
+        match dpapi_unprotect(blob) {
+            Some(p) => p,
+            None => return StoreFile::default(),
+        }
+    } else {
+        raw
+    };
+    serde_json::from_slice(&plain).unwrap_or_default()
 }
 
 fn save_file(f: &StoreFile) {
@@ -44,11 +59,98 @@ fn save_file(f: &StoreFile) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(raw) = serde_json::to_string_pretty(f) {
-        let _ = std::fs::write(&path, raw);
+        let bytes = match dpapi_protect(raw.as_bytes()) {
+            Some(blob) => {
+                let mut out = DPAPI_MAGIC.to_vec();
+                out.extend_from_slice(&blob);
+                out
+            }
+            None => raw.into_bytes(),
+        };
+        let _ = std::fs::write(&path, bytes);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// DPAPI (user scope). `None` on non-Windows or on API failure.
+#[cfg(windows)]
+fn dpapi_protect(plain: &[u8]) -> Option<Vec<u8>> {
+    dpapi::protect(plain)
+}
+#[cfg(windows)]
+fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
+    dpapi::unprotect(blob)
+}
+#[cfg(not(windows))]
+fn dpapi_protect(_plain: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+#[cfg(not(windows))]
+fn dpapi_unprotect(_blob: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(windows)]
+mod dpapi {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    fn blob_of(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        }
+    }
+
+    /// Copy a DPAPI output blob into a Vec and free the LocalAlloc'd buffer.
+    unsafe fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(out.pbData as *mut core::ffi::c_void)));
+        v
+    }
+
+    pub fn protect(plain: &[u8]) -> Option<Vec<u8>> {
+        let input = blob_of(plain);
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: input points at live memory for the call; output is
+        // LocalAlloc'd by the API and freed in `take`.
+        unsafe {
+            CryptProtectData(
+                &input,
+                windows::core::w!("NebulaDisplay viewer credentials"),
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )
+            .ok()?;
+            Some(take(out))
+        }
+    }
+
+    pub fn unprotect(blob: &[u8]) -> Option<Vec<u8>> {
+        let input = blob_of(blob);
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: as above.
+        unsafe {
+            CryptUnprotectData(
+                &input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )
+            .ok()?;
+            Some(take(out))
         }
     }
 }

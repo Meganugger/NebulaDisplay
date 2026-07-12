@@ -22,14 +22,19 @@ Windows PC (host)                            any device (viewer)
   driver — plus a zero-driver **mirror mode** that works out of the box.
 - **Web viewer with no install**: WebCodecs H.264 decode, touch/pen/keyboard,
   stats overlay with *measured* end-to-end latency.
-- **Encrypted by default**: ECDH P-256 + single-use PIN pairing → AES-256-GCM
-  on every frame; per-device trust tokens; input **denied until you allow it**.
+- **Encrypted by default**: PAKE pairing (CPace-style on P-256 — a recorded
+  handshake can't be brute-forced against the PIN) → AES-256-GCM on every
+  frame; per-device trust tokens (DPAPI-protected at rest on Windows); input
+  **denied until you allow it**.
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
   for Office / Video / Drawing / Gaming.
+- **Clipboard sync** (text, both directions) behind an explicit per-device
+  grant — deny by default, live-revocable, size-capped.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
-  required, nothing phones home.
-- Control panel with QR pairing, live client stats, per-device input grants,
-  one-click revocation.
+  required, nothing phones home. Optional HTTPS/WSS with a pinnable
+  self-signed certificate for hostile LANs.
+- Control panel with QR pairing, live client stats, per-device input &
+  clipboard grants, one-click revocation.
 
 ## Quick start
 
@@ -62,13 +67,14 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (32 Rust tests + Node compat + full Chromium E2E
-in CI): protocol/crypto, pairing/trust/grants, H.264+JPEG streaming, web
-viewer, adaptation, discovery, panel. Written but **needing a Windows/WDK/SDK
-machine to build & validate**: the IddCx driver (extend mode), DXGI
-mirror/SendInput runtime behavior, tray app runtime, Android/iOS apps. Not
-implemented yet (designed, reserved in the protocol): audio, clipboard,
-hardware encoders, PAKE pairing — see [ROADMAP](docs/ROADMAP.md).
+Verified by automated tests (64 Rust tests + Node compat + full Chromium E2E
+in CI): protocol/crypto, PAKE + legacy pairing, trust/grants, clipboard sync,
+pinned-TLS transport, H.264+JPEG streaming, web viewer, adaptation,
+discovery, panel. Written but **needing a Windows/WDK/SDK machine to build &
+validate**: the IddCx driver (extend mode), DXGI mirror/SendInput/clipboard
+runtime behavior, hardware-encoder runtime, tray app runtime, Android/iOS
+apps. Not implemented yet (designed, reserved in the protocol): audio, file
+drop, QUIC — see [ROADMAP](docs/ROADMAP.md).
 
 ## Clean-room statement
 

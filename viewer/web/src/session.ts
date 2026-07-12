@@ -18,6 +18,7 @@ import {
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { generatePakeShare, PAKE_SUITE } from "./pake";
 import {
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
@@ -45,9 +46,12 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
+  /** True when pairing ran over the PAKE path (vs legacy PIN-HKDF). */
+  usedPake: boolean;
 }
 
 export class Session {
@@ -93,9 +97,11 @@ export class Session {
         name: clientName,
         platform: "web",
         app_version: "0.2.0",
-        // This viewer renders the host cursor from the dedicated cursor
-        // channel (CursorShape/CursorPos) — never baked into video frames.
-        features: ["cursor"],
+        // cursor: renders the host cursor from the dedicated cursor channel
+        // (CursorShape/CursorPos) — never baked into video frames.
+        // clipboard: understands clipboard sync messages (still gated by the
+        // per-device grant on the host).
+        features: ["cursor", "clipboard"],
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
       codecs: await supportedCodecs(),
@@ -113,42 +119,51 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
-    const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
-    const challenge = await nextText();
-    if (challenge.type === "auth_err") throw new Error(String(challenge.error));
-    if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
-    const serverPub = b64decode(challenge.server_pubkey as string);
-    const salt = b64decode(challenge.salt as string);
-    const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
-
+    let sessionKeyRaw: Uint8Array;
     let newlyPaired = false;
+    let usedPake = false;
+
     if (useToken && stored) {
+      // ---- token reconnect over ephemeral ECDH ----------------------------
+      const keys = await generateHandshakeKeys();
+      send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverPub = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const shared = await agree(keys, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
+    } else if (ack.pake === PAKE_SUITE) {
+      // ---- PAKE pairing (NDSP-PAKE v1) — no offline PIN grinding ----------
+      usedPake = true;
+      const share = generatePakeShare(pin!, nonce, deviceId(), server.fingerprint);
+      send({ type: "pake_start", client_pubkey: b64encode(share.publicBytes) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pake_challenge") throw protoErr("pake_challenge", challenge);
+      const serverShare = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const secret = share.agree(serverShare, nonce, share.publicBytes, serverShare);
+      const pairKey = await secret.pairingKey(salt, nonce);
+      sessionKeyRaw = await secret.sessionKey(salt, nonce);
+      await confirmPairing(send, nextText, pairKey, nonce, host, server.fingerprint);
+      newlyPaired = true;
     } else {
+      // ---- legacy PIN-HKDF pairing (pre-PAKE hosts) ------------------------
+      const keys = await generateHandshakeKeys();
+      send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverPub = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const shared = await agree(keys, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
       const pairKey = await pairingKey(shared, salt, pin!, nonce);
-      const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
-      confirm.set(CONFIRM_CONTEXT, 0);
-      confirm.set(nonce, CONFIRM_CONTEXT.length);
-      const sealed = await seal(pairKey, confirm, new Uint8Array(0));
-      send({ type: "pair_confirm", sealed: b64encode(sealed) });
-      const result = await nextText();
-      if (result.type !== "pair_result" || !result.ok) {
-        throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
-      }
-      const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
-        b64decode(result.sealed_token as string),
-        te.encode("token"),
-      );
-      saveCredentials(host, {
-        deviceId: deviceId(),
-        tokenB64: b64encode(token),
-        hostFingerprint: server.fingerprint,
-      });
+      await confirmPairing(send, nextText, pairKey, nonce, host, server.fingerprint);
       newlyPaired = true;
     }
 
@@ -171,9 +186,11 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,
+      usedPake,
     };
     const session = new Session(ws, sealer, info);
 
@@ -225,6 +242,35 @@ export class Session {
   close(): void {
     this.ws.close();
   }
+}
+
+/**
+ * Shared tail of both pairing paths: prove PIN knowledge under `pairKey`,
+ * then unseal + persist the issued trust token.
+ */
+async function confirmPairing(
+  send: (msg: ControlMsg) => void,
+  nextText: () => Promise<ControlMsg>,
+  pairKey: Uint8Array,
+  nonce: Uint8Array,
+  host: string,
+  fingerprint: string,
+): Promise<void> {
+  const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
+  confirm.set(CONFIRM_CONTEXT, 0);
+  confirm.set(nonce, CONFIRM_CONTEXT.length);
+  const sealed = await seal(pairKey, confirm, new Uint8Array(0));
+  send({ type: "pair_confirm", sealed: b64encode(sealed) });
+  const result = await nextText();
+  if (result.type !== "pair_result" || !result.ok) {
+    throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
+  }
+  const token = await open(pairKey, b64decode(result.sealed_token as string), te.encode("token"));
+  saveCredentials(host, {
+    deviceId: deviceId(),
+    tokenB64: b64encode(token),
+    hostFingerprint: fingerprint,
+  });
 }
 
 async function supportedCodecs(): Promise<string[]> {
