@@ -80,7 +80,8 @@ impl EmbeddedHost {
         };
         let state = Arc::new(AppState::new(cfg).await?);
 
-        if audio::spawn_if_enabled(state.clone()) {
+        // Embedded hosts are for tests: never touch real audio devices.
+        if audio::spawn_test_tone_if_enabled(state.clone()) {
             state
                 .audio_available
                 .store(true, std::sync::atomic::Ordering::Relaxed);

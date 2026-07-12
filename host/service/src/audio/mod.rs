@@ -50,11 +50,23 @@ pub trait PcmSink {
 /// Spawn the capture+encode thread when audio is enabled in config.
 /// Returns true when a pipeline was started (i.e. audio is *available*).
 pub fn spawn_if_enabled(state: Arc<AppState>) -> bool {
+    spawn_pipeline(state, false)
+}
+
+/// Like [`spawn_if_enabled`] but always uses the synthetic test-tone source
+/// — for embedded/e2e hosts, which must not touch real audio devices (CI
+/// runners have none).
+pub fn spawn_test_tone_if_enabled(state: Arc<AppState>) -> bool {
+    spawn_pipeline(state, true)
+}
+
+fn spawn_pipeline(state: Arc<AppState>, force_test_tone: bool) -> bool {
     if !state.cfg.file.audio {
         return false;
     }
     #[cfg(not(feature = "audio"))]
     {
+        let _ = force_test_tone;
         tracing::warn!("audio requested in config but this build lacks the `audio` feature");
         false
     }
@@ -70,10 +82,11 @@ pub fn spawn_if_enabled(state: Arc<AppState>) -> bool {
                         return;
                     }
                 };
-                #[cfg(windows)]
-                let result = windows_wasapi::run(&state, encoder);
-                #[cfg(not(windows))]
-                let result = test_tone(&state, encoder);
+                let result = if force_test_tone {
+                    test_tone(&state, encoder)
+                } else {
+                    platform_source(&state, encoder)
+                };
                 if let Err(e) = result {
                     tracing::error!("audio pipeline stopped: {e:#}");
                 }
@@ -81,6 +94,18 @@ pub fn spawn_if_enabled(state: Arc<AppState>) -> bool {
             .expect("spawn audio thread");
         true
     }
+}
+
+#[cfg(all(feature = "audio", windows))]
+fn platform_source(state: &Arc<AppState>, publisher: OpusPublisher) -> anyhow::Result<()> {
+    windows_wasapi::run(state, publisher)
+}
+
+/// Non-Windows hosts have no loopback capture backend yet (roadmap) — the
+/// test tone doubles as a demo source.
+#[cfg(all(feature = "audio", not(windows)))]
+fn platform_source(state: &Arc<AppState>, publisher: OpusPublisher) -> anyhow::Result<()> {
+    test_tone(state, publisher)
 }
 
 /// Accumulates interleaved 48 kHz stereo f32 samples, encodes 20 ms Opus
@@ -160,12 +185,12 @@ impl PcmSink for OpusPublisher {
     }
 }
 
-/// Synthetic source for non-Windows hosts and automated tests: a gentle
+/// Synthetic source for tests, demos and non-Windows hosts: a gentle
 /// 440 Hz tone with a slow tremolo (so waveforms visibly change).
-#[cfg(all(feature = "audio", not(windows)))]
+#[cfg(feature = "audio")]
 fn test_tone(state: &Arc<AppState>, mut publisher: OpusPublisher) -> anyhow::Result<()> {
     use std::f32::consts::TAU;
-    tracing::info!("audio: synthetic test-tone source (no loopback capture on this OS)");
+    tracing::info!("audio: synthetic test-tone source");
     let mut t: u64 = 0;
     let chunk = FRAME_SAMPLES; // one 20 ms chunk per iteration
     let mut buf = vec![0f32; chunk * CHANNELS as usize];
