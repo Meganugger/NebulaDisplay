@@ -409,6 +409,15 @@ async fn video_keeps_flowing_under_input_flood() {
 /// host must keep accepting it alongside the default SPAKE2 method.
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_pin_pairing_still_works() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        legacy_pin_pairing_still_works_inner(),
+    )
+    .await
+    .expect("legacy pairing test watchdog expired");
+}
+
+async fn legacy_pin_pairing_still_works_inner() {
     let host = start_host("legacy").await;
     let pin = host.state.pins.current_pin();
 
@@ -461,8 +470,21 @@ async fn legacy_pin_pairing_still_works() {
 
 /// Clipboard sync: deny-by-default, live grant notification, host application,
 /// fan-out to *other* granted viewers only (no echo to the origin).
+///
+/// Host-clipboard *content* assertions run against the in-process backend
+/// only (non-Windows): on Windows CI the real OS clipboard is shared runner
+/// state — reading it can even block indefinitely on a delayed-render format
+/// whose owner no longer pumps messages. The protocol-visible behavior
+/// (grants, fan-out, no-echo, size cap) is asserted on every platform.
 #[tokio::test(flavor = "multi_thread")]
 async fn clipboard_sync_grant_flow() {
+    // Watchdog: a wedged step must fail loudly, never hang CI.
+    tokio::time::timeout(Duration::from_secs(120), clipboard_sync_grant_flow_inner())
+        .await
+        .expect("clipboard test watchdog expired (something blocked)");
+}
+
+async fn clipboard_sync_grant_flow_inner() {
     let host = start_host("clipboard").await;
 
     // Pair two viewers (PIN is single-use → fetch it fresh for each).
@@ -499,6 +521,7 @@ async fn clipboard_sync_grant_flow() {
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
+    #[cfg(not(windows))]
     assert_ne!(
         host.state.clipboard.host_text().as_deref(),
         Some("stolen?"),
@@ -552,6 +575,7 @@ async fn clipboard_sync_grant_flow() {
         }
     }
     assert_eq!(b_got.as_deref(), Some("hello from A"));
+    #[cfg(not(windows))]
     assert_eq!(
         host.state.clipboard.host_text().as_deref(),
         Some("hello from A")
@@ -608,6 +632,7 @@ async fn clipboard_sync_grant_flow() {
             _ => {}
         }
     }
+    #[cfg(not(windows))]
     assert_eq!(
         host.state.clipboard.host_text().as_deref(),
         Some("host copy"),
