@@ -1,0 +1,7 @@
+# Workspace-wide build environment.
+
+[env]
+# libopus (vendored by audiopus_sys, our Opus dependency) still declares
+# `cmake_minimum_required` < 3.5, which CMake 4.x refuses outright. CMake 4
+# honors this variable as the documented escape hatch; harmless on CMake 3.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
