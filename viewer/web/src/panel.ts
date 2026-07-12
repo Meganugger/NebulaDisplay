@@ -11,6 +11,7 @@ interface ClientView {
   addr: string;
   connected_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   stats: ViewerStats;
 }
 
@@ -21,6 +22,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -103,6 +105,7 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
         <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td><span class="tag ${c.clipboard_allowed ? "on" : "off"}">${c.clipboard_allowed ? "synced" : "off"}</span></td>
       </tr>`,
     )
     .join("");
@@ -119,6 +122,9 @@ async function refresh(): Promise<void> {
         <td>
           <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
         </td>
+        <td>
+          <label class="switch"><input type="checkbox" data-clip="${esc(d.device_id)}" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
+        </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
     )
@@ -131,6 +137,14 @@ async function refresh(): Promise<void> {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+      }).catch(console.error);
+  });
+  ttbody.querySelectorAll<HTMLInputElement>("input[data-clip]").forEach((el) => {
+    el.onchange = () =>
+      void api("/api/clipboard-grant", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device_id: el.dataset["clip"], allowed: el.checked }),
       }).catch(console.error);
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {

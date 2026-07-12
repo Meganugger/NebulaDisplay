@@ -197,6 +197,66 @@ if (!cur1 || cur1.display === "none" || !cur1.src) await fail("remote cursor ove
 if (cur1.t === cur2.t) await fail("remote cursor is not moving (cursor channel stalled)");
 console.log("cursor channel verified (shape delivered, position updating)");
 
+// ---- clipboard sync: grant → send via UI → second viewer receives ----------
+// Deny-by-default: the clipboard button must be hidden pre-grant.
+if (await page.isVisible("#clipboard-btn")) await fail("clipboard button visible without grant");
+await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+  origin: `http://127.0.0.1:${port}`,
+});
+let cres = await fetch(`http://127.0.0.1:${panelPort}/api/clipboard-grant`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ device_id: deviceId, allowed: true }),
+});
+if (!cres.ok) await fail(`clipboard-grant API failed: ${cres.status}`);
+await sleep(600);
+if (!(await page.isVisible("#clipboard-btn"))) {
+  await fail("clipboard button did not appear after live grant");
+}
+
+// Second viewer in an isolated context (own storage/device id), paired with a
+// fresh PIN, also granted — must receive the first viewer's clipboard.
+const statusRes = await fetch(`http://127.0.0.1:${panelPort}/api/status`);
+const pin2 = (await statusRes.json()).pin;
+const page2 = await browser.newPage({ viewport: { width: 900, height: 700 } });
+await page2.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+  origin: `http://127.0.0.1:${port}`,
+});
+await page2.goto(`http://127.0.0.1:${port}/`);
+await page2.fill("#host", `127.0.0.1:${port}`);
+await page2.fill("#pin", pin2);
+await page2.fill("#client-name", "Clipboard receiver");
+await page2.click("#connect-btn");
+await page2.waitForSelector("#viewer-screen.active", { timeout: 15000 });
+const deviceId2 = await page2.evaluate(() => localStorage.getItem("ndsp.deviceId"));
+cres = await fetch(`http://127.0.0.1:${panelPort}/api/clipboard-grant`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ device_id: deviceId2, allowed: true }),
+});
+if (!cres.ok) await fail(`clipboard-grant (viewer 2) failed: ${cres.status}`);
+await sleep(400);
+
+// Viewer 1: put text in its local clipboard, then click the send button.
+const clipText = `e2e clipboard ${Date.now()}`;
+await page.evaluate((t) => navigator.clipboard.writeText(t), clipText);
+await page.click("#clipboard-btn");
+await sleep(900);
+if (!/clipboard from viewer/.test(hostLog)) {
+  await fail("host did not log the clipboard application");
+}
+const received = await page2.evaluate(() => navigator.clipboard.readText());
+if (received !== clipText) {
+  await fail(`viewer 2 clipboard mismatch: ${JSON.stringify(received)} != ${JSON.stringify(clipText)}`);
+}
+const echoed = await page.evaluate(() => navigator.clipboard.readText());
+if (echoed !== clipText) {
+  // Viewer 1's clipboard must be untouched (no echo) — it still holds what we wrote.
+  await fail("viewer 1 local clipboard was unexpectedly modified");
+}
+console.log("clipboard sync verified (grant gating, UI send, cross-viewer receive)");
+await page2.close();
+
 await browser.close();
 host.kill();
 rmSync(dataDir, { recursive: true, force: true });

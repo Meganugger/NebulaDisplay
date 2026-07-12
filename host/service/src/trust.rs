@@ -1,16 +1,21 @@
 //! Persistent trusted-device store.
 //!
-//! Stored as JSON in the data dir (`devices.json`, mode 0600 on unix). Raw
-//! trust tokens are stored because reconnect proofs are keyed hashes over the
-//! token + handshake transcript (see `docs/SECURITY.md` §Trust store). The
-//! host machine is inside the trust boundary — it renders the screen content
-//! in the first place.
+//! Stored as JSON in the data dir (`devices.json`). Raw trust tokens are
+//! stored because reconnect proofs are keyed hashes over the token +
+//! handshake transcript (see `docs/SECURITY.md` §Trust store). The host
+//! machine is inside the trust boundary — it renders the screen content in
+//! the first place. At rest the file is additionally protected by the OS
+//! keystore where one exists (DPAPI on Windows, see [`crate::keystore`]);
+//! elsewhere it is plaintext with mode 0600. Legacy plaintext stores are
+//! read transparently and upgraded on the next write.
 
 use ndsp_protocol::crypto::{random_bytes, reauth_transcript, token_proof, TOKEN_LEN};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+use crate::keystore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedDevice {
@@ -23,11 +28,20 @@ pub struct TrustedDevice {
     pub last_seen_unix: u64,
     /// Whether this device may inject input. **Deny by default.**
     pub input_allowed: bool,
+    /// Whether this device may sync clipboard text. **Deny by default.**
+    #[serde(default)]
+    pub clipboard_allowed: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreFile {
     devices: Vec<TrustedDevice>,
+}
+
+/// Self-describing OS-keystore container (Windows DPAPI today).
+#[derive(Debug, Serialize, Deserialize)]
+struct ProtectedFile {
+    dpapi: String,
 }
 
 pub struct TrustStore {
@@ -46,24 +60,46 @@ impl TrustStore {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let devices = if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str::<StoreFile>(&raw)
-                .map(|f| f.devices)
-                .unwrap_or_else(|e| {
-                    warn!("trust store corrupt ({e}); starting empty (old file kept as .bak)");
-                    let _ = std::fs::copy(&path, path.with_extension("json.bak"));
-                    Vec::new()
-                })
+            Self::parse(&raw).unwrap_or_else(|e| {
+                warn!("trust store corrupt ({e}); starting empty (old file kept as .bak)");
+                let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+                Vec::new()
+            })
         } else {
             Vec::new()
         };
         Ok(Self { path, devices })
     }
 
+    /// Parse either the keystore-protected container or a legacy plaintext
+    /// store (which keeps working and is upgraded on the next write).
+    fn parse(raw: &str) -> anyhow::Result<Vec<TrustedDevice>> {
+        if let Ok(p) = serde_json::from_str::<ProtectedFile>(raw) {
+            use base64::Engine as _;
+            let sealed = base64::engine::general_purpose::STANDARD
+                .decode(&p.dpapi)
+                .map_err(|e| anyhow::anyhow!("protected store base64: {e}"))?;
+            let plain = keystore::unprotect(&sealed)?;
+            let f: StoreFile = serde_json::from_slice(&plain)?;
+            return Ok(f.devices);
+        }
+        Ok(serde_json::from_str::<StoreFile>(raw)?.devices)
+    }
+
     fn save(&self) -> anyhow::Result<()> {
         let tmp = self.path.with_extension("json.tmp");
-        let raw = serde_json::to_string_pretty(&StoreFile {
+        let plain = serde_json::to_string_pretty(&StoreFile {
             devices: self.devices.clone(),
         })?;
+        let raw = match keystore::protect(plain.as_bytes())? {
+            Some(sealed) => {
+                use base64::Engine as _;
+                serde_json::to_string(&ProtectedFile {
+                    dpapi: base64::engine::general_purpose::STANDARD.encode(sealed),
+                })?
+            }
+            None => plain,
+        };
         std::fs::write(&tmp, raw)?;
         #[cfg(unix)]
         {
@@ -91,7 +127,8 @@ impl TrustStore {
             token_hex: hex::encode(token),
             created_unix: now_unix(),
             last_seen_unix: now_unix(),
-            input_allowed: false, // never grant input implicitly
+            input_allowed: false,     // never grant input implicitly
+            clipboard_allowed: false, // never share the clipboard implicitly
         });
         self.save()?;
         info!(device_id, name, "device enrolled (input DENIED by default)");
@@ -142,6 +179,20 @@ impl TrustStore {
         dev.input_allowed = allowed;
         self.save()?;
         info!(device_id, allowed, "input grant updated");
+        Ok(true)
+    }
+
+    pub fn set_clipboard_allowed(
+        &mut self,
+        device_id: &str,
+        allowed: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.clipboard_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "clipboard grant updated");
         Ok(true)
     }
 
@@ -200,6 +251,34 @@ mod tests {
         assert!(store2
             .verify("dev-1", &nonce, &cpub, &spub, &proof)
             .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_denied_by_default_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("ndsp-test-clip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut store = TrustStore::load(path.clone()).unwrap();
+        store.enroll("dev-c", "Clip device", "web").unwrap();
+        assert!(
+            !store.get("dev-c").unwrap().clipboard_allowed,
+            "clipboard must be denied by default"
+        );
+        assert!(store.set_clipboard_allowed("dev-c", true).unwrap());
+        assert!(!store.set_clipboard_allowed("nope", true).unwrap());
+
+        // Persists across reload; pre-0.5 stores (no field) default to false —
+        // both parse through the same legacy-tolerant path.
+        let store2 = TrustStore::load(path).unwrap();
+        assert!(store2.get("dev-c").unwrap().clipboard_allowed);
+        let legacy = r#"{"devices":[{"device_id":"old","name":"n","platform":"p",
+            "token_hex":"00","created_unix":1,"last_seen_unix":1,"input_allowed":true}]}"#;
+        let parsed = TrustStore::parse(legacy).unwrap();
+        assert!(parsed[0].input_allowed);
+        assert!(!parsed[0].clipboard_allowed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

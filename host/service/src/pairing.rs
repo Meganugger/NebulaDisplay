@@ -1,17 +1,23 @@
 //! Server-side authentication state machine (transport-agnostic → unit
 //! testable without sockets).
 //!
-//! Both auth paths share the ephemeral ECDH exchange so every session gets a
-//! fresh AES-256-GCM key:
+//! Every auth path gives each session a fresh AES-256-GCM key:
 //!
-//! * **Pair** (first contact) — client must prove knowledge of the on-screen
-//!   PIN by sealing a confirmation under the PIN-bound pairing key.
-//! * **Token** (returning device) — client proves possession of its trust
-//!   token via a hash bound to the full handshake transcript.
+//! * **PairPake** (first contact, current clients) — SPAKE2 over P-256: the
+//!   exchanged points are PIN-blinded, so a recorded transcript cannot be
+//!   ground offline; the confirmation seal proves the client knew the PIN.
+//! * **Pair** (first contact, legacy clients) — ephemeral ECDH + PIN-bound
+//!   HKDF; client proves PIN knowledge by sealing a confirmation.
+//! * **Token** (returning device) — ephemeral ECDH; client proves possession
+//!   of its trust token via a hash bound to the full handshake transcript.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ndsp_protocol::{
-    crypto::{self, HandshakeKeys, SharedSecret},
+    crypto::{
+        self,
+        pake::{PakeKeys, PakeShare, Role},
+        HandshakeKeys, SharedSecret,
+    },
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, ServerInfo},
     PROTOCOL_VERSION,
 };
@@ -28,18 +34,27 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     pub newly_paired: bool,
 }
 
-enum Phase {
-    AwaitHello,
-    AwaitPairStart,
-    AwaitProof {
+/// Cryptographic state carried from `PairChallenge` to the client's proof.
+enum ProofState {
+    /// Legacy PIN pairing / token auth: plain ephemeral ECDH.
+    Ecdh {
         shared: Box<SharedSecret>,
         salt: [u8; 16],
         client_pub: Vec<u8>,
         server_pub: Vec<u8>,
     },
+    /// SPAKE2 pairing: both keys are fully derived once the shares crossed.
+    Pake { keys: Box<PakeKeys> },
+}
+
+enum Phase {
+    AwaitHello,
+    AwaitPairStart,
+    AwaitProof(ProofState),
     Done,
 }
 
@@ -105,11 +120,12 @@ impl ServerHandshake {
         Codec::Jpeg
     }
 
-    fn auth_ok(&self, input_allowed: bool) -> ControlMsg {
+    fn auth_ok(&self, input_allowed: bool, clipboard_allowed: bool) -> ControlMsg {
         ControlMsg::AuthOk {
             codec: self.select_codec(),
             mode: *self.state.mode.lock().unwrap(),
             input_allowed,
+            clipboard_allowed,
         }
     }
 
@@ -133,7 +149,7 @@ impl ServerHandshake {
                     );
                 }
                 info!(device = %client.device_id, name = %client.name, platform = %client.platform, "hello");
-                let pairing = matches!(auth, AuthMethod::Pair);
+                let pairing = matches!(auth, AuthMethod::Pair | AuthMethod::PairPake);
                 self.client = Some(client);
                 self.auth = Some(auth);
                 self.client_codecs = codecs;
@@ -152,7 +168,7 @@ impl ServerHandshake {
 
             (Phase::AwaitPairStart, ControlMsg::PairStart { client_pubkey }) => {
                 // Rate-limit before any expensive crypto.
-                if matches!(self.auth, Some(AuthMethod::Pair)) {
+                if matches!(self.auth, Some(AuthMethod::Pair | AuthMethod::PairPake)) {
                     if let PinGate::LockedOut { retry_after } = self.state.pins.gate(self.peer_ip) {
                         return Step::reject(
                             ControlMsg::AuthErr {
@@ -173,6 +189,32 @@ impl ServerHandshake {
                         "bad pubkey b64",
                     );
                 };
+                let salt: [u8; 16] = crypto::random_bytes();
+                if matches!(self.auth, Some(AuthMethod::PairPake)) {
+                    // SPAKE2: our challenge share is PIN-blinded; both keys
+                    // are derivable as soon as the client share arrived.
+                    let pin = self.state.pins.current_pin();
+                    let share = PakeShare::new(Role::Server, &pin, &self.nonce);
+                    let server_pub = share.public_bytes().to_vec();
+                    let keys = match share.complete(&client_pub, &salt, &self.nonce) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            return Step::reject(
+                                ControlMsg::AuthErr {
+                                    error: "invalid PAKE share".into(),
+                                },
+                                "bad pake share",
+                            )
+                        }
+                    };
+                    self.phase = Phase::AwaitProof(ProofState::Pake {
+                        keys: Box::new(keys),
+                    });
+                    return Step::reply(ControlMsg::PairChallenge {
+                        server_pubkey: B64.encode(&server_pub),
+                        salt: B64.encode(salt),
+                    });
+                }
                 let keys = HandshakeKeys::generate();
                 let server_pub = keys.public_bytes().to_vec();
                 let shared = match keys.agree(&client_pub) {
@@ -186,22 +228,21 @@ impl ServerHandshake {
                         )
                     }
                 };
-                let salt: [u8; 16] = crypto::random_bytes();
                 let reply = ControlMsg::PairChallenge {
                     server_pubkey: B64.encode(&server_pub),
                     salt: B64.encode(salt),
                 };
-                self.phase = Phase::AwaitProof {
+                self.phase = Phase::AwaitProof(ProofState::Ecdh {
                     shared: Box::new(shared),
                     salt,
                     client_pub,
                     server_pub,
-                };
+                });
                 Step::reply(reply)
             }
 
-            (Phase::AwaitProof { shared, salt, .. }, ControlMsg::PairConfirm { sealed })
-                if matches!(self.auth, Some(AuthMethod::Pair)) =>
+            (Phase::AwaitProof(proof), ControlMsg::PairConfirm { sealed })
+                if matches!(self.auth, Some(AuthMethod::Pair | AuthMethod::PairPake)) =>
             {
                 let Ok(sealed) = B64.decode(&sealed) else {
                     return Step::reject(
@@ -213,8 +254,16 @@ impl ServerHandshake {
                         "bad confirm b64",
                     );
                 };
-                let pin = self.state.pins.current_pin();
-                let pair_key = shared.pairing_key(salt.as_ref(), &pin, &self.nonce);
+                let (pair_key, session_key) = match proof {
+                    ProofState::Pake { keys } => (keys.pair_key, keys.session_key),
+                    ProofState::Ecdh { shared, salt, .. } => {
+                        let pin = self.state.pins.current_pin();
+                        (
+                            shared.pairing_key(salt.as_ref(), &pin, &self.nonce),
+                            shared.session_key(salt.as_ref(), &self.nonce),
+                        )
+                    }
+                };
                 let mut expected = crypto::CONFIRM_CONTEXT.to_vec();
                 expected.extend_from_slice(&self.nonce);
                 match crypto::open(&pair_key, &sealed, b"") {
@@ -240,8 +289,7 @@ impl ServerHandshake {
                             }
                         };
                         let sealed_token = crypto::seal(&pair_key, &token, b"token");
-                        let session_key = shared.session_key(salt.as_ref(), &self.nonce);
-                        let auth_ok = self.auth_ok(false);
+                        let auth_ok = self.auth_ok(false, false);
                         let codec = self.select_codec();
                         self.phase = Phase::Done;
                         Step {
@@ -258,6 +306,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -278,12 +327,12 @@ impl ServerHandshake {
             }
 
             (
-                Phase::AwaitProof {
+                Phase::AwaitProof(ProofState::Ecdh {
                     shared,
                     salt,
                     client_pub,
                     server_pub,
-                },
+                }),
                 ControlMsg::TokenProof { proof },
             ) => {
                 let Some(AuthMethod::Token { device_id }) = self.auth.clone() else {
@@ -314,7 +363,8 @@ impl ServerHandshake {
                         let client = self.client.clone().expect("hello precedes proof");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let input_allowed = dev.input_allowed;
-                        let auth_ok = self.auth_ok(input_allowed);
+                        let clipboard_allowed = dev.clipboard_allowed;
+                        let auth_ok = self.auth_ok(input_allowed, clipboard_allowed);
                         let codec = self.select_codec();
                         info!(device = %device_id, "token reconnect ok");
                         self.phase = Phase::Done;
@@ -325,6 +375,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,

@@ -87,6 +87,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tokio::spawn(discovery::run(state.clone(), args.discovery_port));
     }
 
+    // Host clipboard watcher (Windows: publishes local copies to granted
+    // viewers; no-op elsewhere). Only the real host runs this — embedded
+    // test hosts drive the service directly.
+    state.clipboard.spawn_watcher();
+
     // Loopback control panel.
     let panel_state = state.clone();
     let panel_port = args.panel_port;

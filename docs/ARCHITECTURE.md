@@ -143,12 +143,28 @@ coordinates → discrete events sent immediately, move samples coalesced ≤4 ms
 encrypted control channel → session pump applies them the moment they
 decrypt (never queued behind video) after checking the device's grant
 (deny by default, toggled live from the panel) → `SendInput` mapped through
-the captured monitor's desktop rect (multi-monitor correct).
+the captured monitor's desktop rect (multi-monitor correct). Keyboard events
+carry both the physical `code` and the layout-resolved `key`; the host picks
+scan-code, `VkKeyScanW` virtual-key, or Unicode injection per event so
+mismatched layouts type correctly. Stylus events are injected as real
+Windows Ink pens (`InjectSyntheticPointerInput`: pressure, tilt, hover) with
+automatic mouse fallback where the API is missing.
+
+### Clipboard
+Permission-gated per device (deny by default, panel toggle, live-revocable).
+A viewer push travels the control channel → session pump checks grant + the
+256 KiB cap → host clipboard (CF_UNICODETEXT on Windows, in-process store
+elsewhere) → fan-out watch channel to every *other* granted session (the
+origin never gets its own echo). Host-side copies are detected on Windows by
+polling `GetClipboardSequenceNumber` (no message window needed) and pushed
+to granted viewers only. New connections never see pre-existing clipboard
+state; contents are never logged.
 
 ### Control/health
 2 Hz Ping/Pong (clock sync + RTT, answered off the fast path), 2 s HostStats
-push, 30 s dead-peer timeout, single-use PINs with per-IP lockout, revocation
-kicks live sessions.
+push, 30 s dead-peer timeout, single-use PINs (SPAKE2-paired, so recorded
+transcripts can't be PIN-ground) with per-IP lockout, revocation kicks live
+sessions, trust store DPAPI-wrapped at rest on Windows.
 
 ## Fault handling
 

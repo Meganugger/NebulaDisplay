@@ -1,33 +1,102 @@
-//! Windows input injection via `SendInput`.
+//! Windows input injection via `SendInput` + synthetic pen pointers.
 //!
 //! Coordinates arrive normalized (0..1) relative to the *streamed monitor*.
 //! They are mapped through the captured output's desktop rectangle into the
 //! full virtual-desktop space (`MOUSEEVENTF_VIRTUALDESK`), so taps land on
 //! the correct pixel even when the captured monitor is not the primary one
 //! or sits at a non-zero desktop offset in a multi-monitor layout.
+//!
+//! ## Layout-aware keyboard mapping
+//!
+//! Viewers send both the physical `code` ("KeyQ") and, when known, the
+//! layout-resolved `key` ("a" on AZERTY). The host picks per event:
+//!
+//! * modifier chords (Ctrl/Alt/Win held) and named keys → **scan codes**
+//!   (positional, what games and shortcuts expect);
+//! * printable characters whose `VkKeyScanW` mapping matches the currently
+//!   held Shift state → that **virtual key** (host-layout-correct, supports
+//!   auto-repeat and key-up);
+//! * anything else printable → **`KEYEVENTF_UNICODE`** (exact character,
+//!   layout-proof) injected on key-down only.
+//!
+//! Key-ups always replay whatever strategy the matching key-down used, so a
+//! layout switch mid-hold can't wedge a key.
+//!
+//! ## True stylus injection
+//!
+//! Pen events use `CreateSyntheticPointerDevice(PT_PEN)` +
+//! `InjectSyntheticPointerInput`, delivering real pressure/tilt/hover to
+//! Windows Ink apps. If the synthetic pointer API is unavailable (< Win10
+//! 1809 or a locked-down session), the sink falls back to the mouse mapping
+//! permanently for the process lifetime.
 
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use windows::Win32::UI::Controls::{
+    CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
+    POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MAPVK_VSC_TO_VK,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+};
+use windows::Win32::UI::Input::Pointer::{
+    InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT,
+    POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
+    POINTER_PEN_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     XBUTTON1, XBUTTON2,
 };
 
 use super::InputSink;
 use crate::state::AppState;
 
+/// How a key-down was injected — its key-up must mirror it exactly.
+#[derive(Debug, Clone, Copy)]
+enum PressAction {
+    /// Positional scan-code injection.
+    Scan,
+    /// Host-layout virtual key from `VkKeyScanW`.
+    Vk(u16),
+    /// `KEYEVENTF_UNICODE` down+up already sent on press; up is a no-op.
+    UnicodeDone,
+}
+
+#[derive(Default)]
+struct KeyState {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    /// Per-`code` action of the most recent key-down.
+    pressed: HashMap<String, PressAction>,
+}
+
+#[derive(Default)]
+struct PenState {
+    device: Option<HSYNTHETICPOINTERDEVICE>,
+    /// Synthetic pointer API unavailable — use the mouse fallback forever.
+    unavailable: bool,
+    in_contact: bool,
+}
+
+// HSYNTHETICPOINTERDEVICE is a plain handle owned by this sink only.
+unsafe impl Send for PenState {}
+
 pub struct WindowsInputSink {
     state: Arc<AppState>,
     /// Touch state so single-finger touch maps to press-drag-release.
     touch_down: Mutex<bool>,
+    keys: Mutex<KeyState>,
+    pen: Mutex<PenState>,
 }
 
 impl WindowsInputSink {
@@ -35,6 +104,8 @@ impl WindowsInputSink {
         Self {
             state,
             touch_down: Mutex::new(false),
+            keys: Mutex::new(KeyState::default()),
+            pen: Mutex::new(PenState::default()),
         }
     }
 
@@ -84,6 +155,27 @@ impl WindowsInputSink {
         )
     }
 
+    /// Map a normalized (0..1) point on the streamed monitor to desktop
+    /// pixel coordinates (for pointer injection, which is pixel-based).
+    fn desktop_pixel(&self, x: f32, y: f32) -> (i32, i32) {
+        let x = x.clamp(0.0, 1.0) as f64;
+        let y = y.clamp(0.0, 1.0) as f64;
+        if let Some((l, t, r, b)) = *self.state.capture_rect.lock().unwrap() {
+            if r > l && b > t {
+                return (
+                    (l as f64 + x * (r - l - 1) as f64).round() as i32,
+                    (t as f64 + y * (b - t - 1) as f64).round() as i32,
+                );
+            }
+        }
+        // SAFETY: GetSystemMetrics is always safe to call.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        (
+            (x * (w - 1).max(1) as f64).round() as i32,
+            (y * (h - 1).max(1) as f64).round() as i32,
+        )
+    }
+
     fn send(&self, inputs: &[INPUT]) {
         if inputs.is_empty() {
             return;
@@ -94,6 +186,213 @@ impl WindowsInputSink {
             tracing::warn!("SendInput injected {sent}/{} events", inputs.len());
         }
     }
+
+    /// Layout-aware key event → INPUT list (see module docs for the policy).
+    fn key_event(&self, code: &str, key: Option<&str>, pressed: bool) -> Vec<INPUT> {
+        let mut ks = self.keys.lock().unwrap();
+        // Track modifier state from the forwarded stream itself.
+        match code {
+            "ShiftLeft" | "ShiftRight" => ks.shift = pressed,
+            "ControlLeft" | "ControlRight" => ks.ctrl = pressed,
+            "AltLeft" | "AltRight" => ks.alt = pressed,
+            "MetaLeft" | "MetaRight" => ks.meta = pressed,
+            _ => {}
+        }
+
+        if !pressed {
+            // Replay whatever the matching key-down did.
+            let action = ks.pressed.remove(code).unwrap_or(PressAction::Scan);
+            return match action {
+                PressAction::Scan => key_input(code, false).into_iter().collect(),
+                PressAction::Vk(vk) => vec![vk_input(vk, false)],
+                PressAction::UnicodeDone => Vec::new(),
+            };
+        }
+
+        let printable = key.filter(|k| {
+            let mut chars = k.chars();
+            matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control())
+        });
+        let is_modifier = matches!(
+            code,
+            "ShiftLeft"
+                | "ShiftRight"
+                | "ControlLeft"
+                | "ControlRight"
+                | "AltLeft"
+                | "AltRight"
+                | "MetaLeft"
+                | "MetaRight"
+        );
+
+        // Shortcut chords and named/modifier keys are positional.
+        if is_modifier || ks.ctrl || ks.alt || ks.meta || printable.is_none() {
+            return match key_input(code, true) {
+                Some(i) => {
+                    ks.pressed.insert(code.to_string(), PressAction::Scan);
+                    vec![i]
+                }
+                None => {
+                    tracing::debug!(code, "unmapped key code ignored");
+                    Vec::new()
+                }
+            };
+        }
+
+        // Printable character: prefer the host layout's virtual key when its
+        // required shift state matches what the viewer is physically holding
+        // (keeps auto-repeat + key-up semantics); otherwise inject the exact
+        // character as Unicode.
+        let ch = printable.unwrap().chars().next().unwrap();
+        let mut units = [0u16; 2];
+        let utf16 = ch.encode_utf16(&mut units);
+        if utf16.len() == 1 {
+            // SAFETY: VkKeyScanW is always safe to call.
+            let scan = unsafe { VkKeyScanW(utf16[0]) };
+            if scan != -1 {
+                let vk = (scan & 0xFF) as u16;
+                let mods = ((scan >> 8) & 0xFF) as u8;
+                let needs_shift = mods & 0b001 != 0;
+                let needs_ctrl_alt = mods & 0b110 != 0; // AltGr-style chars
+                if !needs_ctrl_alt && needs_shift == ks.shift {
+                    ks.pressed.insert(code.to_string(), PressAction::Vk(vk));
+                    return vec![vk_input(vk, true)];
+                }
+            }
+        }
+        ks.pressed
+            .insert(code.to_string(), PressAction::UnicodeDone);
+        unicode_tap(printable.unwrap())
+    }
+
+    /// Inject a stylus event through the synthetic pen device. Returns false
+    /// when the API is unavailable (caller falls back to the mouse path).
+    fn pen_event(
+        &self,
+        phase: TouchPhase,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+    ) -> bool {
+        let mut pen = self.pen.lock().unwrap();
+        if pen.unavailable {
+            return false;
+        }
+        if pen.device.is_none() {
+            // SAFETY: plain API call; the handle is owned by this sink.
+            match unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) } {
+                Ok(dev) => pen.device = Some(dev),
+                Err(e) => {
+                    tracing::warn!(
+                        "synthetic pen unavailable ({e}); stylus falls back to mouse mapping"
+                    );
+                    pen.unavailable = true;
+                    return false;
+                }
+            }
+        }
+        let device = pen.device.expect("created above");
+
+        let mut flags = POINTER_FLAG_PRIMARY | POINTER_FLAG_INRANGE;
+        match phase {
+            TouchPhase::Start => {
+                flags |= POINTER_FLAG_DOWN | POINTER_FLAG_INCONTACT;
+                pen.in_contact = true;
+            }
+            TouchPhase::Move => {
+                flags |= POINTER_FLAG_UPDATE;
+                if pen.in_contact {
+                    flags |= POINTER_FLAG_INCONTACT;
+                }
+            }
+            TouchPhase::End => {
+                flags |= POINTER_FLAG_UP;
+                pen.in_contact = false;
+            }
+            TouchPhase::Cancel => {
+                flags |= POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+                pen.in_contact = false;
+            }
+        }
+
+        let (px, py) = self.desktop_pixel(x, y);
+        let info = POINTER_TYPE_INFO {
+            r#type: PT_PEN,
+            Anonymous: POINTER_TYPE_INFO_0 {
+                penInfo: POINTER_PEN_INFO {
+                    pointerInfo: windows::Win32::UI::Input::Pointer::POINTER_INFO {
+                        pointerType: PT_PEN,
+                        pointerFlags: flags,
+                        ptPixelLocation: windows::Win32::Foundation::POINT { x: px, y: py },
+                        ..Default::default()
+                    },
+                    penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+                    // Windows Ink pressure range is 0..1024.
+                    pressure: (pressure.clamp(0.0, 1.0) * 1024.0) as u32,
+                    tiltX: (tilt_x.clamp(-1.0, 1.0) * 90.0) as i32,
+                    tiltY: (tilt_y.clamp(-1.0, 1.0) * 90.0) as i32,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: device is a live synthetic pointer handle; info is fully
+        // initialized.
+        if let Err(e) = unsafe { InjectSyntheticPointerInput(device, &[info]) } {
+            tracing::debug!("pen injection failed: {e}");
+        }
+        true
+    }
+}
+
+/// Virtual-key injection (layout-resolved path). The scan code is attached
+/// for apps that read it.
+fn vk_input(vk: u16, pressed: bool) -> INPUT {
+    // SAFETY: MapVirtualKeyW is always safe to call.
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+    let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Exact-character injection: `KEYEVENTF_UNICODE` down+up per UTF-16 unit.
+fn unicode_tap(text: &str) -> Vec<INPUT> {
+    let mut out = Vec::new();
+    for u in text.encode_utf16() {
+        for &up in &[false, true] {
+            let mut flags = KEYEVENTF_UNICODE;
+            if up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            out.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: u,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+    }
+    out
 }
 
 fn mouse_input(
@@ -292,55 +591,58 @@ impl InputSink for WindowsInputSink {
                         batch.push(mouse_input(0, 0, (dx * 120.0) as i32, MOUSEEVENTF_HWHEEL));
                     }
                 }
-                InputEvent::Key { code, pressed } => {
-                    if let Some(i) = key_input(code, *pressed) {
-                        batch.push(i);
-                    } else {
-                        tracing::debug!(code, "unmapped key code ignored");
-                    }
+                InputEvent::Key { code, pressed, key } => {
+                    batch.extend(self.key_event(code, key.as_deref(), *pressed));
                 }
                 InputEvent::Text { text } => {
-                    for u in text.encode_utf16() {
-                        for &up in &[false, true] {
-                            let mut flags = KEYEVENTF_UNICODE;
-                            if up {
-                                flags |= KEYEVENTF_KEYUP;
-                            }
-                            batch.push(INPUT {
-                                r#type: INPUT_KEYBOARD,
-                                Anonymous: INPUT_0 {
-                                    ki: KEYBDINPUT {
-                                        wVk: VIRTUAL_KEY(0),
-                                        wScan: u,
-                                        dwFlags: flags,
-                                        time: 0,
-                                        dwExtraInfo: 0,
-                                    },
-                                },
-                            });
-                        }
-                    }
+                    batch.extend(unicode_tap(text));
                 }
-                InputEvent::Touch { phase, x, y, .. } | InputEvent::Pen { phase, x, y, .. } => {
+                InputEvent::Pen {
+                    phase,
+                    x,
+                    y,
+                    pressure,
+                    tilt_x,
+                    tilt_y,
+                } => {
+                    // Real stylus injection (pressure/tilt/hover). Flush the
+                    // SendInput batch first so ordering is preserved, then
+                    // inject through the synthetic pointer device. On API
+                    // failure fall through to the mouse mapping below.
+                    self.send(&batch);
+                    batch.clear();
+                    if self.pen_event(*phase, *x, *y, *pressure, *tilt_x, *tilt_y) {
+                        continue;
+                    }
+                    self.pointer_as_mouse(&mut batch, *phase, *x, *y);
+                }
+                InputEvent::Touch { phase, x, y, .. } => {
                     // Single-pointer mapping to mouse until InjectTouchInput
                     // integration (see docs/ROADMAP.md).
-                    let (ax, ay, flags) = self.map_coords(*x, *y);
-                    batch.push(mouse_input(ax, ay, 0, flags));
-                    let mut down = self.touch_down.lock().unwrap();
-                    match phase {
-                        TouchPhase::Start if !*down => {
-                            *down = true;
-                            batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN));
-                        }
-                        TouchPhase::End | TouchPhase::Cancel if *down => {
-                            *down = false;
-                            batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP));
-                        }
-                        _ => {}
-                    }
+                    self.pointer_as_mouse(&mut batch, *phase, *x, *y);
                 }
             }
         }
         self.send(&batch);
+    }
+}
+
+impl WindowsInputSink {
+    /// Single-pointer press-drag-release mapping to mouse events.
+    fn pointer_as_mouse(&self, batch: &mut Vec<INPUT>, phase: TouchPhase, x: f32, y: f32) {
+        let (ax, ay, flags) = self.map_coords(x, y);
+        batch.push(mouse_input(ax, ay, 0, flags));
+        let mut down = self.touch_down.lock().unwrap();
+        match phase {
+            TouchPhase::Start if !*down => {
+                *down = true;
+                batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN));
+            }
+            TouchPhase::End | TouchPhase::Cancel if *down => {
+                *down = false;
+                batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP));
+            }
+            _ => {}
+        }
     }
 }

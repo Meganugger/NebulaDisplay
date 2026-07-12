@@ -56,6 +56,7 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -133,8 +134,10 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -161,6 +164,7 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -191,6 +195,8 @@ pub async fn run(
         ctl_tx.clone(),
         input_sink,
         handle.clone(),
+        state.clipboard.clone(),
+        client_id,
     ));
     let video = tokio::spawn(video_task(
         state.clone(),
@@ -214,12 +220,20 @@ pub async fn run(
     cursor_rx.mark_changed();
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
+    // Clipboard fan-out. Deliberately *not* primed: a newly connected viewer
+    // only sees clipboard changes made while it is connected, never whatever
+    // happened to be in the clipboard beforehand.
+    let mut clipboard_rx = state.clipboard.subscribe();
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -261,6 +275,16 @@ pub async fn run(
                     }
                 }
                 if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: cs.visible }).await.is_err() { break; }
+            }
+
+            changed = clipboard_rx.changed() => {
+                if changed.is_err() { continue; }
+                let update = clipboard_rx.borrow_and_update().clone();
+                let Some(update) = update else { continue };
+                if !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                if update.origin == Some(client_id) { continue; } // no echo
+                let msg = ControlMsg::Clipboard { text: update.text.to_string() };
+                if ctl_tx.send(msg).await.is_err() { break; }
             }
 
             _ = host_stats_timer.tick() => {
@@ -533,6 +557,7 @@ async fn video_task(
 /// Latency-critical handling happens *right here* — input events go straight
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
+#[allow(clippy::too_many_arguments)]
 async fn incoming_pump(
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
@@ -540,6 +565,8 @@ async fn incoming_pump(
     ctl_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
     handle: Arc<ClientHandle>,
+    clipboard: Arc<crate::clipboard::ClipboardService>,
+    client_id: u64,
 ) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
@@ -590,6 +617,21 @@ async fn incoming_pump(
                         }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        ControlMsg::Clipboard { text } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard push (no grant)");
+                            } else if text.len() > ndsp_protocol::MAX_CLIPBOARD_TEXT_BYTES {
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "clipboard_too_large".into(),
+                                    message: format!(
+                                        "clipboard text exceeds {} bytes",
+                                        ndsp_protocol::MAX_CLIPBOARD_TEXT_BYTES
+                                    ),
+                                });
+                            } else {
+                                clipboard.apply_remote(client_id, text);
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");

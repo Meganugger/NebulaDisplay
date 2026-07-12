@@ -135,6 +135,55 @@ for (let i = 0; i < 100 && frames.length < 2; i++) await sleep(100);
 if (frames.length < 2) fail("no frames after reconnect");
 console.log("token reconnect OK, frames flowing");
 s2.close();
+await sleep(300);
+
+// ---- 2b. clipboard sync (grant → push → fan-out to the other viewer) -------
+{
+  const deviceId = store.get("ndsp.deviceId");
+  if (!deviceId) fail("no stored device id after pairing");
+
+  const mkEvents = () => {
+    const st = { clipboard: [], closed: null };
+    st.events = {
+      onVideo: () => {},
+      onControl: (m) => {
+        if (m.type === "clipboard") st.clipboard.push(m.text);
+      },
+      onClose: (r) => (st.closed = r),
+    };
+    return st;
+  };
+  const ea = mkEvents();
+  const eb = mkEvents();
+  const sa = await Session.connect(hostAddr, null, "Clip A", ea.events).catch((e) =>
+    fail(`clip A reconnect failed: ${e.message}`),
+  );
+  if (sa.info.clipboardAllowed) fail("clipboard must be denied by default");
+
+  // Grant via the loopback panel API (what the panel toggle calls).
+  const res = await fetch("http://127.0.0.1:41998/api/clipboard-grant", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId, allowed: true }),
+  });
+  if (!res.ok) fail(`clipboard-grant API: ${res.status}`);
+
+  const sb = await Session.connect(hostAddr, null, "Clip B", eb.events).catch((e) =>
+    fail(`clip B reconnect failed: ${e.message}`),
+  );
+  if (!sb.info.clipboardAllowed) fail("grant must be reflected in auth_ok");
+
+  await sa.send({ type: "clipboard", text: "cross-stack clipboard ✓" });
+  for (let i = 0; i < 100 && eb.clipboard.length === 0; i++) await sleep(100);
+  if (eb.clipboard[0] !== "cross-stack clipboard ✓") {
+    fail(`clipboard fan-out failed: got ${JSON.stringify(eb.clipboard)}`);
+  }
+  if (ea.clipboard.length !== 0) fail("origin session must not receive its own clipboard echo");
+  console.log("clipboard sync OK (grant, push, fan-out, no echo)");
+  sa.close();
+  sb.close();
+  await sleep(300);
+}
 
 // ---- 3. wrong PIN must fail cleanly ----------------------------------------
 store.clear(); // forget credentials → forces pairing path

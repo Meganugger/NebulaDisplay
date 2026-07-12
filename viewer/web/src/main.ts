@@ -29,6 +29,7 @@ const statsOverlay = $("stats-overlay");
 const inputDenied = $("input-denied");
 const toast = $("toast");
 const remoteCursor = $<HTMLImageElement>("remote-cursor");
+const clipboardBtn = $<HTMLButtonElement>("clipboard-btn");
 
 let session: Session | null = null;
 let renderer: Renderer | null = null;
@@ -38,6 +39,10 @@ let pingTimer: number | undefined;
 const clock = new ClockSync();
 let hostStats: HostStats | null = null;
 let inputAllowed = false;
+/** Clipboard sync grant (deny by default; host panel toggles it live). */
+let clipboardAllowed = false;
+/** Last clipboard text received from the host (manual-copy fallback). */
+let hostClipboard: string | null = null;
 /** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
 let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
@@ -134,6 +139,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
       showToast(`Video error: ${e.message}`, 8000);
     };
     inputAllowed = s.info.inputAllowed;
+    clipboardAllowed = s.info.clipboardAllowed;
     userDisconnected = false; // fresh session — clear any stale flag
     enterViewer(s);
   } catch (e) {
@@ -194,6 +200,31 @@ function onControl(msg: ControlMsg): void {
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
       break;
     }
+    case "clipboard_grant": {
+      clipboardAllowed = Boolean(msg.allowed);
+      refreshClipboardUi();
+      showToast(
+        clipboardAllowed ? "Host enabled clipboard sync" : "Host disabled clipboard sync",
+      );
+      break;
+    }
+    case "clipboard": {
+      const text = String(msg.text ?? "");
+      hostClipboard = text;
+      // Best effort into the local clipboard; insecure contexts (plain-HTTP
+      // LAN) have no async clipboard API — Ctrl/Cmd+C in the viewer then
+      // serves the received text (see the global "copy" handler).
+      const cb = navigator.clipboard;
+      if (cb && typeof cb.writeText === "function") {
+        cb.writeText(text).then(
+          () => showToast("Clipboard synced from host"),
+          () => showToast("Host clipboard received — press Ctrl/Cmd+C here to copy"),
+        );
+      } else {
+        showToast("Host clipboard received — press Ctrl/Cmd+C here to copy");
+      }
+      break;
+    }
     case "cursor_shape": {
       // RGBA8 → canvas → data URL for the overlay <img>.
       const w = Number(msg.width);
@@ -225,6 +256,9 @@ function onControl(msg: ControlMsg): void {
       break;
     case "error":
       console.warn("host error", msg);
+      if (msg.code === "clipboard_too_large") {
+        showToast("Host rejected clipboard: too large (256 KiB max)");
+      }
       break;
   }
 }
@@ -257,6 +291,59 @@ function refreshInputBadge(): void {
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
 }
 
+function refreshClipboardUi(): void {
+  clipboardBtn.style.display = session && clipboardAllowed ? "" : "none";
+}
+
+/** Protocol-level clipboard size cap (must match the host). */
+const MAX_CLIPBOARD_TEXT_BYTES = 256 * 1024;
+
+function sendClipboardText(text: string): void {
+  if (!session || !clipboardAllowed || !text) return;
+  if (new TextEncoder().encode(text).length > MAX_CLIPBOARD_TEXT_BYTES) {
+    showToast("Clipboard too large to sync (256 KiB max)");
+    return;
+  }
+  void session.send({ type: "clipboard", text });
+  showToast("Clipboard sent to host");
+}
+
+/** Toolbar action: read this device's clipboard (or prompt) and send it. */
+async function sendLocalClipboard(): Promise<void> {
+  const cb = navigator.clipboard;
+  if (cb && typeof cb.readText === "function") {
+    try {
+      const text = await cb.readText();
+      if (text) return sendClipboardText(text);
+    } catch {
+      /* permission denied — fall through to the prompt */
+    }
+  }
+  const text = window.prompt("Paste the text to send to the host:");
+  if (text) sendClipboardText(text);
+}
+
+// Ctrl/Cmd+V anywhere in the viewer pushes the pasted text to the host;
+// Ctrl/Cmd+C serves the last host clipboard (works on insecure contexts
+// where the async clipboard API doesn't exist). Both only act with a live
+// session and an active clipboard grant.
+window.addEventListener("paste", (ev: ClipboardEvent) => {
+  if (!session || !clipboardAllowed) return;
+  const text = ev.clipboardData?.getData("text");
+  if (text) {
+    ev.preventDefault();
+    sendClipboardText(text);
+  }
+});
+window.addEventListener("copy", (ev: ClipboardEvent) => {
+  if (!session || !clipboardAllowed || hostClipboard === null) return;
+  // Don't hijack a real local selection (e.g. in the connect form).
+  if ((window.getSelection()?.toString() ?? "") !== "") return;
+  ev.preventDefault();
+  ev.clipboardData?.setData("text/plain", hostClipboard);
+  showToast("Copied host clipboard");
+});
+
 function enterViewer(s: Session): void {
   connectScreen.style.display = "none";
   viewerScreen.classList.add("active");
@@ -272,6 +359,7 @@ function enterViewer(s: Session): void {
   );
   input.attach();
   refreshInputBadge();
+  refreshClipboardUi();
 
   // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
   // measurable cost.
@@ -330,6 +418,9 @@ function endSession(reason: string): void {
   session = null;
   hostStats = null;
   cursorPos = null;
+  clipboardAllowed = false;
+  hostClipboard = null;
+  refreshClipboardUi();
   remoteCursor.style.display = "none";
   remoteCursor.removeAttribute("src");
   viewerScreen.classList.remove("active");
@@ -344,6 +435,7 @@ function round1(n: number): number {
 
 // --- toolbar wiring -------------------------------------------------------
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
+clipboardBtn.onclick = () => void sendLocalClipboard();
 if (fullscreen.supported) {
   $("fullscreen-btn").onclick = () => {
     if (fullscreen.element()) void fullscreen.exit();

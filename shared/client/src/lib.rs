@@ -9,7 +9,11 @@ use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
-    crypto::{self, HandshakeKeys},
+    crypto::{
+        self,
+        pake::{PakeShare, Role},
+        HandshakeKeys,
+    },
     envelope::{Channel, Direction, Opener, Sealer},
     media::VideoFrame,
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, DisplayMode},
@@ -30,8 +34,12 @@ pub struct Credentials {
 }
 
 pub enum Auth<'a> {
-    /// First contact: pair with the PIN shown on the host.
+    /// First contact: pair with the PIN shown on the host (SPAKE2 — a
+    /// recorded transcript cannot be ground offline).
     Pin(&'a str),
+    /// First contact via the legacy PIN-bound-HKDF method. Only useful to
+    /// talk to old hosts or to exercise the host's legacy path in tests.
+    PinLegacy(&'a str),
     /// Returning device.
     Token(&'a Credentials),
 }
@@ -44,6 +52,7 @@ pub struct Session {
     pub codec: Codec,
     pub mode: DisplayMode,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     /// Set when this connection performed a fresh pairing.
     pub new_credentials: Option<Credentials>,
     pub server_fingerprint: String,
@@ -69,7 +78,8 @@ pub async fn connect(
         .with_context(|| format!("connecting {url}"))?;
 
     let auth_method = match &auth {
-        Auth::Pin(_) => AuthMethod::Pair,
+        Auth::Pin(_) => AuthMethod::PairPake,
+        Auth::PinLegacy(_) => AuthMethod::Pair,
         Auth::Token(c) => AuthMethod::Token {
             device_id: c.device_id.clone(),
         },
@@ -107,9 +117,20 @@ pub async fn connect(
         }
     }
 
-    // Ephemeral ECDH (both auth paths).
-    let keys = HandshakeKeys::generate();
-    let client_pub = keys.public_bytes().to_vec();
+    // Handshake share: SPAKE2 for PIN pairing (default), plain ephemeral
+    // ECDH for legacy pairing and token reconnect.
+    enum Share {
+        Pake(PakeShare),
+        Ecdh(HandshakeKeys),
+    }
+    let share = match &auth {
+        Auth::Pin(pin) => Share::Pake(PakeShare::new(Role::Client, pin, &nonce)),
+        Auth::PinLegacy(_) | Auth::Token(_) => Share::Ecdh(HandshakeKeys::generate()),
+    };
+    let client_pub = match &share {
+        Share::Pake(p) => p.public_bytes().to_vec(),
+        Share::Ecdh(k) => k.public_bytes().to_vec(),
+    };
     send_json(
         &mut ws,
         &ControlMsg::PairStart {
@@ -128,15 +149,31 @@ pub async fn connect(
         ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
         other => bail!("expected pair_challenge, got {other:?}"),
     };
-    let shared = keys
-        .agree(&server_pub)
-        .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
-    let session_key = shared.session_key(&salt, &nonce);
+
+    // Derive (pair_key, session_key) per method.
+    let (pair_key, session_key) = match share {
+        Share::Pake(p) => {
+            let keys = p
+                .complete(&server_pub, &salt, &nonce)
+                .map_err(|e| anyhow::anyhow!("PAKE: {e}"))?;
+            (Some(keys.pair_key), keys.session_key)
+        }
+        Share::Ecdh(k) => {
+            let shared = k
+                .agree(&server_pub)
+                .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
+            let pair_key = match &auth {
+                Auth::PinLegacy(pin) => Some(shared.pairing_key(&salt, pin, &nonce)),
+                _ => None,
+            };
+            (pair_key, shared.session_key(&salt, &nonce))
+        }
+    };
 
     let mut new_credentials = None;
     match auth {
-        Auth::Pin(pin) => {
-            let pair_key = shared.pairing_key(&salt, pin, &nonce);
+        Auth::Pin(_) | Auth::PinLegacy(_) => {
+            let pair_key = pair_key.expect("pair key derived for PIN auth");
             let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
             confirm.extend_from_slice(&nonce);
             let sealed = crypto::seal(&pair_key, &confirm, b"");
@@ -186,12 +223,13 @@ pub async fn connect(
         }
     }
 
-    let (codec, mode, input_allowed) = match recv_json(&mut ws).await? {
+    let (codec, mode, input_allowed, clipboard_allowed) = match recv_json(&mut ws).await? {
         ControlMsg::AuthOk {
             codec,
             mode,
             input_allowed,
-        } => (codec, mode, input_allowed),
+            clipboard_allowed,
+        } => (codec, mode, input_allowed, clipboard_allowed),
         ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
         other => bail!("expected auth_ok, got {other:?}"),
     };
@@ -203,6 +241,7 @@ pub async fn connect(
         codec,
         mode,
         input_allowed,
+        clipboard_allowed,
         new_credentials,
         server_fingerprint,
     })
