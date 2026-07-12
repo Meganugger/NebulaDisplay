@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # audiopus_sys (Opus audio) bundles an opus tree whose CMakeLists declares
+  # cmake_minimum_required(3.1); CMake ≥ 4 (current GitHub runners) refuses
+  # <3.5 projects without this opt-in. Harmlessly ignored by older CMake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   rust-linux:
