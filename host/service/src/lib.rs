@@ -104,11 +104,24 @@ impl EmbeddedHost {
         })
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.state.trigger_shutdown();
-        for t in self.tasks {
+        for t in std::mem::take(&mut self.tasks) {
             t.abort();
             let _ = t.await; // waits for the capture blocking thread to exit
+        }
+    }
+}
+
+/// A test that panics (or an embedder that forgets `shutdown`) must not
+/// leave the capture `spawn_blocking` thread running: tokio's runtime drop
+/// waits for blocking tasks, which would turn any failed assertion into an
+/// indefinite hang. Signal shutdown so the capture loop exits on its own.
+impl Drop for EmbeddedHost {
+    fn drop(&mut self) {
+        self.state.trigger_shutdown();
+        for t in &self.tasks {
+            t.abort();
         }
     }
 }

@@ -30,7 +30,18 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> String {
 }
 
 /// Load the persisted TLS identity or create a fresh self-signed one.
+///
+/// Process-synchronized: the server accept loop, the startup banner and the
+/// panel status endpoint may all ask for the identity around the same time —
+/// without the lock, two callers could each generate a *different*
+/// certificate and interleave the cert/key writes (mismatched pin, or a
+/// cert/key pair that doesn't match at all).
 pub fn load_or_create(data_dir: &Path) -> anyhow::Result<TlsIdentity> {
+    static IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = IDENTITY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let cert_path = data_dir.join(CERT_FILE);
     let key_path = data_dir.join(KEY_FILE);
 
