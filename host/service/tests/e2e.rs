@@ -19,6 +19,10 @@ fn client_info(name: &str) -> ndsp_protocol::messages::ClientInfo {
 }
 
 async fn start_host(tag: &str) -> EmbeddedHost {
+    start_host_with(tag, EmbeddedOptions::default()).await
+}
+
+async fn start_host_with(tag: &str, opts: EmbeddedOptions) -> EmbeddedHost {
     let dir = std::env::temp_dir().join(format!("ndsp-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     EmbeddedHost::start(EmbeddedOptions {
@@ -26,6 +30,7 @@ async fn start_host(tag: &str) -> EmbeddedHost {
         name: format!("e2e-host-{tag}"),
         capture: (320, 240),
         max_fps: 30,
+        ..opts
     })
     .await
     .expect("host starts")
@@ -74,7 +79,7 @@ async fn pairing_streams_video_and_ping_pong_works() {
                 assert!(t1_us > 0);
                 got_pong = true;
             }
-            Incoming::Control(_) => {}
+            Incoming::Audio(_) | Incoming::Control(_) => {}
             Incoming::Closed => panic!("server closed unexpectedly"),
         }
     }
@@ -92,6 +97,84 @@ async fn pairing_streams_video_and_ping_pong_works() {
     #[cfg(feature = "h264")]
     assert_eq!(frames[0].codec, Codec::H264, "H264 preferred when offered");
 
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Older clients (mobile viewers) still pair via the legacy PIN-bound-HKDF
+/// method — the host must keep accepting it by default, and the issued
+/// token must interoperate with normal token reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_still_works_and_tokens_interoperate() {
+    let host = start_host("legacy").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Old phone");
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::PinLegacy(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("legacy pairing succeeds");
+    let creds = session.new_credentials.clone().expect("credentials issued");
+    session.close().await;
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info,
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("token reconnect after legacy pairing");
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// With `allow_legacy_pair = false`, legacy pairing is refused with a clear
+/// error while SPAKE2 pairing keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_can_be_disabled() {
+    let host = start_host_with(
+        "nolegacy",
+        EmbeddedOptions {
+            allow_legacy_pair: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pin = host.state.pins.current_pin();
+
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Old phone"),
+            Auth::PinLegacy(&pin),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "legacy pairing disabled",
+    );
+    assert!(
+        format!("{err:#}").contains("legacy"),
+        "error should explain legacy pairing is off: {err:#}"
+    );
+
+    // SPAKE2 path unaffected.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("New phone"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("SPAKE2 pairing works with legacy disabled");
     session.close().await;
     host.shutdown().await;
 }
@@ -373,7 +456,7 @@ async fn video_keeps_flowing_under_input_flood() {
         loop {
             match tokio::time::timeout(Duration::from_micros(100), session.recv()).await {
                 Ok(Ok(Incoming::Video(_))) => frames += 1,
-                Ok(Ok(Incoming::Control(_))) => {}
+                Ok(Ok(Incoming::Audio(_) | Incoming::Control(_))) => {}
                 Ok(Ok(Incoming::Closed)) => panic!("server closed during input flood"),
                 Ok(Err(e)) => panic!("recv error during flood: {e:#}"),
                 Err(_) => break, // nothing pending

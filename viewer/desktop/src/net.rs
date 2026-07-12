@@ -166,6 +166,10 @@ async fn session_loop(
                     session.send(&ControlMsg::RequestKeyframe).await?;
                 }
             },
+            // Audio playback is not implemented in the desktop viewer yet
+            // (see docs/ROADMAP.md); it also never requests audio, so this
+            // arm is defensive.
+            Ok(Ok(Incoming::Audio(_))) => {}
             Ok(Ok(Incoming::Control(msg))) => match msg {
                 ControlMsg::InputGrant { allowed } => {
                     shared.input_allowed.store(allowed, Ordering::Relaxed);

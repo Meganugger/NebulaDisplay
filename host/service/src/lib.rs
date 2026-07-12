@@ -28,6 +28,23 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Accept the legacy (pre-PAKE) pairing method.
+    pub allow_legacy_pair: bool,
+    /// Stream a synthetic test tone as audio (channel 3) for e2e tests.
+    pub audio: bool,
+}
+
+impl Default for EmbeddedOptions {
+    fn default() -> Self {
+        Self {
+            data_dir: std::env::temp_dir().join("ndsp-embedded"),
+            name: "embedded-host".into(),
+            capture: (320, 240),
+            max_fps: 30,
+            allow_legacy_pair: true,
+            audio: false,
+        }
+    }
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,6 +65,8 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
+                allow_legacy_pair: opts.allow_legacy_pair,
+                audio: opts.audio,
                 ..Default::default()
             },
         };

@@ -1,18 +1,20 @@
 //! Server-side authentication state machine (transport-agnostic → unit
 //! testable without sockets).
 //!
-//! Both auth paths share the ephemeral ECDH exchange so every session gets a
-//! fresh AES-256-GCM key:
+//! Every auth path yields a fresh AES-256-GCM session key:
 //!
-//! * **Pair** (first contact) — client must prove knowledge of the on-screen
-//!   PIN by sealing a confirmation under the PIN-bound pairing key.
-//! * **Token** (returning device) — client proves possession of its trust
-//!   token via a hash bound to the full handshake transcript.
+//! * **PairSpake2** (first contact, preferred) — SPAKE2 PAKE over the PIN;
+//!   passive transcripts cannot be PIN-ground offline (`ndsp_protocol::pake`).
+//! * **Pair** (first contact, legacy) — ephemeral ECDH + PIN-bound HKDF;
+//!   kept for older clients, can be disabled via `allow_legacy_pair = false`.
+//! * **Token** (returning device) — ephemeral ECDH; client proves possession
+//!   of its trust token via a hash bound to the full handshake transcript.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys, SharedSecret},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, ServerInfo},
+    pake::{PakeKeys, Spake2Server},
     PROTOCOL_VERSION,
 };
 use std::net::IpAddr;
@@ -34,13 +36,23 @@ pub struct AuthComplete {
 enum Phase {
     AwaitHello,
     AwaitPairStart,
-    AwaitProof {
+    AwaitProof(ProofSecret),
+    Done,
+}
+
+/// Key material carried between `PairStart`/`PairChallenge` and the proof
+/// message, per auth method.
+enum ProofSecret {
+    /// Legacy pairing + token reconnect (ephemeral ECDH).
+    Ecdh {
         shared: Box<SharedSecret>,
         salt: [u8; 16],
         client_pub: Vec<u8>,
         server_pub: Vec<u8>,
     },
-    Done,
+    /// SPAKE2 pairing: the exchange completes at `PairStart` server-side;
+    /// only the derived keys are kept.
+    Spake2 { keys: Box<PakeKeys> },
 }
 
 pub struct ServerHandshake {
@@ -132,8 +144,18 @@ impl ServerHandshake {
                         "protocol too old",
                     );
                 }
+                if matches!(auth, AuthMethod::Pair) && !self.state.cfg.file.allow_legacy_pair {
+                    return Step::reject(
+                        ControlMsg::AuthErr {
+                            error: "legacy PIN pairing is disabled on this host; \
+                                    update the viewer (SPAKE2 pairing required)"
+                                .into(),
+                        },
+                        "legacy pairing disabled",
+                    );
+                }
                 info!(device = %client.device_id, name = %client.name, platform = %client.platform, "hello");
-                let pairing = matches!(auth, AuthMethod::Pair);
+                let pairing = matches!(auth, AuthMethod::Pair | AuthMethod::PairSpake2);
                 self.client = Some(client);
                 self.auth = Some(auth);
                 self.client_codecs = codecs;
@@ -152,7 +174,10 @@ impl ServerHandshake {
 
             (Phase::AwaitPairStart, ControlMsg::PairStart { client_pubkey }) => {
                 // Rate-limit before any expensive crypto.
-                if matches!(self.auth, Some(AuthMethod::Pair)) {
+                if matches!(
+                    self.auth,
+                    Some(AuthMethod::Pair) | Some(AuthMethod::PairSpake2)
+                ) {
                     if let PinGate::LockedOut { retry_after } = self.state.pins.gate(self.peer_ip) {
                         return Step::reject(
                             ControlMsg::AuthErr {
@@ -173,6 +198,35 @@ impl ServerHandshake {
                         "bad pubkey b64",
                     );
                 };
+
+                if matches!(self.auth, Some(AuthMethod::PairSpake2)) {
+                    // SPAKE2: pA arrives; produce pB + salt, derive keys now.
+                    let pin = self.state.pins.current_pin();
+                    let server = Spake2Server::start(&pin, &self.nonce);
+                    let server_pub = server.public_bytes().to_vec();
+                    let salt: [u8; 16] = crypto::random_bytes();
+                    let keys = match server.finish(&client_pub, &self.nonce, &salt) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            return Step::reject(
+                                ControlMsg::AuthErr {
+                                    error: "invalid SPAKE2 element".into(),
+                                },
+                                "bad spake2 element",
+                            )
+                        }
+                    };
+                    let reply = ControlMsg::PairChallenge {
+                        server_pubkey: B64.encode(&server_pub),
+                        salt: B64.encode(salt),
+                    };
+                    self.phase = Phase::AwaitProof(ProofSecret::Spake2 {
+                        keys: Box::new(keys),
+                    });
+                    return Step::reply(reply);
+                }
+
+                // Legacy pairing / token reconnect: ephemeral ECDH.
                 let keys = HandshakeKeys::generate();
                 let server_pub = keys.public_bytes().to_vec();
                 let shared = match keys.agree(&client_pub) {
@@ -191,17 +245,20 @@ impl ServerHandshake {
                     server_pubkey: B64.encode(&server_pub),
                     salt: B64.encode(salt),
                 };
-                self.phase = Phase::AwaitProof {
+                self.phase = Phase::AwaitProof(ProofSecret::Ecdh {
                     shared: Box::new(shared),
                     salt,
                     client_pub,
                     server_pub,
-                };
+                });
                 Step::reply(reply)
             }
 
-            (Phase::AwaitProof { shared, salt, .. }, ControlMsg::PairConfirm { sealed })
-                if matches!(self.auth, Some(AuthMethod::Pair)) =>
+            (Phase::AwaitProof(secret), ControlMsg::PairConfirm { sealed })
+                if matches!(
+                    self.auth,
+                    Some(AuthMethod::Pair) | Some(AuthMethod::PairSpake2)
+                ) =>
             {
                 let Ok(sealed) = B64.decode(&sealed) else {
                     return Step::reject(
@@ -213,8 +270,17 @@ impl ServerHandshake {
                         "bad confirm b64",
                     );
                 };
-                let pin = self.state.pins.current_pin();
-                let pair_key = shared.pairing_key(salt.as_ref(), &pin, &self.nonce);
+                // Both methods land here; only the key derivation differs.
+                let (pair_key, session_key) = match secret {
+                    ProofSecret::Ecdh { shared, salt, .. } => {
+                        let pin = self.state.pins.current_pin();
+                        (
+                            shared.pairing_key(salt.as_ref(), &pin, &self.nonce),
+                            shared.session_key(salt.as_ref(), &self.nonce),
+                        )
+                    }
+                    ProofSecret::Spake2 { keys } => (keys.pairing_key, keys.session_key),
+                };
                 let mut expected = crypto::CONFIRM_CONTEXT.to_vec();
                 expected.extend_from_slice(&self.nonce);
                 match crypto::open(&pair_key, &sealed, b"") {
@@ -240,7 +306,6 @@ impl ServerHandshake {
                             }
                         };
                         let sealed_token = crypto::seal(&pair_key, &token, b"token");
-                        let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let auth_ok = self.auth_ok(false);
                         let codec = self.select_codec();
                         self.phase = Phase::Done;
@@ -277,19 +342,25 @@ impl ServerHandshake {
                 }
             }
 
-            (
-                Phase::AwaitProof {
-                    shared,
-                    salt,
-                    client_pub,
-                    server_pub,
-                },
-                ControlMsg::TokenProof { proof },
-            ) => {
+            (Phase::AwaitProof(secret), ControlMsg::TokenProof { proof }) => {
                 let Some(AuthMethod::Token { device_id }) = self.auth.clone() else {
                     return Step::reject(
                         ControlMsg::AuthErr {
                             error: "token proof without token auth".into(),
+                        },
+                        "protocol misuse",
+                    );
+                };
+                let ProofSecret::Ecdh {
+                    shared,
+                    salt,
+                    client_pub,
+                    server_pub,
+                } = secret
+                else {
+                    return Step::reject(
+                        ControlMsg::AuthErr {
+                            error: "token proof after SPAKE2 start".into(),
                         },
                         "protocol misuse",
                     );

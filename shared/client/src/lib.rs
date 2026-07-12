@@ -11,8 +11,9 @@ use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys},
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, VideoFrame},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, DisplayMode},
+    pake::Spake2Client,
     PROTOCOL_VERSION, WS_PATH,
 };
 use tokio::net::TcpStream;
@@ -29,9 +30,15 @@ pub struct Credentials {
     pub host_fingerprint: String,
 }
 
+#[derive(Clone, Copy)]
 pub enum Auth<'a> {
-    /// First contact: pair with the PIN shown on the host.
+    /// First contact: pair with the PIN shown on the host. Uses SPAKE2
+    /// (PAKE — no offline PIN grinding from transcripts) and transparently
+    /// falls back to the legacy method against pre-SPAKE2 hosts.
     Pin(&'a str),
+    /// First contact, forcing the legacy PIN-bound-HKDF pairing (testing /
+    /// very old hosts).
+    PinLegacy(&'a str),
     /// Returning device.
     Token(&'a Credentials),
 }
@@ -52,11 +59,44 @@ pub struct Session {
 /// Anything a session can yield to the app.
 pub enum Incoming {
     Video(VideoFrame),
+    Audio(AudioFrame),
     Control(ControlMsg),
     Closed,
 }
 
 pub async fn connect(
+    host: &str,
+    port: u16,
+    client: ClientInfo,
+    auth: Auth<'_>,
+    codecs: Vec<Codec>,
+) -> anyhow::Result<Session> {
+    if let Auth::Pin(pin) = auth {
+        // Prefer SPAKE2. A pre-SPAKE2 host cannot parse the auth method and
+        // drops the socket during the handshake — retry once with legacy.
+        return match connect_once(host, port, client.clone(), Auth::Pin(pin), codecs.clone()).await
+        {
+            Err(e) if handshake_dropped(&e) => {
+                tracing::warn!(
+                    "host closed during SPAKE2 pairing (pre-PAKE host?); retrying legacy pairing"
+                );
+                connect_once(host, port, client, Auth::PinLegacy(pin), codecs).await
+            }
+            r => r,
+        };
+    }
+    connect_once(host, port, client, auth, codecs).await
+}
+
+/// True when the failure looks like "the server dropped the socket during
+/// the plaintext handshake" (what an older host does on an unknown auth
+/// method) rather than an explicit rejection like a wrong PIN.
+fn handshake_dropped(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    msg.contains("closed") && msg.contains("handshake")
+}
+
+async fn connect_once(
     host: &str,
     port: u16,
     client: ClientInfo,
@@ -69,7 +109,8 @@ pub async fn connect(
         .with_context(|| format!("connecting {url}"))?;
 
     let auth_method = match &auth {
-        Auth::Pin(_) => AuthMethod::Pair,
+        Auth::Pin(_) => AuthMethod::PairSpake2,
+        Auth::PinLegacy(_) => AuthMethod::Pair,
         Auth::Token(c) => AuthMethod::Token {
             device_id: c.device_id.clone(),
         },
@@ -107,9 +148,20 @@ pub async fn connect(
         }
     }
 
-    // Ephemeral ECDH (both auth paths).
-    let keys = HandshakeKeys::generate();
-    let client_pub = keys.public_bytes().to_vec();
+    // First flight: SPAKE2 element for PAKE pairing, ephemeral ECDH public
+    // key for the legacy/token paths (same message either way).
+    enum FirstFlight<'p> {
+        Spake2(Spake2Client),
+        Ecdh(HandshakeKeys, Auth<'p>),
+    }
+    let flight = match auth {
+        Auth::Pin(pin) => FirstFlight::Spake2(Spake2Client::start(pin, &nonce)),
+        other => FirstFlight::Ecdh(HandshakeKeys::generate(), other),
+    };
+    let client_pub = match &flight {
+        FirstFlight::Spake2(c) => c.public_bytes().to_vec(),
+        FirstFlight::Ecdh(k, _) => k.public_bytes().to_vec(),
+    };
     send_json(
         &mut ws,
         &ControlMsg::PairStart {
@@ -128,61 +180,78 @@ pub async fn connect(
         ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
         other => bail!("expected pair_challenge, got {other:?}"),
     };
-    let shared = keys
-        .agree(&server_pub)
-        .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
-    let session_key = shared.session_key(&salt, &nonce);
 
+    // Second flight: prove the PIN (pairing) or the trust token (reconnect),
+    // and settle on the session key.
     let mut new_credentials = None;
-    match auth {
-        Auth::Pin(pin) => {
-            let pair_key = shared.pairing_key(&salt, pin, &nonce);
-            let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
-            confirm.extend_from_slice(&nonce);
-            let sealed = crypto::seal(&pair_key, &confirm, b"");
-            send_json(
-                &mut ws,
-                &ControlMsg::PairConfirm {
-                    sealed: B64.encode(sealed),
-                },
-            )
-            .await?;
-            match recv_json(&mut ws).await? {
-                ControlMsg::PairResult {
-                    ok: true,
-                    sealed_token: Some(tok),
-                    ..
-                } => {
-                    let sealed = B64.decode(tok).context("token b64")?;
-                    let token = crypto::open(&pair_key, &sealed, b"token")
-                        .map_err(|e| anyhow::anyhow!("token unseal: {e}"))?;
-                    new_credentials = Some(Credentials {
-                        device_id: client.device_id.clone(),
-                        token,
-                        host_fingerprint: server_fingerprint.clone(),
-                    });
-                }
-                ControlMsg::PairResult {
-                    ok: false, error, ..
-                } => {
-                    bail!(
-                        "pairing failed: {}",
-                        error.unwrap_or_else(|| "unknown".into())
+    let session_key: [u8; 32];
+    let pair_key: Option<[u8; 32]> = match flight {
+        FirstFlight::Spake2(c) => {
+            let keys = c
+                .finish(&server_pub, &nonce, &salt)
+                .map_err(|e| anyhow::anyhow!("SPAKE2: {e}"))?;
+            session_key = keys.session_key;
+            Some(keys.pairing_key)
+        }
+        FirstFlight::Ecdh(keys, auth) => {
+            let shared = keys
+                .agree(&server_pub)
+                .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
+            session_key = shared.session_key(&salt, &nonce);
+            match auth {
+                Auth::PinLegacy(pin) => Some(shared.pairing_key(&salt, pin, &nonce)),
+                Auth::Token(creds) => {
+                    let transcript = crypto::reauth_transcript(&nonce, &client_pub, &server_pub);
+                    let proof = crypto::token_proof(&creds.token, &transcript);
+                    send_json(
+                        &mut ws,
+                        &ControlMsg::TokenProof {
+                            proof: B64.encode(proof),
+                        },
                     )
+                    .await?;
+                    None
                 }
-                other => bail!("expected pair_result, got {other:?}"),
+                Auth::Pin(_) => unreachable!("Pin always takes the SPAKE2 flight"),
             }
         }
-        Auth::Token(creds) => {
-            let transcript = crypto::reauth_transcript(&nonce, &client_pub, &server_pub);
-            let proof = crypto::token_proof(&creds.token, &transcript);
-            send_json(
-                &mut ws,
-                &ControlMsg::TokenProof {
-                    proof: B64.encode(proof),
-                },
-            )
-            .await?;
+    };
+
+    if let Some(pair_key) = pair_key {
+        let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
+        confirm.extend_from_slice(&nonce);
+        let sealed = crypto::seal(&pair_key, &confirm, b"");
+        send_json(
+            &mut ws,
+            &ControlMsg::PairConfirm {
+                sealed: B64.encode(sealed),
+            },
+        )
+        .await?;
+        match recv_json(&mut ws).await? {
+            ControlMsg::PairResult {
+                ok: true,
+                sealed_token: Some(tok),
+                ..
+            } => {
+                let sealed = B64.decode(tok).context("token b64")?;
+                let token = crypto::open(&pair_key, &sealed, b"token")
+                    .map_err(|e| anyhow::anyhow!("token unseal: {e}"))?;
+                new_credentials = Some(Credentials {
+                    device_id: client.device_id.clone(),
+                    token,
+                    host_fingerprint: server_fingerprint.clone(),
+                });
+            }
+            ControlMsg::PairResult {
+                ok: false, error, ..
+            } => {
+                bail!(
+                    "pairing failed: {}",
+                    error.unwrap_or_else(|| "unknown".into())
+                )
+            }
+            other => bail!("expected pair_result, got {other:?}"),
         }
     }
 
@@ -239,7 +308,12 @@ impl Session {
                             let s = std::str::from_utf8(&pt).context("control utf8")?;
                             return Ok(Incoming::Control(ControlMsg::from_json(s)?));
                         }
-                        Channel::Audio => continue, // reserved
+                        Channel::Audio => {
+                            return Ok(Incoming::Audio(
+                                AudioFrame::decode(&pt)
+                                    .map_err(|e| anyhow::anyhow!("audio frame: {e}"))?,
+                            ))
+                        }
                     }
                 }
                 Message::Close(_) => return Ok(Incoming::Closed),

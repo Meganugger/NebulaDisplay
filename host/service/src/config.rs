@@ -29,6 +29,18 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Accept the legacy (pre-PAKE) PIN pairing method. On by default so
+    /// older viewers keep working; turn off to require SPAKE2 pairing
+    /// (removes the offline-PIN-grinding exposure entirely).
+    pub allow_legacy_pair: bool,
+    /// Capture and stream host audio (Opus on channel 3). **Off by default**;
+    /// even when on, each viewer must still explicitly request audio.
+    pub audio: bool,
+    /// Serve the viewer endpoint over HTTPS with a persistent self-signed
+    /// certificate (printed fingerprint enables pinning). Off by default —
+    /// NDSP traffic is end-to-end encrypted either way; HTTPS additionally
+    /// protects the *viewer page code* on hostile LANs.
+    pub https: bool,
 }
 
 impl Default for FileConfig {
@@ -40,6 +52,9 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            allow_legacy_pair: true,
+            audio: false,
+            https: false,
         }
     }
 }

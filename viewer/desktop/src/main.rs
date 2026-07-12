@@ -272,8 +272,16 @@ impl ApplicationHandler<UiWake> for App {
                 }
                 let w3c = keycode_to_w3c(code);
                 if let Some(codestr) = w3c {
+                    // Layout-aware value alongside the physical code so the
+                    // host can fall back to Unicode injection for characters
+                    // the scan-code table can't produce (non-US layouts).
+                    let key = match &event.logical_key {
+                        winit::keyboard::Key::Character(s) => Some(s.to_string()),
+                        _ => None,
+                    };
                     self.send_input(InputEvent::Key {
                         code: codestr.to_string(),
+                        key,
                         pressed: event.state == ElementState::Pressed,
                     });
                 }
