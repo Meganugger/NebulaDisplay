@@ -29,6 +29,9 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Per-event clipboard size cap in bytes (both directions). Oversized
+    /// transfers are dropped, never truncated.
+    pub clipboard_max_bytes: usize,
 }
 
 impl Default for FileConfig {
@@ -40,6 +43,7 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            clipboard_max_bytes: 256 * 1024,
         }
     }
 }

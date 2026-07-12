@@ -3,6 +3,7 @@
 
 pub mod adapt;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
@@ -52,12 +53,17 @@ impl EmbeddedHost {
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);
+        // Tests must be deterministic (and must not touch the CI machine's
+        // real clipboard), so the embedded host always uses the in-memory
+        // backend regardless of platform.
+        *state.clipboard.lock().unwrap() = Box::new(clipboard::MemoryClipboard::default());
 
         let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();
         let cap = tokio::spawn(async move {
             capture::run_capture_loop(cap_state, source).await;
         });
+        let clip = tokio::spawn(clipboard::run_poll_loop(state.clone()));
 
         // Bind explicitly so we know the ephemeral port before returning.
         let listener =
@@ -75,7 +81,7 @@ impl EmbeddedHost {
         Ok(Self {
             state,
             port,
-            tasks: vec![cap, srv],
+            tasks: vec![cap, clip, srv],
         })
     }
 

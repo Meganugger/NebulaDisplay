@@ -38,6 +38,11 @@ let pingTimer: number | undefined;
 const clock = new ClockSync();
 let hostStats: HostStats | null = null;
 let inputAllowed = false;
+let clipboardAllowed = false;
+/** Host clipboard text we could not write locally yet (needs a user gesture). */
+let pendingHostClipboard: string | null = null;
+/** Soft client-side cap mirroring the host's default clipboard_max_bytes. */
+const CLIPBOARD_SOFT_CAP = 256 * 1024;
 /** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
 let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
@@ -134,6 +139,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
       showToast(`Video error: ${e.message}`, 8000);
     };
     inputAllowed = s.info.inputAllowed;
+    clipboardAllowed = s.info.clipboardAllowed;
     userDisconnected = false; // fresh session — clear any stale flag
     enterViewer(s);
   } catch (e) {
@@ -194,6 +200,17 @@ function onControl(msg: ControlMsg): void {
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
       break;
     }
+    case "clipboard_grant": {
+      clipboardAllowed = Boolean(msg.allowed);
+      if (!clipboardAllowed) pendingHostClipboard = null;
+      refreshClipboardButtons();
+      showToast(clipboardAllowed ? "Host enabled clipboard sync" : "Host disabled clipboard sync");
+      break;
+    }
+    case "clipboard": {
+      onHostClipboard(String(msg.text));
+      break;
+    }
     case "cursor_shape": {
       // RGBA8 → canvas → data URL for the overlay <img>.
       const w = Number(msg.width);
@@ -252,6 +269,75 @@ function placeRemoteCursor(): void {
   remoteCursor.style.transform = `translate(${x}px, ${y}px) scale(${box.scale})`;
 }
 
+/** Host clipboard arrived: try to write it locally; browsers that refuse
+ * (insecure context / no permission) get a one-click Copy button instead —
+ * `execCommand` fallbacks only work inside a user gesture. */
+function onHostClipboard(text: string): void {
+  pendingHostClipboard = text;
+  const write = navigator.clipboard?.writeText?.bind(navigator.clipboard);
+  if (write) {
+    write(text).then(
+      () => {
+        pendingHostClipboard = null;
+        refreshClipboardButtons();
+        showToast("Host clipboard received ✓");
+      },
+      () => {
+        refreshClipboardButtons();
+        showToast("Host clipboard received — press 📥 Copy");
+      },
+    );
+  } else {
+    refreshClipboardButtons();
+    showToast("Host clipboard received — press 📥 Copy");
+  }
+}
+
+function copyViaTextarea(text: string): boolean {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+async function sendClipboardToHost(): Promise<void> {
+  if (!session || !clipboardAllowed) return;
+  let text: string | null = null;
+  const read = navigator.clipboard?.readText?.bind(navigator.clipboard);
+  if (read) {
+    try {
+      text = await read();
+    } catch {
+      text = null; // permission denied — fall through to manual paste
+    }
+  }
+  if (text === null) text = prompt("Paste the text to send to the host:");
+  if (!text) return;
+  if (text.length > CLIPBOARD_SOFT_CAP) {
+    showToast("Clipboard too large to sync (256 KiB cap)");
+    return;
+  }
+  void session.send({ type: "clipboard", text });
+  showToast("Clipboard sent to host ✓");
+}
+
+function refreshClipboardButtons(): void {
+  $("clip-send-btn").style.display = session && clipboardAllowed ? "" : "none";
+  $("clip-recv-btn").style.display =
+    session && clipboardAllowed && pendingHostClipboard !== null ? "" : "none";
+}
+
 function refreshInputBadge(): void {
   const wantsInput = (input?.mode ?? "view_only") !== "view_only";
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
@@ -272,6 +358,7 @@ function enterViewer(s: Session): void {
   );
   input.attach();
   refreshInputBadge();
+  refreshClipboardButtons();
 
   // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
   // measurable cost.
@@ -330,6 +417,9 @@ function endSession(reason: string): void {
   session = null;
   hostStats = null;
   cursorPos = null;
+  clipboardAllowed = false;
+  pendingHostClipboard = null;
+  refreshClipboardButtons();
   remoteCursor.style.display = "none";
   remoteCursor.removeAttribute("src");
   viewerScreen.classList.remove("active");
@@ -343,6 +433,24 @@ function round1(n: number): number {
 }
 
 // --- toolbar wiring -------------------------------------------------------
+$("clip-send-btn").onclick = () => void sendClipboardToHost();
+$("clip-recv-btn").onclick = () => {
+  const text = pendingHostClipboard;
+  if (text === null) return;
+  const done = () => {
+    pendingHostClipboard = null;
+    refreshClipboardButtons();
+    showToast("Copied ✓");
+  };
+  const write = navigator.clipboard?.writeText?.bind(navigator.clipboard);
+  if (write) {
+    write(text).then(done, () => {
+      if (copyViaTextarea(text)) done();
+      else showToast("Copy failed — your browser blocked clipboard access");
+    });
+  } else if (copyViaTextarea(text)) done();
+  else showToast("Copy failed — your browser blocked clipboard access");
+};
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
 if (fullscreen.supported) {
   $("fullscreen-btn").onclick = () => {

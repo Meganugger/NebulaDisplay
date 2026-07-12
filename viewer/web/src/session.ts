@@ -1,10 +1,9 @@
-// NDSP session: connect → (pair | token reconnect) → encrypted session.
+// NDSP session: connect → (PAKE pair | token reconnect) → encrypted session.
 
 import { caps, probeH264Decode } from "./caps";
 import {
   b64decode,
   b64encode,
-  CONFIRM_CONTEXT,
   agree,
   clearCredentials,
   deviceId,
@@ -12,12 +11,11 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
   saveCredentials,
-  seal,
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { pakeClientStart } from "./pake";
 import {
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
@@ -45,6 +43,7 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
@@ -97,7 +96,11 @@ export class Session {
         // channel (CursorShape/CursorPos) — never baked into video frames.
         features: ["cursor"],
       },
-      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
+      // First contact pairs via SPAKE2 PAKE (the recorded transcript is not
+      // offline-grindable, unlike the legacy PIN-HKDF path kept for older
+      // native clients). The web viewer is served by the host itself, so the
+      // two always speak the same protocol revision.
+      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pake" },
       codecs: await supportedCodecs(),
     });
 
@@ -113,34 +116,42 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
-    const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
-    const challenge = await nextText();
-    if (challenge.type === "auth_err") throw new Error(String(challenge.error));
-    if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
-    const serverPub = b64decode(challenge.server_pubkey as string);
-    const salt = b64decode(challenge.salt as string);
-    const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
-
     let newlyPaired = false;
+    let sessionKeyRaw: Uint8Array;
     if (useToken && stored) {
+      // Returning device: ephemeral ECDH + trust-token proof.
+      const keys = await generateHandshakeKeys();
+      send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverPub = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const shared = await agree(keys, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
-      const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
-      confirm.set(CONFIRM_CONTEXT, 0);
-      confirm.set(nonce, CONFIRM_CONTEXT.length);
-      const sealed = await seal(pairKey, confirm, new Uint8Array(0));
-      send({ type: "pair_confirm", sealed: b64encode(sealed) });
+      // First contact: SPAKE2 PAKE bound to the on-screen PIN.
+      const pake = pakeClientStart(pin!, nonce);
+      send({ type: "pake_start", share: b64encode(pake.shareBytes) });
+      const response = await nextText();
+      if (response.type === "auth_err") throw new Error(String(response.error));
+      if (response.type === "pake_result") {
+        throw new Error(`Pairing failed: ${String(response.error ?? "unknown error")}`);
+      }
+      if (response.type !== "pake_response") throw protoErr("pake_response", response);
+      const pending = pake.finish(b64decode(response.share as string));
+      // Client confirms first — the host counts wrong-PIN attempts.
+      send({ type: "pake_confirm", confirm: b64encode(pending.confirmA) });
       const result = await nextText();
-      if (result.type !== "pair_result" || !result.ok) {
+      if (result.type !== "pake_result" || !result.ok) {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
+      // Verify the host also knew the PIN before trusting anything it sent.
+      sessionKeyRaw = pending.verifyServer(b64decode(result.confirm as string));
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        sessionKeyRaw,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -171,6 +182,7 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,

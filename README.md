@@ -22,8 +22,11 @@ Windows PC (host)                            any device (viewer)
   driver — plus a zero-driver **mirror mode** that works out of the box.
 - **Web viewer with no install**: WebCodecs H.264 decode, touch/pen/keyboard,
   stats overlay with *measured* end-to-end latency.
-- **Encrypted by default**: ECDH P-256 + single-use PIN pairing → AES-256-GCM
-  on every frame; per-device trust tokens; input **denied until you allow it**.
+- **Encrypted by default**: SPAKE2 PAKE pairing with a single-use PIN
+  (offline-grind-proof) → AES-256-GCM on every frame; per-device trust
+  tokens; input **denied until you allow it**.
+- **Clipboard sync** (optional): per-device permission, size-capped, off by
+  default — toggle it from the panel like input.
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
   for Office / Video / Drawing / Gaming.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
@@ -62,13 +65,14 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (32 Rust tests + Node compat + full Chromium E2E
+Verified by automated tests (59 Rust tests + Node compat + full Chromium E2E
 in CI): protocol/crypto, pairing/trust/grants, H.264+JPEG streaming, web
-viewer, adaptation, discovery, panel. Written but **needing a Windows/WDK/SDK
-machine to build & validate**: the IddCx driver (extend mode), DXGI
-mirror/SendInput runtime behavior, tray app runtime, Android/iOS apps. Not
-implemented yet (designed, reserved in the protocol): audio, clipboard,
-hardware encoders, PAKE pairing — see [ROADMAP](docs/ROADMAP.md).
+viewer, adaptation, discovery, panel, **SPAKE2 PAKE pairing**, **clipboard
+sync** (permission-gated). Written but **needing a Windows/WDK/SDK machine to
+build & validate**: the IddCx driver (extend mode), DXGI mirror/SendInput
+runtime behavior, Win32 clipboard backend, hardware H.264 runtime, tray app
+runtime, Android/iOS apps. Not implemented yet (designed, reserved in the
+protocol): audio, file drop, QUIC — see [ROADMAP](docs/ROADMAP.md).
 
 ## Clean-room statement
 

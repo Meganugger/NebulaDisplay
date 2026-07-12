@@ -1330,6 +1330,7 @@ dependencies = [
  "base64",
  "hex",
  "hkdf",
+ "hmac",
  "p256",
  "rand 0.8.6",
  "serde",

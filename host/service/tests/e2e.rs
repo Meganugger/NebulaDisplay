@@ -97,6 +97,95 @@ async fn pairing_streams_video_and_ping_pong_works() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pake_pairing_streams_and_reconnect_works() {
+    let host = start_host("pake").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("PAKE Viewer");
+
+    // First contact via SPAKE2 PAKE with the on-screen PIN.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pake(&pin),
+        vec![Codec::H264, Codec::Jpeg],
+    )
+    .await
+    .expect("PAKE pairing with correct PIN succeeds");
+    let creds = session
+        .new_credentials
+        .clone()
+        .expect("PAKE pairing must issue credentials");
+    assert!(!session.input_allowed, "input denied by default");
+    assert_eq!(session.mode.width, 320);
+    session.close().await;
+
+    // The token minted by the PAKE handshake must reconnect like any other.
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info,
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("token reconnect after PAKE pairing");
+    assert!(session.new_credentials.is_none());
+
+    // And it actually streams video.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut frames = 0;
+    while frames < 3 {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("frame timeout")
+            .expect("recv ok")
+        {
+            Incoming::Video(_) => frames += 1,
+            Incoming::Closed => panic!("closed unexpectedly"),
+            _ => {}
+        }
+    }
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pake_wrong_pin_is_rejected_and_rotates_pin() {
+    let host = start_host("pake-wrong").await;
+    let real_pin = host.state.pins.current_pin();
+    let wrong_pin = if real_pin == "000000" {
+        "000001".to_string()
+    } else {
+        "000000".to_string()
+    };
+
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("PAKE Evil"),
+            Auth::Pake(&wrong_pin),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "wrong PAKE PIN",
+    );
+    // The client aborts at server-confirmation failure ("PAKE").
+    assert!(
+        format!("{err:#}").to_lowercase().contains("pake"),
+        "error should mention PAKE: {err:#}"
+    );
+    // Failed attempt must rotate the PIN (anti-grinding), same as PIN pairing.
+    assert_ne!(
+        host.state.pins.current_pin(),
+        real_pin,
+        "PIN must rotate after a failed PAKE attempt"
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wrong_pin_is_rejected_and_rotates_pin() {
     let host = start_host("wrongpin").await;
     let real_pin = host.state.pins.current_pin();
@@ -283,6 +372,178 @@ async fn fingerprint_mismatch_blocks_token_send() {
         "impostor host",
     );
     assert!(format!("{err:#}").contains("fingerprint"));
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_is_permission_gated_and_size_capped() {
+    let host = start_host("clip").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Clipboard tablet");
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pake(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    assert!(
+        !session.clipboard_allowed,
+        "clipboard must be denied by default"
+    );
+
+    let host_clip = |state: &nebulad::state::AppState| -> Option<String> {
+        state.clipboard.lock().unwrap().peek_text().unwrap()
+    };
+
+    // 1. Without a grant, pushes are dropped server-side.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "stolen?".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_ne!(
+        host_clip(&host.state).as_deref(),
+        Some("stolen?"),
+        "ungranted clipboard push must not reach the host clipboard"
+    );
+
+    // 2. Grant clipboard from the panel → live notification.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed: true }) => break,
+            Incoming::Closed => panic!("closed while waiting for clipboard grant"),
+            _ => {}
+        }
+    }
+
+    // 3. Client → host now works.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "hello from viewer".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if host_clip(&host.state).as_deref() == Some("hello from viewer") {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("granted clipboard push never reached the host clipboard");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 4. Host copy → granted client receives it (and never its own echo).
+    // Simulate what the clipboard poll loop does when the host user copies:
+    // backend updated, then the change is broadcast.
+    host.state
+        .clipboard
+        .lock()
+        .unwrap()
+        .set_text("hello from host")
+        .unwrap();
+    host.state.publish_clipboard(None, "hello from host".into());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("host clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { text }) => {
+                assert_eq!(text, "hello from host");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for host clipboard"),
+            _ => {}
+        }
+    }
+
+    // 5. Oversized pushes are rejected with an error, host clipboard intact.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "x".repeat(300 * 1024), // > 256 KiB default cap
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("oversize error timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Error { code, .. }) => {
+                assert_eq!(code, "clipboard_too_large");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for oversize error"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host_clip(&host.state).as_deref(),
+        Some("hello from host"),
+        "oversized push must not modify the host clipboard"
+    );
+
+    // 6. Re-granting shares the current host clipboard immediately.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, false)
+        .unwrap());
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("regrant clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { text }) => {
+                assert_eq!(text, "hello from host");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for regrant share"),
+            _ => {}
+        }
+    }
+
+    // 7. After revocation, pushes are dropped again.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, false)
+        .unwrap());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "too late".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_ne!(host_clip(&host.state).as_deref(), Some("too late"));
+
+    session.close().await;
     host.shutdown().await;
 }
 

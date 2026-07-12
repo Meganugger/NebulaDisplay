@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
+use crate::clipboard::ClipboardBackend;
 use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
@@ -55,7 +56,19 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
+    SetClipboardGrant(bool),
     Kick { reason: String },
+}
+
+/// Latest clipboard text published to sessions (host copy or client push).
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardEvent {
+    /// Monotonic update counter (0 = never updated).
+    pub seq: u64,
+    /// Device that pushed this text, or None when the host user copied it.
+    /// Sessions skip events they originated (echo-loop prevention).
+    pub origin: Option<String>,
+    pub text: Arc<String>,
 }
 
 /// Panel-visible live client entry.
@@ -66,6 +79,7 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
@@ -82,6 +96,10 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Host-side clipboard access (platform backend; in-memory off Windows).
+    pub clipboard: Mutex<Box<dyn ClipboardBackend>>,
+    /// Latest clipboard text; granted sessions `watch` and forward this.
+    pub clipboard_tx: watch::Sender<ClipboardEvent>,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -106,6 +124,7 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (clipboard_tx, _) = watch::channel(ClipboardEvent::default());
         Ok(Self {
             cfg,
             fingerprint,
@@ -113,6 +132,8 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            clipboard: Mutex::new(crate::clipboard::create_backend()),
+            clipboard_tx,
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -206,6 +227,44 @@ impl AppState {
             }
         }
         Ok(found)
+    }
+
+    /// Push a clipboard-grant change both to the persistent store and any
+    /// live session for that device.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Broadcast clipboard text to granted sessions. `origin` is the pushing
+    /// device (None = the host user copied it); sessions skip their own
+    /// events so a push is never echoed back to its sender.
+    pub fn publish_clipboard(&self, origin: Option<&str>, text: String) {
+        self.clipboard_tx.send_modify(|ev| {
+            ev.seq += 1;
+            ev.origin = origin.map(str::to_string);
+            ev.text = Arc::new(text);
+        });
+    }
+
+    /// A granted client pushed clipboard text: write it to the host
+    /// clipboard and relay it to the *other* granted viewers.
+    pub fn set_clipboard_from_client(&self, device_id: &str, text: String) -> anyhow::Result<()> {
+        self.clipboard.lock().unwrap().set_text(&text)?;
+        self.publish_clipboard(Some(device_id), text);
+        Ok(())
     }
 
     /// Revoke trust and kick any live session for that device.
