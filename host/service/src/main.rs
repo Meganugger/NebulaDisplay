@@ -1,7 +1,7 @@
 //! `nebulad` — the NebulaDisplay host service binary.
 
 use clap::Parser;
-use nebulad::{capture, config, discovery, panel, server, state, util};
+use nebulad::{capture, clipboard, config, discovery, panel, server, state, util};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +81,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (w, h) = util::parse_size(&args.capture_size)?;
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
+
+    // Clipboard bridge (permission-gated per device; see docs/SECURITY.md).
+    tokio::spawn(clipboard::run_poll_loop(state.clone()));
 
     // UDP discovery responder.
     if args.discovery_port != 0 {

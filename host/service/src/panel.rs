@@ -50,6 +50,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,6 +63,7 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     stats: ndsp_protocol::messages::ViewerStats,
 }
 
@@ -94,6 +96,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,6 +118,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
@@ -138,14 +144,29 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     Json(serde_json::json!({ "pin": pin }))
 }
 
+#[derive(Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GrantCapability {
+    #[default]
+    Input,
+    Clipboard,
+}
+
 #[derive(Deserialize)]
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// Which capability to toggle; absent = input (backward compatible).
+    #[serde(default)]
+    capability: GrantCapability,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.capability {
+        GrantCapability::Input => state.set_input_grant(&req.device_id, req.allowed),
+        GrantCapability::Clipboard => state.set_clipboard_grant(&req.device_id, req.allowed),
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),

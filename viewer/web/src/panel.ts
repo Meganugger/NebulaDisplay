@@ -11,6 +11,7 @@ interface ClientView {
   addr: string;
   connected_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   stats: ViewerStats;
 }
 
@@ -21,6 +22,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -119,6 +121,9 @@ async function refresh(): Promise<void> {
         <td>
           <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
         </td>
+        <td>
+          <label class="switch"><input type="checkbox" data-clip-grant="${esc(d.device_id)}" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
+        </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
     )
@@ -131,6 +136,18 @@ async function refresh(): Promise<void> {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+      }).catch(console.error);
+  });
+  ttbody.querySelectorAll<HTMLInputElement>("input[data-clip-grant]").forEach((el) => {
+    el.onchange = () =>
+      void api("/api/grant", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          device_id: el.dataset["clipGrant"],
+          allowed: el.checked,
+          capability: "clipboard",
+        }),
       }).catch(console.error);
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {

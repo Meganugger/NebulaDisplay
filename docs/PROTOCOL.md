@@ -18,7 +18,7 @@ Authority: `shared/protocol` — this document describes what that code does.
 
 ```
 C→S  hello        {protocol, client{device_id,name,platform,app_version,
-                   features?[]}, auth{method: pair | token+device_id},
+                   features?[]}, auth{method: pake | pair | token+device_id},
                    codecs[]}
                    # features: optional capability flags. "cursor" → this
                    # viewer renders the host cursor from cursor_shape/
@@ -26,25 +26,45 @@ C→S  hello        {protocol, client{device_id,name,platform,app_version,
                    # while ALL connected viewers advertise it).
 S→C  hello_ack    {protocol, server{name,app_version,fingerprint},
                    pairing_required, connection_nonce}      # 16B nonce, b64
+```
+
+**PAKE pairing path** (first contact, preferred — used by the web + desktop
+viewers): SPAKE2 over P-256 with the on-screen PIN as the password. Unlike
+the legacy path below, a recorded PAKE transcript **cannot be ground offline**
+against the short PIN — see `shared/protocol/src/pake.rs` for the exact
+construction (group elements derived by public-seed hash-to-curve, transcript
+binding, HMAC key confirmation).
+
+```
+C→S  pake_start    {share}          # pA = x·G + w·M, uncompressed SEC1, b64
+S→C  pake_response {share}          # pB = y·G + w·N
+C→S  pake_confirm  {confirm}        # cA — client confirms FIRST so the host
+                                    # counts wrong-PIN attempts (lockout+rotate)
+S→C  pake_result   {ok, confirm?, sealed_token?, error?}
+                                    # cB (client must verify before trusting
+                                    # the key) + 32B trust token sealed under
+                                    # the PAKE session key (AAD "token")
+session_key = HKDF-SHA256(ikm=SHA-256(TT), salt=nonce, "ndsp-session-v1")
+```
+
+**Legacy PIN path** (first contact; kept for the Android/iOS viewers until
+they grow SPAKE2):
+
+```
 C→S  pair_start   {client_pubkey}                           # P-256, uncompressed SEC1, b64
 S→C  pair_challenge {server_pubkey, salt}                   # salt: 16B
-```
-
-Both sides compute `shared = ECDH(eph_c, eph_s)` and
-`session_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-session-v1"‖nonce)`.
-
-**Pairing path** (first contact; host displays a PIN):
-
-```
-pair_key = HKDF-SHA256(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)
+pair_key    = HKDF-SHA256(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)
+session_key = HKDF-SHA256(ikm=shared, salt, "ndsp-session-v1"‖nonce)
 C→S  pair_confirm {sealed}    # AES-GCM(pair_key, "ndsp-confirm-v1"‖nonce)
 S→C  pair_result  {ok, sealed_token?}   # 32B trust token, sealed under pair_key (AAD "token")
 ```
 
-The PIN never crosses the wire. A wrong PIN fails the AEAD open; the host
-rotates the PIN and counts the failure against the source IP.
+The PIN never crosses the wire on either path. A wrong PIN fails the
+confirmation; the host rotates the PIN and counts the failure against the
+source IP.
 
-**Token path** (returning device):
+**Token path** (returning device — starts with the same
+`pair_start`/`pair_challenge` ephemeral ECDH exchange):
 
 ```
 C→S  token_proof {proof}   # b64 SHA-256(token ‖ nonce ‖ client_pub ‖ server_pub)
@@ -57,7 +77,8 @@ host `fingerprint` from pairing and refuse to send proofs to a changed host.
 Finally:
 
 ```
-S→C  auth_ok  {codec, mode{width,height,refresh_hz}, input_allowed}
+S→C  auth_ok  {codec, mode{width,height,refresh_hz}, input_allowed,
+              clipboard_allowed}
      (or auth_err {error})
 ```
 
@@ -99,6 +120,8 @@ ts_us: host-clock capture timestamp (for measured e2e latency)
 | `stats {stats}` | C→S | fps/decode/queue/rtt/e2e/net/present-wait — drives adaptation + panel |
 | `host_stats {stats}` | S→C | capture fps, encode/convert ms, capture age, seal+send ms, bitrate, drops |
 | `input_grant {allowed}` | S→C | live grant change from the panel |
+| `clipboard {text}` | both | clipboard text; requires the per-device clipboard grant and ≤ `clipboard_max_bytes` (default 256 KiB) — violations are dropped (`error {code:"clipboard_too_large"}` for oversize) |
+| `clipboard_grant {allowed}` | S→C | live clipboard-grant change from the panel |
 | `cursor_shape {width,height,hot_x,hot_y,rgba}` | S→C | host cursor image (b64 RGBA8), sent on change to "cursor" viewers |
 | `cursor_pos {x,y,visible}` | S→C | host cursor moved (normalized coords); `visible:false` also = hide overlay (e.g. legacy client joined) |
 | `mode_change {mode}` | S→C | resolution/refresh switch |

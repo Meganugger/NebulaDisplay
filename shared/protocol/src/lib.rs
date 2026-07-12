@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod envelope;
 pub mod media;
 pub mod messages;
+pub mod pake;
 
 /// Current protocol version. Bump on breaking changes; peers negotiate
 /// `min(client, server)` and refuse to talk below [`MIN_PROTOCOL_VERSION`].

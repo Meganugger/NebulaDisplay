@@ -56,6 +56,9 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
+    /// Per-event clipboard size cap (bytes), from config.
+    clipboard_max: usize,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -133,8 +136,11 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        clipboard_max: state.cfg.file.clipboard_max_bytes,
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -161,6 +167,7 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -185,6 +192,7 @@ pub async fn run(
         consumed_seq.clone(),
     ));
     let pump = tokio::spawn(incoming_pump(
+        state.clone(),
         ws_rx,
         opener,
         shared.clone(),
@@ -212,6 +220,9 @@ pub async fn run(
     // Deliver the current cursor state right away (a client connecting while
     // the mouse is idle should not wait for the first physical move).
     cursor_rx.mark_changed();
+    // Clipboard events (host copies + other clients' pushes). Only forwarded
+    // while this device holds the clipboard grant.
+    let mut clipboard_rx = state.clipboard_tx.subscribe();
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
     loop {
@@ -220,6 +231,23 @@ pub async fn run(
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
+                    // A fresh grant shares the current host clipboard right
+                    // away — that's invariably why the user flipped it on.
+                    if allowed {
+                        let text = state.clipboard.lock().unwrap().peek_text().unwrap_or(None);
+                        if let Some(text) = text {
+                            if !text.is_empty()
+                                && text.len() <= shared.clipboard_max
+                                && ctl_tx.send(ControlMsg::Clipboard { text }).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -261,6 +289,17 @@ pub async fn run(
                     }
                 }
                 if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: cs.visible }).await.is_err() { break; }
+            }
+
+            changed = clipboard_rx.changed() => {
+                if changed.is_err() { continue; }
+                let ev = clipboard_rx.borrow_and_update().clone();
+                if ev.seq == 0 { continue; }
+                if !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                // Never echo a push back to the device it came from.
+                if ev.origin.as_deref() == Some(handle.device_id.as_str()) { continue; }
+                if ev.text.len() > shared.clipboard_max { continue; }
+                if ctl_tx.send(ControlMsg::Clipboard { text: (*ev.text).clone() }).await.is_err() { break; }
             }
 
             _ = host_stats_timer.tick() => {
@@ -534,6 +573,7 @@ async fn video_task(
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
 async fn incoming_pump(
+    state: Arc<AppState>,
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
     shared: Arc<Shared>,
@@ -590,6 +630,28 @@ async fn incoming_pump(
                         }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        ControlMsg::Clipboard { text } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard push (no grant)");
+                            } else if text.len() > shared.clipboard_max {
+                                warn!(
+                                    len = text.len(),
+                                    cap = shared.clipboard_max,
+                                    "dropping oversized clipboard push"
+                                );
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "clipboard_too_large".into(),
+                                    message: format!(
+                                        "clipboard exceeds the {} byte cap",
+                                        shared.clipboard_max
+                                    ),
+                                });
+                            } else if let Err(e) =
+                                state.set_clipboard_from_client(&handle.device_id, text)
+                            {
+                                warn!("host clipboard write failed: {e:#}");
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");

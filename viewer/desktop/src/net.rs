@@ -95,12 +95,17 @@ async fn session_loop(
                             "stored trust was rejected by the host — run again with --pin <PIN>"
                         );
                     };
-                    connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?
+                    connect(&host, port, client.clone(), Auth::Pake(pin), codecs()).await?
                 }
                 Err(e) => return Err(e),
             }
         }
-        (None, Some(pin)) => connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?,
+        // First contact pairs via SPAKE2 PAKE (offline-grind-proof); pass
+        // through the legacy PIN-HKDF path only for pre-PAKE hosts via
+        // `Auth::Pin` if ever needed.
+        (None, Some(pin)) => {
+            connect(&host, port, client.clone(), Auth::Pake(pin), codecs()).await?
+        }
         (None, None) => anyhow::bail!("first connection needs --pin <PIN shown on the host>"),
     };
 

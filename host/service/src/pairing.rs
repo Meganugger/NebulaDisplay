@@ -13,6 +13,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys, SharedSecret},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, ServerInfo},
+    pake::PakeServer,
     PROTOCOL_VERSION,
 };
 use std::net::IpAddr;
@@ -28,6 +29,7 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     pub newly_paired: bool,
 }
 
@@ -39,6 +41,12 @@ enum Phase {
         salt: [u8; 16],
         client_pub: Vec<u8>,
         server_pub: Vec<u8>,
+    },
+    /// PAKE path: waiting for the client's `PakeStart` share.
+    AwaitPakeStart,
+    /// PAKE path: waiting for the client's `PakeConfirm` MAC.
+    AwaitPakeConfirm {
+        server: Box<PakeServer>,
     },
     Done,
 }
@@ -105,11 +113,12 @@ impl ServerHandshake {
         Codec::Jpeg
     }
 
-    fn auth_ok(&self, input_allowed: bool) -> ControlMsg {
+    fn auth_ok(&self, input_allowed: bool, clipboard_allowed: bool) -> ControlMsg {
         ControlMsg::AuthOk {
             codec: self.select_codec(),
             mode: *self.state.mode.lock().unwrap(),
             input_allowed,
+            clipboard_allowed,
         }
     }
 
@@ -133,11 +142,18 @@ impl ServerHandshake {
                     );
                 }
                 info!(device = %client.device_id, name = %client.name, platform = %client.platform, "hello");
-                let pairing = matches!(auth, AuthMethod::Pair);
+                // Both first-contact paths (PIN-HKDF and PAKE) require pairing;
+                // only a returning token device skips it.
+                let pairing = !matches!(auth, AuthMethod::Token { .. });
+                let is_pake = matches!(auth, AuthMethod::Pake);
                 self.client = Some(client);
                 self.auth = Some(auth);
                 self.client_codecs = codecs;
-                self.phase = Phase::AwaitPairStart;
+                self.phase = if is_pake {
+                    Phase::AwaitPakeStart
+                } else {
+                    Phase::AwaitPairStart
+                };
                 Step::reply(ControlMsg::HelloAck {
                     protocol: PROTOCOL_VERSION.min(protocol),
                     server: ServerInfo {
@@ -241,7 +257,7 @@ impl ServerHandshake {
                         };
                         let sealed_token = crypto::seal(&pair_key, &token, b"token");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
-                        let auth_ok = self.auth_ok(false);
+                        let auth_ok = self.auth_ok(false, false);
                         let codec = self.select_codec();
                         self.phase = Phase::Done;
                         Step {
@@ -258,6 +274,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -314,7 +331,8 @@ impl ServerHandshake {
                         let client = self.client.clone().expect("hello precedes proof");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let input_allowed = dev.input_allowed;
-                        let auth_ok = self.auth_ok(input_allowed);
+                        let clipboard_allowed = dev.clipboard_allowed;
+                        let auth_ok = self.auth_ok(input_allowed, clipboard_allowed);
                         let codec = self.select_codec();
                         info!(device = %device_id, "token reconnect ok");
                         self.phase = Phase::Done;
@@ -325,6 +343,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,
@@ -339,6 +358,140 @@ impl ServerHandshake {
                             "token rejected",
                         )
                     }
+                }
+            }
+
+            (Phase::AwaitPakeStart, ControlMsg::PakeStart { share }) => {
+                // Rate-limit before the (cheap, but PIN-testing) PAKE math.
+                if let PinGate::LockedOut { retry_after } = self.state.pins.gate(self.peer_ip) {
+                    return Step::reject(
+                        ControlMsg::PakeResult {
+                            ok: false,
+                            confirm: None,
+                            sealed_token: None,
+                            error: Some(format!(
+                                "too many failed attempts; retry in {}s",
+                                retry_after.as_secs()
+                            )),
+                        },
+                        "pairing lockout",
+                    );
+                }
+                let Ok(client_share) = B64.decode(&share) else {
+                    return Step::reject(
+                        ControlMsg::PakeResult {
+                            ok: false,
+                            confirm: None,
+                            sealed_token: None,
+                            error: Some("bad share encoding".into()),
+                        },
+                        "bad pake share b64",
+                    );
+                };
+                let pin = self.state.pins.current_pin();
+                let (server, pb) = match PakeServer::respond(&pin, &self.nonce, &client_share) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A malformed/off-curve share is a protocol error, not a
+                        // wrong-PIN attempt — don't burn the client's PIN budget.
+                        return Step::reject(
+                            ControlMsg::PakeResult {
+                                ok: false,
+                                confirm: None,
+                                sealed_token: None,
+                                error: Some(format!("invalid PAKE share: {e}")),
+                            },
+                            "bad pake share",
+                        );
+                    }
+                };
+                let reply = ControlMsg::PakeResponse {
+                    share: B64.encode(&pb),
+                };
+                self.phase = Phase::AwaitPakeConfirm {
+                    server: Box::new(server),
+                };
+                Step::reply(reply)
+            }
+
+            (Phase::AwaitPakeConfirm { .. }, ControlMsg::PakeConfirm { confirm }) => {
+                // Move the server state out of the phase to consume it.
+                let Phase::AwaitPakeConfirm { server } =
+                    std::mem::replace(&mut self.phase, Phase::Done)
+                else {
+                    unreachable!("matched AwaitPakeConfirm above");
+                };
+                let Ok(confirm_a) = B64.decode(&confirm) else {
+                    self.state.pins.record_failure(self.peer_ip);
+                    return Step::reject(
+                        ControlMsg::PakeResult {
+                            ok: false,
+                            confirm: None,
+                            sealed_token: None,
+                            error: Some("bad confirm encoding".into()),
+                        },
+                        "bad pake confirm b64",
+                    );
+                };
+                let keys = match server.verify(&confirm_a) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        self.state.pins.record_failure(self.peer_ip);
+                        return Step::reject(
+                            ControlMsg::PakeResult {
+                                ok: false,
+                                confirm: None,
+                                sealed_token: None,
+                                error: Some("wrong PIN".into()),
+                            },
+                            "wrong PIN (pake)",
+                        );
+                    }
+                };
+                let session_key = keys.session_key;
+                let client = self.client.clone().expect("hello precedes confirm");
+                self.state.pins.consume(self.peer_ip);
+                let token = match self.state.trust.lock().unwrap().enroll(
+                    &client.device_id,
+                    &client.name,
+                    &client.platform,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("trust store write failed: {e:#}");
+                        return Step::reject(
+                            ControlMsg::PakeResult {
+                                ok: false,
+                                confirm: None,
+                                sealed_token: None,
+                                error: Some("host storage error".into()),
+                            },
+                            "trust store error",
+                        );
+                    }
+                };
+                let sealed_token = crypto::seal(&session_key, &token, b"token");
+                let auth_ok = self.auth_ok(false, false);
+                let codec = self.select_codec();
+                Step {
+                    replies: vec![
+                        ControlMsg::PakeResult {
+                            ok: true,
+                            confirm: Some(B64.encode(&keys.confirm_b)),
+                            sealed_token: Some(B64.encode(sealed_token)),
+                            error: None,
+                        },
+                        auth_ok,
+                    ],
+                    complete: Some(AuthComplete {
+                        client,
+                        session_key,
+                        codec,
+                        input_allowed: false,
+                        clipboard_allowed: false,
+                        newly_paired: true,
+                    }),
+                    reject: None,
                 }
             }
 
@@ -363,6 +516,10 @@ fn variant_name(msg: &ControlMsg) -> &'static str {
         ControlMsg::PairChallenge { .. } => "pair_challenge",
         ControlMsg::PairConfirm { .. } => "pair_confirm",
         ControlMsg::PairResult { .. } => "pair_result",
+        ControlMsg::PakeStart { .. } => "pake_start",
+        ControlMsg::PakeResponse { .. } => "pake_response",
+        ControlMsg::PakeConfirm { .. } => "pake_confirm",
+        ControlMsg::PakeResult { .. } => "pake_result",
         ControlMsg::TokenProof { .. } => "token_proof",
         ControlMsg::AuthOk { .. } => "auth_ok",
         ControlMsg::AuthErr { .. } => "auth_err",

@@ -25,9 +25,16 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 * Handshake: ephemeral **ECDH P-256** per connection → **HKDF-SHA256** →
   **AES-256-GCM** session key. Forward secrecy: recording traffic and later
   stealing the trust store does not decrypt past sessions.
-* Pairing: the session is bound to a **single-use, TTL-limited PIN** via
-  `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`. The PIN never
-  crosses the wire; an active MITM without it cannot complete pairing.
+* Pairing (preferred path, used by the web + desktop viewers): **SPAKE2 PAKE**
+  over P-256 bound to the single-use, TTL-limited PIN. The PIN never crosses
+  the wire, a recorded transcript is **not offline-grindable**, an active
+  MITM gets exactly one PIN guess per run, and the client confirms first so
+  the host counts every wrong-PIN attempt (lockout + rotation). See
+  `shared/protocol/src/pake.rs`.
+* Pairing (legacy path, Android/iOS until they grow SPAKE2): the session is
+  bound to the PIN via `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`.
+  The PIN never crosses the wire; an active MITM without it cannot complete
+  pairing.
 * Reconnect: 256-bit per-device token; proof = SHA-256 over token + nonce +
   both ephemeral keys (transcript binding defeats key-substitution MITM).
   Clients pin the host fingerprint and refuse proofs to a changed host.
@@ -36,11 +43,12 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 ### Known cryptographic limitations (honest)
 
-1. **Offline PIN grinding**: a passive attacker who records a *pairing*
-   exchange can brute-force the 6-digit PIN offline against `pair_confirm`.
-   Mitigations today: PINs are single-use, expire in 5 min, rotate on every
-   failure, and pairing is rare. Fix planned: **PAKE (SPAKE2/CPace)** so the
-   transcript is un-grindable (ROADMAP P1).
+1. **Offline PIN grinding — fixed for SPAKE2 pairings** (the web and desktop
+   viewers). It still applies to the *legacy* PIN-HKDF path used by the
+   Android/iOS viewers: a passive attacker recording such an exchange can
+   brute-force the 6-digit PIN offline against `pair_confirm`. Mitigations:
+   PINs are single-use, expire in 5 min, rotate on every failure, and pairing
+   is rare. The fix is porting those clients to the SPAKE2 path (ROADMAP).
 2. **No TLS layer**: HTTP serving the web viewer JS is plaintext on the LAN —
    an active LAN attacker could tamper the *viewer code* before crypto starts
    (native viewers are immune). Documented trade-off; mitigations: QR/manual
@@ -59,6 +67,7 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 | Stolen trust token file (client) | Token useless without matching device_id? No — token is the credential: **revoke from the panel**; tokens are per-device so revocation is surgical |
 | Rogue host at same IP | Client-side fingerprint pinning (tested) |
 | Input abuse | Input **denied by default** per device; grants are live-revocable; sessions enforce grant server-side on every event batch |
+| Clipboard exfiltration | Clipboard sync **denied by default** per device; live-revocable; both directions size-capped (`clipboard_max_bytes`, 256 KiB default, oversize dropped not truncated); text only; pushes from ungranted devices are dropped server-side |
 | Replay/reorder injection | Envelope counters + GCM |
 | Panel exposure | Panel binds 127.0.0.1 only; contains PIN/grants; never reachable from LAN |
 | Driver attack surface | Driver has no network code; validates geometry; ring is `Local\` namespace |
@@ -80,8 +89,10 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
   unless the user configures it.
 * Audio capture is **off** and unimplemented until the WASAPI feature lands —
   it will be opt-in per device with a visible indicator (ROADMAP).
-* Clipboard/file transfer: designed permission-gated, not yet implemented —
-  the protocol reserves message space; nothing is shared implicitly.
+* Clipboard sync is implemented and **off by default**: nothing is shared
+  until the host user grants it per device in the panel, transfers are
+  size-capped both ways, and grants are revocable live. File transfer stays
+  designed-but-unimplemented; nothing is shared implicitly.
 
 ## Reporting
 

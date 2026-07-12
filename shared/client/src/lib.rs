@@ -13,6 +13,7 @@ use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
     media::VideoFrame,
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, DisplayMode},
+    pake::PakeClient,
     PROTOCOL_VERSION, WS_PATH,
 };
 use tokio::net::TcpStream;
@@ -30,8 +31,11 @@ pub struct Credentials {
 }
 
 pub enum Auth<'a> {
-    /// First contact: pair with the PIN shown on the host.
+    /// First contact: pair with the PIN shown on the host (PIN-bound HKDF).
     Pin(&'a str),
+    /// First contact via SPAKE2 PAKE with the PIN shown on the host — same
+    /// user experience, but the recorded transcript is not offline-grindable.
+    Pake(&'a str),
     /// Returning device.
     Token(&'a Credentials),
 }
@@ -44,6 +48,7 @@ pub struct Session {
     pub codec: Codec,
     pub mode: DisplayMode,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     /// Set when this connection performed a fresh pairing.
     pub new_credentials: Option<Credentials>,
     pub server_fingerprint: String,
@@ -70,6 +75,7 @@ pub async fn connect(
 
     let auth_method = match &auth {
         Auth::Pin(_) => AuthMethod::Pair,
+        Auth::Pake(_) => AuthMethod::Pake,
         Auth::Token(c) => AuthMethod::Token {
             device_id: c.device_id.clone(),
         },
@@ -107,91 +113,159 @@ pub async fn connect(
         }
     }
 
-    // Ephemeral ECDH (both auth paths).
-    let keys = HandshakeKeys::generate();
-    let client_pub = keys.public_bytes().to_vec();
-    send_json(
-        &mut ws,
-        &ControlMsg::PairStart {
-            client_pubkey: B64.encode(&client_pub),
-        },
-    )
-    .await?;
-    let (server_pub, salt) = match recv_json(&mut ws).await? {
-        ControlMsg::PairChallenge {
-            server_pubkey,
-            salt,
-        } => (
-            B64.decode(server_pubkey).context("server pub b64")?,
-            B64.decode(salt).context("salt b64")?,
-        ),
-        ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
-        other => bail!("expected pair_challenge, got {other:?}"),
-    };
-    let shared = keys
-        .agree(&server_pub)
-        .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
-    let session_key = shared.session_key(&salt, &nonce);
-
     let mut new_credentials = None;
-    match auth {
-        Auth::Pin(pin) => {
-            let pair_key = shared.pairing_key(&salt, pin, &nonce);
-            let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
-            confirm.extend_from_slice(&nonce);
-            let sealed = crypto::seal(&pair_key, &confirm, b"");
-            send_json(
-                &mut ws,
-                &ControlMsg::PairConfirm {
-                    sealed: B64.encode(sealed),
-                },
-            )
-            .await?;
-            match recv_json(&mut ws).await? {
-                ControlMsg::PairResult {
-                    ok: true,
-                    sealed_token: Some(tok),
-                    ..
-                } => {
-                    let sealed = B64.decode(tok).context("token b64")?;
-                    let token = crypto::open(&pair_key, &sealed, b"token")
-                        .map_err(|e| anyhow::anyhow!("token unseal: {e}"))?;
-                    new_credentials = Some(Credentials {
-                        device_id: client.device_id.clone(),
-                        token,
-                        host_fingerprint: server_fingerprint.clone(),
-                    });
-                }
-                ControlMsg::PairResult {
-                    ok: false, error, ..
-                } => {
-                    bail!(
-                        "pairing failed: {}",
-                        error.unwrap_or_else(|| "unknown".into())
-                    )
-                }
-                other => bail!("expected pair_result, got {other:?}"),
-            }
-        }
-        Auth::Token(creds) => {
-            let transcript = crypto::reauth_transcript(&nonce, &client_pub, &server_pub);
-            let proof = crypto::token_proof(&creds.token, &transcript);
-            send_json(
-                &mut ws,
-                &ControlMsg::TokenProof {
-                    proof: B64.encode(proof),
-                },
-            )
-            .await?;
-        }
-    }
 
-    let (codec, mode, input_allowed) = match recv_json(&mut ws).await? {
+    // The PAKE path derives its session key from SPAKE2 and needs no ECDH
+    // exchange; the PIN-HKDF and token paths share the ephemeral ECDH prelude.
+    let session_key: [u8; 32] = if let Auth::Pake(pin) = auth {
+        let pake = PakeClient::start(pin, &nonce);
+        send_json(
+            &mut ws,
+            &ControlMsg::PakeStart {
+                share: B64.encode(pake.share_bytes()),
+            },
+        )
+        .await?;
+        let server_share = match recv_json(&mut ws).await? {
+            ControlMsg::PakeResponse { share } => B64.decode(share).context("pake share b64")?,
+            ControlMsg::PakeResult { error, .. } => {
+                bail!(
+                    "PAKE rejected: {}",
+                    error.unwrap_or_else(|| "unknown".into())
+                )
+            }
+            ControlMsg::AuthErr { error } => bail!("PAKE rejected: {error}"),
+            other => bail!("expected pake_response, got {other:?}"),
+        };
+        let pending = pake
+            .finish(&server_share)
+            .map_err(|e| anyhow::anyhow!("PAKE: {e}"))?;
+        // Client confirms first so the host can rate-limit wrong-PIN attempts.
+        send_json(
+            &mut ws,
+            &ControlMsg::PakeConfirm {
+                confirm: B64.encode(&pending.confirm_a),
+            },
+        )
+        .await?;
+        match recv_json(&mut ws).await? {
+            ControlMsg::PakeResult {
+                ok: true,
+                confirm: Some(cb),
+                sealed_token: Some(tok),
+                ..
+            } => {
+                // Verify the host proved knowledge of the PIN before trusting
+                // the session key or the token it sealed.
+                let cb = B64.decode(cb).context("pake confirm b64")?;
+                let session_key = pending
+                    .verify_server(&cb)
+                    .map_err(|e| anyhow::anyhow!("PAKE: {e}"))?;
+                let sealed = B64.decode(tok).context("token b64")?;
+                let token = crypto::open(&session_key, &sealed, b"token")
+                    .map_err(|e| anyhow::anyhow!("token unseal: {e}"))?;
+                new_credentials = Some(Credentials {
+                    device_id: client.device_id.clone(),
+                    token,
+                    host_fingerprint: server_fingerprint.clone(),
+                });
+                session_key
+            }
+            ControlMsg::PakeResult { error, .. } => bail!(
+                "PAKE pairing failed: {}",
+                error.unwrap_or_else(|| "unknown".into())
+            ),
+            other => bail!("expected pake_result, got {other:?}"),
+        }
+    } else {
+        // Ephemeral ECDH (PIN-HKDF pairing + token reconnect).
+        let keys = HandshakeKeys::generate();
+        let client_pub = keys.public_bytes().to_vec();
+        send_json(
+            &mut ws,
+            &ControlMsg::PairStart {
+                client_pubkey: B64.encode(&client_pub),
+            },
+        )
+        .await?;
+        let (server_pub, salt) = match recv_json(&mut ws).await? {
+            ControlMsg::PairChallenge {
+                server_pubkey,
+                salt,
+            } => (
+                B64.decode(server_pubkey).context("server pub b64")?,
+                B64.decode(salt).context("salt b64")?,
+            ),
+            ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
+            other => bail!("expected pair_challenge, got {other:?}"),
+        };
+        let shared = keys
+            .agree(&server_pub)
+            .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
+        let session_key = shared.session_key(&salt, &nonce);
+
+        match auth {
+            Auth::Pin(pin) => {
+                let pair_key = shared.pairing_key(&salt, pin, &nonce);
+                let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
+                confirm.extend_from_slice(&nonce);
+                let sealed = crypto::seal(&pair_key, &confirm, b"");
+                send_json(
+                    &mut ws,
+                    &ControlMsg::PairConfirm {
+                        sealed: B64.encode(sealed),
+                    },
+                )
+                .await?;
+                match recv_json(&mut ws).await? {
+                    ControlMsg::PairResult {
+                        ok: true,
+                        sealed_token: Some(tok),
+                        ..
+                    } => {
+                        let sealed = B64.decode(tok).context("token b64")?;
+                        let token = crypto::open(&pair_key, &sealed, b"token")
+                            .map_err(|e| anyhow::anyhow!("token unseal: {e}"))?;
+                        new_credentials = Some(Credentials {
+                            device_id: client.device_id.clone(),
+                            token,
+                            host_fingerprint: server_fingerprint.clone(),
+                        });
+                    }
+                    ControlMsg::PairResult {
+                        ok: false, error, ..
+                    } => {
+                        bail!(
+                            "pairing failed: {}",
+                            error.unwrap_or_else(|| "unknown".into())
+                        )
+                    }
+                    other => bail!("expected pair_result, got {other:?}"),
+                }
+            }
+            Auth::Token(creds) => {
+                let transcript = crypto::reauth_transcript(&nonce, &client_pub, &server_pub);
+                let proof = crypto::token_proof(&creds.token, &transcript);
+                send_json(
+                    &mut ws,
+                    &ControlMsg::TokenProof {
+                        proof: B64.encode(proof),
+                    },
+                )
+                .await?;
+            }
+            Auth::Pake(_) => unreachable!("handled in the PAKE branch above"),
+        }
+        session_key
+    };
+
+    let (codec, mode, input_allowed, clipboard_allowed) = match recv_json(&mut ws).await? {
         ControlMsg::AuthOk {
             codec,
             mode,
             input_allowed,
-        } => (codec, mode, input_allowed),
+            clipboard_allowed,
+        } => (codec, mode, input_allowed, clipboard_allowed),
         ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
         other => bail!("expected auth_ok, got {other:?}"),
     };
@@ -203,6 +277,7 @@ pub async fn connect(
         codec,
         mode,
         input_allowed,
+        clipboard_allowed,
         new_credentials,
         server_fingerprint,
     })

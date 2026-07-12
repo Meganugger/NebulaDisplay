@@ -37,8 +37,11 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// First contact: run the PIN-bound pairing handshake.
+    /// First contact: run the PIN-bound pairing handshake (HKDF over ECDH).
     Pair,
+    /// First contact via a **PAKE** (SPAKE2): same on-screen PIN, but the
+    /// transcript is not offline-grindable. Preferred by modern clients.
+    Pake,
     /// Returning device: prove possession of a previously issued trust token.
     /// The token itself is never sent; see `TokenProof`.
     Token { device_id: String },
@@ -228,6 +231,32 @@ pub enum ControlMsg {
         sealed_token: Option<String>,
         error: Option<String>,
     },
+
+    // ---- PAKE pairing path (SPAKE2) --------------------------------------
+    /// Client's SPAKE2 public share `pA = x·G + w·M` (base64 uncompressed
+    /// SEC1). Sent instead of `PairStart` when `auth.method == pake`.
+    PakeStart {
+        share: String,
+    },
+    /// Server's SPAKE2 public share `pB = y·G + w·N` (base64). Carries no
+    /// confirmation: the **client confirms first** so the host can count
+    /// wrong-PIN attempts (see `shared/protocol/src/pake.rs`).
+    PakeResponse {
+        share: String,
+    },
+    /// Client's key-confirmation MAC `cA` (base64), proving it knew the PIN.
+    PakeConfirm {
+        confirm: String,
+    },
+    /// Server verdict. On success carries the server's confirmation MAC `cB`
+    /// (the client must verify it before trusting the session key) and the
+    /// sealed trust token (sealed under the PAKE session key, AAD `"token"`).
+    PakeResult {
+        ok: bool,
+        confirm: Option<String>,
+        sealed_token: Option<String>,
+        error: Option<String>,
+    },
     /// Proof of trust-token possession, bound to this handshake's transcript:
     /// base64(SHA-256(token || connection_nonce || client_pubkey || server_pubkey)).
     /// Requires a preceding PairStart/PairChallenge ephemeral exchange (which
@@ -244,6 +273,9 @@ pub enum ControlMsg {
         mode: DisplayMode,
         /// Whether this device is currently allowed to inject input.
         input_allowed: bool,
+        /// Whether this device may sync the clipboard (absent on old hosts).
+        #[serde(default)]
+        clipboard_allowed: bool,
     },
     AuthErr {
         error: String,
@@ -283,6 +315,16 @@ pub enum ControlMsg {
     },
     /// Server informs the viewer its input grant changed (panel toggle).
     InputGrant {
+        allowed: bool,
+    },
+    /// Clipboard text transfer, either direction. Gated by the per-device
+    /// clipboard grant (deny by default) and by `clipboard_max_bytes` on both
+    /// ends — oversized or ungranted transfers are dropped, never truncated.
+    Clipboard {
+        text: String,
+    },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
         allowed: bool,
     },
     /// Server is about to switch modes (resolution change etc.).

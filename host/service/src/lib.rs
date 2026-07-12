@@ -3,6 +3,7 @@
 
 pub mod adapt;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
@@ -58,6 +59,7 @@ impl EmbeddedHost {
         let cap = tokio::spawn(async move {
             capture::run_capture_loop(cap_state, source).await;
         });
+        let clip = tokio::spawn(clipboard::run_poll_loop(state.clone()));
 
         // Bind explicitly so we know the ephemeral port before returning.
         let listener =
@@ -75,7 +77,7 @@ impl EmbeddedHost {
         Ok(Self {
             state,
             port,
-            tasks: vec![cap, srv],
+            tasks: vec![cap, clip, srv],
         })
     }
 

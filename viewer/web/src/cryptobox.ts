@@ -13,7 +13,7 @@ import { p256 } from "@noble/curves/nist.js";
 import { hkdf as nobleHkdf } from "@noble/hashes/hkdf.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
-import { caps, randomBytes } from "./caps";
+import { caps } from "./caps";
 
 /** True when the native WebCrypto backend is in use. */
 export const usingNativeCrypto: boolean = caps.subtle;
@@ -135,9 +135,4 @@ export async function importAesGcmKey(raw: Uint8Array): Promise<AesGcmKey> {
       return Promise.resolve(gcm(keyCopy, nonce, aad).decrypt(sealed));
     },
   };
-}
-
-/** Random 96-bit AES-GCM nonce. */
-export function randomNonce(): Uint8Array {
-  return randomBytes(12);
 }

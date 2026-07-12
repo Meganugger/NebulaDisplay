@@ -10,6 +10,14 @@ single-pass BGRA→I420, TCP_NODELAY, DXGI cursor compositing, multi-monitor
 input mapping, letterbox-correct touch coordinates on all viewers,
 device-rate pointer sampling, latest-frame rendering everywhere.
 
+Shipped since (v0.5 security & features — no longer roadmap items):
+**SPAKE2 PAKE pairing** (offline-grind-proof; web + desktop viewers use it by
+default, PIN-HKDF kept for mobile until ported; client-confirms-first so the
+host rate-limits every wrong-PIN attempt; cross-stack Rust↔TS compatibility
+tested against the real host in CI), **clipboard sync** (per-device grant,
+deny-by-default, 256 KiB cap both directions, Win32 CF_UNICODETEXT backend +
+panel toggles + web viewer UI, echo-loop-free multi-viewer relay).
+
 Shipped since (v0.4 pipeline overhaul — no longer roadmap items):
 zero-rebuild runtime bitrate raises (max-bitrate ceiling lift), parallel
 multi-slice encode, dirty-region encoding (static-frame elision + partial
@@ -45,9 +53,11 @@ harness (`viewer/web/tests/bench.mjs`).
 
 ## P1 — security & transports
 
-4. **PAKE pairing** (CPace or SPAKE2) replacing PIN-bound HKDF: removes the
-   offline-grinding caveat in SECURITY.md; wire format has room (new
-   `auth.method`).
+4. **PAKE pairing — SHIPPED** (`shared/protocol/src/pake.rs`,
+   `viewer/web/src/pake.ts`): SPAKE2 over P-256, hash-to-curve group
+   elements, transcript-bound HMAC confirmation, client-confirms-first rate
+   limiting. Remaining: port the Android/iOS viewers off the legacy PIN-HKDF
+   path (needs a small P-256 point-arithmetic layer on each platform).
 5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
    video, streams for control; WebTransport for the web viewer where
    available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
@@ -65,8 +75,11 @@ harness (`viewer/web/tests/bench.mjs`).
 
 8. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
    mute/volume; off by default with a visible indicator.
-9. **Clipboard sync** with explicit per-device permission + per-event size
-   caps (protocol slot: control messages).
+9. **Clipboard sync — SHIPPED** (`host/service/src/clipboard.rs`): text
+   clipboard, per-device grant (deny by default, panel-toggled, live-
+   revocable), `clipboard_max_bytes` cap enforced both directions, Windows
+   CF_UNICODETEXT backend with sequence-number change detection. Remaining:
+   image clipboard (protocol has room: a future `clipboard_image` message).
 10. **File drop** with explicit accept dialog per transfer.
 11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
     already parameterized by `MaxMonitorsSupported`), per-client monitor
