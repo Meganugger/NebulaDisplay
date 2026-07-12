@@ -70,6 +70,14 @@ struct ClientView {
 }
 
 #[derive(Serialize)]
+struct AudioView {
+    /// Host audio pipeline is running (config `audio = true`).
+    available: bool,
+    /// Sessions currently receiving audio (the visible indicator).
+    listeners: u64,
+}
+
+#[derive(Serialize)]
 struct StatusView {
     name: String,
     version: String,
@@ -78,6 +86,7 @@ struct StatusView {
     pin: String,
     viewer_urls: Vec<String>,
     mode: ndsp_protocol::messages::DisplayMode,
+    audio: AudioView,
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
     trusted: Vec<TrustedDeviceView>,
@@ -136,6 +145,14 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             .map(|ip| format!("http://{ip}:{port}/"))
             .collect(),
         mode: *state.mode.lock().unwrap(),
+        audio: AudioView {
+            available: state
+                .audio_available
+                .load(std::sync::atomic::Ordering::Relaxed),
+            listeners: state
+                .audio_listeners
+                .load(std::sync::atomic::Ordering::Relaxed),
+        },
         host_stats: state.host_stats.lock().unwrap().clone(),
         clients,
         trusted,

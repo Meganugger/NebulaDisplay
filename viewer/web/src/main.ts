@@ -2,6 +2,7 @@
 
 import "./style.css";
 import { capabilityReport, caps, fullscreen, storage } from "./caps";
+import { AudioPlayer, audioPlaybackSupported } from "./audio";
 import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
@@ -30,6 +31,7 @@ const inputDenied = $("input-denied");
 const toast = $("toast");
 const remoteCursor = $<HTMLImageElement>("remote-cursor");
 const clipboardBtn = $<HTMLButtonElement>("clipboard-btn");
+const audioBtn = $<HTMLButtonElement>("audio-btn");
 
 let session: Session | null = null;
 let renderer: Renderer | null = null;
@@ -44,6 +46,10 @@ let clipboardKnown = false; // first grant notice is state, not a change
 /** Host clipboard text we couldn't write automatically (needs a gesture). */
 let pendingRemoteClipboard: string | null = null;
 const MAX_CLIPBOARD_BYTES = 256 * 1024;
+/** Host audio state (channel 3). Off until the user presses the button. */
+let audioAvailable = false;
+let audioOn = false;
+let audioPlayer: AudioPlayer | null = null;
 /** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
 let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
@@ -132,6 +138,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
       },
       onControl: onControl,
       onClose: (reason) => onSessionClosed(host, reason),
+      onAudio: (frame) => audioPlayer?.push(frame),
     });
     session = s;
     renderer.requestKeyframe = () => void s.send({ type: "request_keyframe" });
@@ -198,6 +205,11 @@ function onControl(msg: ControlMsg): void {
       inputAllowed = Boolean(msg.allowed);
       refreshInputBadge();
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
+      break;
+    }
+    case "audio_status": {
+      audioAvailable = Boolean(msg.available);
+      refreshAudioBtn();
       break;
     }
     case "clipboard_grant": {
@@ -357,6 +369,33 @@ async function onClipboardClick(): Promise<void> {
   showToast("📋 Sent to host clipboard");
 }
 
+function refreshAudioBtn(): void {
+  const supported = audioPlaybackSupported();
+  audioBtn.disabled = !audioAvailable || !supported;
+  audioBtn.textContent = audioOn ? "🔊" : "🔇";
+  audioBtn.title = !supported
+    ? "Audio needs WebCodecs (Chromium/Safari on a secure or localhost origin)"
+    : !audioAvailable
+      ? "Host audio streaming is off (enable `audio = true` in the host config)"
+      : audioOn
+        ? "Mute host audio"
+        : "Play host audio";
+}
+
+async function onAudioClick(): Promise<void> {
+  if (!session) return;
+  audioOn = !audioOn;
+  if (audioOn) {
+    audioPlayer ??= new AudioPlayer();
+    await audioPlayer.resume(); // inside the click gesture → autoplay-safe
+  } else {
+    audioPlayer?.close();
+    audioPlayer = null;
+  }
+  void session.send({ type: "set_audio", enabled: audioOn });
+  refreshAudioBtn();
+}
+
 function refreshInputBadge(): void {
   const wantsInput = (input?.mode ?? "view_only") !== "view_only";
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
@@ -372,6 +411,9 @@ function enterViewer(s: Session): void {
   clipboardKnown = false;
   pendingRemoteClipboard = null;
   refreshClipboardBtn();
+  audioOn = false;
+  audioAvailable = false;
+  refreshAudioBtn();
 
   input = new InputCapture(
     canvas,
@@ -433,6 +475,9 @@ function endSession(reason: string): void {
   if (!session) return;
   window.clearInterval(statsTimer);
   window.clearInterval(pingTimer);
+  audioPlayer?.close();
+  audioPlayer = null;
+  audioOn = false;
   input?.detach();
   input = null;
   renderer?.destroy();
@@ -464,6 +509,7 @@ if (fullscreen.supported) {
   $("fullscreen-btn").style.display = "none";
 }
 clipboardBtn.onclick = () => void onClipboardClick();
+audioBtn.onclick = () => void onAudioClick();
 $("disconnect-btn").onclick = () => {
   userDisconnected = true;
   session?.close();

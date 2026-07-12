@@ -35,6 +35,7 @@ interface Status {
   pin: string;
   viewer_urls: string[];
   mode: { width: number; height: number; refresh_hz: number };
+  audio: { available: boolean; listeners: number };
   host_stats: HostStats;
   clients: ClientView[];
   trusted: TrustedView[];
@@ -80,6 +81,14 @@ async function refresh(): Promise<void> {
     line("Version", esc(st.version)),
     line("Mode", `${st.mode.width}×${st.mode.height}`),
     line("Identity", `<span class="mono">${esc(st.fingerprint.slice(0, 16))}…</span>`),
+    line(
+      "Audio",
+      st.audio.available
+        ? st.audio.listeners > 0
+          ? `<span class="tag on">🔊 streaming to ${st.audio.listeners}</span>`
+          : "enabled, no listeners"
+        : "off",
+    ),
   ].join("");
   $("urls").innerHTML =
     st.viewer_urls.map((u) => `<a href="${esc(u)}" target="_blank">${esc(u)}</a>`).join("<br>") ||

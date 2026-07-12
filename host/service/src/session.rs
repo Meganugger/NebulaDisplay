@@ -30,7 +30,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, VideoFrame},
     messages::{ControlMsg, InputMode, Profile},
 };
 use std::net::SocketAddr;
@@ -187,6 +187,8 @@ pub async fn run(
         sealer,
         ctl_rx,
         vid_rx,
+        state.audio_tx.subscribe(),
+        audio_active.clone(),
         shared.clone(),
         consumed_seq.clone(),
     ));
@@ -225,15 +227,26 @@ pub async fn run(
     // current value seen: a viewer only receives copies made after it
     // connected, never whatever happened to be on the clipboard before.
     let mut clipboard_rx = state.clipboard.subscribe();
-    // Tell the client its clipboard grant up front (input arrives in AuthOk;
-    // clipboard rides the control channel to keep AuthOk stable).
-    if ctl_tx
-        .send(ControlMsg::ClipboardGrant {
+    // Tell the client its clipboard grant + audio availability up front
+    // (input arrives in AuthOk; these ride the control channel to keep
+    // AuthOk stable).
+    let initial = [
+        ControlMsg::ClipboardGrant {
             allowed: clipboard_allowed.load(Ordering::Relaxed),
-        })
-        .await
-        .is_err()
-    {
+        },
+        ControlMsg::AudioStatus {
+            available: state.audio_available.load(Ordering::Relaxed),
+            active: false,
+        },
+    ];
+    let mut initial_send_failed = false;
+    for msg in initial {
+        if ctl_tx.send(msg).await.is_err() {
+            initial_send_failed = true;
+            break;
+        }
+    }
+    if initial_send_failed {
         state.unregister_client(client_id);
         pump.abort();
         video.abort();
@@ -344,17 +357,28 @@ pub async fn run(
     state.unregister_client(client_id);
     pump.abort();
     video.abort();
+    // Wait for the pump to actually stop: afterwards nothing can flip
+    // audio_active anymore, so the listener slot is released exactly once.
+    let _ = (&mut pump).await;
+    if handle.audio_active.swap(false, Ordering::Relaxed) {
+        state.audio_listeners.fetch_sub(1, Ordering::Relaxed);
+    }
     drop(ctl_tx); // writer exits once both inputs are gone
     writer.abort();
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts video; video is latest-only.
+/// Owns the socket sink. Priority: control > audio > video; video is
+/// latest-only, audio is latest-only too (Opus PLC absorbs a skipped 20 ms
+/// packet; a queue would turn one slow write into permanent audio delay).
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
+    mut aud_rx: watch::Receiver<Option<Arc<AudioFrame>>>,
+    audio_on: Arc<AtomicBool>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
 ) {
@@ -366,6 +390,15 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+            }
+
+            changed = aud_rx.changed(), if audio_on.load(Ordering::Relaxed) => {
+                if changed.is_err() { break; }
+                let frame = aud_rx.borrow_and_update().clone();
+                let Some(af) = frame else { continue };
+                let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &af.payload]);
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
 
@@ -632,6 +665,21 @@ async fn incoming_pump(
                         }
                         ControlMsg::SetInputMode { mode } => {
                             shared.input_mode.store(mode_to_u8(mode), Ordering::Relaxed);
+                        }
+                        ControlMsg::SetAudio { enabled } => {
+                            let available = state.audio_available.load(Ordering::Relaxed);
+                            let effective = enabled && available;
+                            let was = handle.audio_active.swap(effective, Ordering::Relaxed);
+                            if !was && effective {
+                                state.audio_listeners.fetch_add(1, Ordering::Relaxed);
+                            } else if was && !effective {
+                                state.audio_listeners.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            debug!(enabled, available, "viewer set audio");
+                            let _ = ctl_tx.try_send(ControlMsg::AudioStatus {
+                                available,
+                                active: effective,
+                            });
                         }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);

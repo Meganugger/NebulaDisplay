@@ -7,10 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["h264"]
+default = ["h264", "audio"]
 # OpenH264 software encoder (built from source; BSD-2-Clause). Disable to fall
 # back to JPEG-only streaming: `cargo build --no-default-features`.
 h264 = ["dep:openh264", "dep:openh264-sys2"]
+# Opus audio streaming (libopus built from source via cmake; BSD-3-Clause).
+audio = ["dep:opus"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
@@ -37,6 +39,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 openh264 = { version = "0.9", optional = true }
 # Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
 openh264-sys2 = { version = "0.9", optional = true }
+opus = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -55,6 +58,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Variant",
@@ -62,3 +68,6 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 ndsp-client = { workspace = true }
+# e2e tests decode the streamed audio to prove packets are real Opus.
+opus = "0.3"
+

@@ -102,6 +102,11 @@ pub struct AppState {
     /// when the platform exposes one — used for multi-monitor input mapping.
     pub capture_rect: Mutex<Option<(i32, i32, i32, i32)>>,
     pub clients: Mutex<HashMap<u64, Arc<ClientHandle>>>,
+    /// Number of sessions currently opted into audio — lets the audio
+    /// pipeline skip Opus encoding entirely while nobody listens.
+    pub audio_listeners: AtomicU64,
+    /// An audio pipeline is running (config `audio = true` and spawn ok).
+    pub audio_available: AtomicBool,
     next_client_id: AtomicU64,
     serving_port: AtomicU64,
     shutdown: AtomicBool,
@@ -137,6 +142,8 @@ impl AppState {
             }),
             capture_rect: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
+            audio_listeners: AtomicU64::new(0),
+            audio_available: AtomicBool::new(false),
             next_client_id: AtomicU64::new(1),
             serving_port: AtomicU64::new(ndsp_protocol::DEFAULT_PORT as u64),
             shutdown: AtomicBool::new(false),

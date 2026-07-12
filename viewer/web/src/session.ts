@@ -19,6 +19,8 @@ import {
 } from "./crypto";
 import { Spake2Client } from "./pake";
 import {
+  AudioFrame,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
   ControlMsg,
@@ -30,6 +32,7 @@ import {
   Sealer,
   VideoFrame,
   WS_PATH,
+  parseAudioFrame,
   parseVideoFrame,
   td,
   te,
@@ -39,6 +42,8 @@ export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
+  /** Encrypted audio channel (only flows after SetAudio{enabled:true}). */
+  onAudio?(frame: AudioFrame): void;
 }
 
 export interface SessionInfo {
@@ -193,6 +198,8 @@ export class Session {
           const { chan, plaintext } = await opener.open(data);
           if (chan === CHANNEL_VIDEO) {
             events.onVideo(parseVideoFrame(plaintext));
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio?.(parseAudioFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
           }

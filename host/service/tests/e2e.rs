@@ -483,6 +483,179 @@ async fn clipboard_sync_is_permission_gated_and_size_capped() {
     host.shutdown().await;
 }
 
+/// Audio (channel 3): opt-in per session, real Opus packets that decode,
+/// clean disable, and never streamed to sessions that didn't ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_is_opt_in_and_delivers_decodable_opus() {
+    let host = start_host_with(
+        "audio",
+        EmbeddedOptions {
+            audio: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pin = host.state.pins.current_pin();
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Audio tablet"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+
+    // Initial status announces availability without activity.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("initial audio status timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::AudioStatus { available, active }) => {
+                assert!(available, "test host has the audio pipeline enabled");
+                assert!(!active, "audio must be off until requested");
+                break;
+            }
+            Incoming::Audio(_) => panic!("audio frame before opt-in"),
+            Incoming::Closed => panic!("closed early"),
+            _ => {}
+        }
+    }
+
+    // No audio without opt-in (while video flows).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio frame before opt-in"),
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Opt in → status flips active and Opus packets arrive.
+    session
+        .send(&ControlMsg::SetAudio { enabled: true })
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    let mut got_active = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while frames.len() < 5 {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("audio frames timeout")
+            .unwrap()
+        {
+            Incoming::Audio(f) => frames.push(f),
+            Incoming::Control(ControlMsg::AudioStatus { active, .. }) => got_active = active,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert!(got_active, "server must confirm audio is active");
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // Packets are valid 20 ms 48 kHz stereo Opus with increasing seq.
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0f32; 960 * 2];
+    let mut nonzero = false;
+    for f in &frames {
+        assert_eq!(f.sample_rate, 48_000);
+        assert_eq!(f.channels, 2);
+        let n = decoder.decode_float(&f.payload, &mut pcm, false).unwrap();
+        assert_eq!(n, 960, "one 20 ms packet per frame");
+        nonzero |= pcm.iter().any(|s| s.abs() > 1e-4);
+    }
+    assert!(nonzero, "test tone must not decode to pure silence");
+    for w in frames.windows(2) {
+        assert!(w[1].seq > w[0].seq, "audio seq must increase");
+    }
+
+    // Disable → stream stops and the listener slot is released.
+    session
+        .send(&ControlMsg::SetAudio { enabled: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Drain anything sent before the disable landed.
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(50), session.recv()).await {}
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio kept flowing after disable"),
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// A host without the audio pipeline reports unavailability and ignores
+/// opt-ins gracefully.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_unavailable_is_reported() {
+    let host = start_host("noaudio").await;
+    let pin = host.state.pins.current_pin();
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Silent viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    session
+        .send(&ControlMsg::SetAudio { enabled: true })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_reply = false;
+    while !saw_reply {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("status timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::AudioStatus { available, active }) => {
+                // Initial notice and the opt-in reply both must say "no".
+                assert!(!available);
+                if !active {
+                    saw_reply = true;
+                }
+            }
+            Incoming::Audio(_) => panic!("audio from a host without a pipeline"),
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    session.close().await;
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fingerprint_mismatch_blocks_token_send() {
     let host = start_host("fp").await;

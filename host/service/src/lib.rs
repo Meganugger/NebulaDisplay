@@ -2,6 +2,7 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod config;
@@ -72,6 +73,12 @@ impl EmbeddedHost {
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);
+
+        if audio::spawn_if_enabled(state.clone()) {
+            state
+                .audio_available
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();
