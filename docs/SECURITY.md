@@ -25,30 +25,50 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 * Handshake: ephemeral **ECDH P-256** per connection → **HKDF-SHA256** →
   **AES-256-GCM** session key. Forward secrecy: recording traffic and later
   stealing the trust store does not decrypt past sessions.
-* Pairing: the session is bound to a **single-use, TTL-limited PIN** via
-  `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`. The PIN never
-  crosses the wire; an active MITM without it cannot complete pairing.
+* Pairing (preferred path): **NDSP-PAKE v1**, a CPace-style balanced PAKE on
+  P-256 — the PIN is hashed into a fresh group generator (RFC 9380
+  hash-to-curve) and both sides run Diffie-Hellman on it, with channel
+  binding to the connection nonce, device id and host fingerprint. The PIN
+  never crosses the wire, **and a recorded transcript cannot be brute-forced
+  offline**: every PIN guess costs a CDH instance. An active guesser gets
+  one online attempt per connection (rate-limited; PIN rotates on failure).
+  Interop between the Rust host and the web viewer is pinned by an RFC 9380
+  test vector on both stacks + a full cross-stack handshake test in CI.
+* Pairing (legacy path, for not-yet-updated mobile viewers): session bound
+  to the single-use, TTL-limited PIN via
+  `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`. Subject to the
+  offline-grinding caveat below; hosts can refuse it entirely with
+  `allow_legacy_pairing = false`.
 * Reconnect: 256-bit per-device token; proof = SHA-256 over token + nonce +
   both ephemeral keys (transcript binding defeats key-substitution MITM).
   Clients pin the host fingerprint and refuse proofs to a changed host.
 * Envelopes: per-direction/channel monotonic counters inside the GCM nonce +
   counter regression rejection = replay protection; channel byte is AAD.
+* At rest: the host trust store and the desktop viewer's credentials are
+  **DPAPI-protected on Windows** (user-scope OS keystore; a copied file is
+  useless on another machine/account) and mode-0600 on unix.
+* Optional TLS (`tls = true`): the viewer endpoint serves HTTPS/WSS behind a
+  per-install self-signed certificate. Native clients pin its SHA-256
+  fingerprint (`--tls-pin` / `Transport::TlsPinned`); browsers accept it
+  once. This protects the *web viewer code* against on-path tampering on
+  hostile LANs — NDSP's own encryption never depended on it.
 
 ### Known cryptographic limitations (honest)
 
-1. **Offline PIN grinding**: a passive attacker who records a *pairing*
-   exchange can brute-force the 6-digit PIN offline against `pair_confirm`.
-   Mitigations today: PINs are single-use, expire in 5 min, rotate on every
-   failure, and pairing is rare. Fix planned: **PAKE (SPAKE2/CPace)** so the
-   transcript is un-grindable (ROADMAP P1).
-2. **No TLS layer**: HTTP serving the web viewer JS is plaintext on the LAN —
-   an active LAN attacker could tamper the *viewer code* before crypto starts
-   (native viewers are immune). Documented trade-off; mitigations: QR/manual
-   fingerprint display, native clients, planned self-signed-cert + fingerprint
-   pinning option.
-3. Trust tokens are stored **raw** at rest (0600) on host and clients: proofs
-   are keyed hashes, so the verifier needs the key. Host compromise already
-   means screen compromise; still, an OS-keystore upgrade is planned.
+1. **Offline PIN grinding — legacy pairing only**: a passive attacker who
+   records a *legacy* pairing exchange can brute-force the 6-digit PIN
+   offline against `pair_confirm`. The PAKE path (used by the web viewer,
+   desktop viewer and client SDK) is immune; the legacy path remains
+   accepted by default only for the Android/iOS apps until they ship PAKE
+   (set `allow_legacy_pairing = false` to refuse it). Legacy mitigations
+   remain: PINs are single-use, expire in 5 min, rotate on every failure.
+2. **Web viewer code delivery**: with TLS off (the default), the HTTP page
+   serving the viewer JS is plaintext on the LAN — an active LAN attacker
+   could tamper the *viewer code* before crypto starts (native viewers are
+   immune). Mitigations: the optional TLS mode above, QR/manual fingerprint
+   display, native clients.
+3. macOS Keychain / Linux secret-service backends for at-rest credential
+   protection are not yet wired (0600 files there; DPAPI on Windows is).
 
 ## Controls by threat
 
@@ -59,6 +79,7 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 | Stolen trust token file (client) | Token useless without matching device_id? No — token is the credential: **revoke from the panel**; tokens are per-device so revocation is surgical |
 | Rogue host at same IP | Client-side fingerprint pinning (tested) |
 | Input abuse | Input **denied by default** per device; grants are live-revocable; sessions enforce grant server-side on every event batch |
+| Clipboard exfiltration | Clipboard sync **denied by default** per device; grants are live-revocable; 256 KiB per-event cap; nothing is pushed to a newly connected device (changes only); enforced server-side both directions |
 | Replay/reorder injection | Envelope counters + GCM |
 | Panel exposure | Panel binds 127.0.0.1 only; contains PIN/grants; never reachable from LAN |
 | Driver attack surface | Driver has no network code; validates geometry; ring is `Local\` namespace |
@@ -80,8 +101,10 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
   unless the user configures it.
 * Audio capture is **off** and unimplemented until the WASAPI feature lands —
   it will be opt-in per device with a visible indicator (ROADMAP).
-* Clipboard/file transfer: designed permission-gated, not yet implemented —
-  the protocol reserves message space; nothing is shared implicitly.
+* Clipboard sync is **off by default** and permission-gated per device (panel
+  toggle, live-revocable); only explicit changes are forwarded, text only,
+  size-capped. File transfer remains unimplemented (protocol space reserved);
+  nothing is shared implicitly.
 
 ## Reporting
 

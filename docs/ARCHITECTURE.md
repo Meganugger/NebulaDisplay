@@ -71,8 +71,11 @@ small-and-preempting (control).
 
 **Application-layer encryption, transport-agnostic.** Instead of relying on
 TLS (self-signed certs on LAN = warning fatigue = users clicking through),
-NDSP runs ECDH-derived AES-256-GCM *inside* the WebSocket. The same envelope
-format will ride QUIC/WebTransport later without protocol changes.
+NDSP runs PAKE/ECDH-derived AES-256-GCM *inside* the WebSocket. The same
+envelope format will ride QUIC/WebTransport later without protocol changes.
+An *optional* TLS layer (`tls = true`, pinned self-signed cert) exists for
+one thing NDSP cannot cover: integrity of the web viewer's JS delivery on
+hostile networks.
 
 **Adaptation uses measured signals only — with hysteresis.** Send-queue
 backpressure (TCP pushback measured per frame), RTT trend vs. observed

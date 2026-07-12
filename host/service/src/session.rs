@@ -56,6 +56,10 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
+    /// Hash of the last clipboard text seen in either direction — echo
+    /// suppression so a client-set clipboard isn't mirrored straight back.
+    last_clip_hash: AtomicU64,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -101,6 +105,15 @@ impl Shared {
     }
 }
 
+/// Non-cryptographic content fingerprint for clipboard echo suppression.
+fn clip_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    // Reserve 0 as "nothing seen yet".
+    h.finish().max(1)
+}
+
 fn mode_to_u8(m: InputMode) -> u32 {
     match m {
         InputMode::ViewOnly => 0,
@@ -133,8 +146,11 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        last_clip_hash: AtomicU64::new(0),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -150,6 +166,7 @@ pub async fn run(
     });
 
     let supports_cursor = auth.client.features.iter().any(|f| f == "cursor");
+    let supports_clipboard = auth.client.features.iter().any(|f| f == "clipboard");
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(8);
     let handle = Arc::new(ClientHandle {
         device_id: auth.client.device_id.clone(),
@@ -161,6 +178,7 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -190,6 +208,7 @@ pub async fn run(
         shared.clone(),
         ctl_tx.clone(),
         input_sink,
+        state.clipboard.clone(),
         handle.clone(),
     ));
     let video = tokio::spawn(video_task(
@@ -214,12 +233,19 @@ pub async fn run(
     cursor_rx.mark_changed();
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
+    // Host-clipboard → viewer forwarding (changes only — the pre-connect
+    // clipboard content is never pushed to a newly connected device).
+    let mut clipboard_rx = state.clipboard_tx.subscribe();
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -261,6 +287,16 @@ pub async fn run(
                     }
                 }
                 if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: cs.visible }).await.is_err() { break; }
+            }
+
+            changed = clipboard_rx.changed(), if supports_clipboard => {
+                if changed.is_err() { continue; }
+                let cs = clipboard_rx.borrow_and_update().clone();
+                if cs.seq == 0 || !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                let hash = clip_hash(&cs.text);
+                // Don't echo a clipboard this client just set (or a repeat).
+                if shared.last_clip_hash.swap(hash, Ordering::Relaxed) == hash { continue; }
+                if ctl_tx.send(ControlMsg::Clipboard { text: (*cs.text).clone() }).await.is_err() { break; }
             }
 
             _ = host_stats_timer.tick() => {
@@ -539,6 +575,7 @@ async fn incoming_pump(
     shared: Arc<Shared>,
     ctl_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
+    clipboard: Arc<dyn crate::clipboard::ClipboardBackend>,
     handle: Arc<ClientHandle>,
 ) {
     while let Some(Ok(msg)) = ws_rx.next().await {
@@ -590,6 +627,31 @@ async fn incoming_pump(
                         }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        ControlMsg::Clipboard { text } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard event (no grant)");
+                                continue;
+                            }
+                            if text.len() > ndsp_protocol::MAX_CLIPBOARD_BYTES {
+                                warn!(len = text.len(), "clipboard event over size cap; dropped");
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "clipboard_too_large".into(),
+                                    message: format!(
+                                        "clipboard sync is capped at {} bytes",
+                                        ndsp_protocol::MAX_CLIPBOARD_BYTES
+                                    ),
+                                });
+                                continue;
+                            }
+                            // Remember it so the poll loop's re-broadcast of
+                            // this very change isn't echoed back.
+                            shared
+                                .last_clip_hash
+                                .store(clip_hash(&text), Ordering::Relaxed);
+                            if let Err(e) = clipboard.set_text(&text) {
+                                warn!("host clipboard write failed: {e:#}");
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");

@@ -25,13 +25,15 @@
 
 use ndsp_protocol::messages::Codec;
 use windows::core::PWSTR;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
-    MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_NV12,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoROIEnabled, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFSample, IMFTransform, METransformHaveOutput,
+    METransformNeedInput, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_ROIRectangle, MFStartup, MFTEnumEx,
+    MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
@@ -172,7 +174,19 @@ pub struct MfH264Encoder {
     frame_index: u64,
     /// Pending NeedInput credits from the event stream.
     need_input_credits: u32,
+    /// Encoder supports per-sample region-of-interest rate-control hints
+    /// (`CODECAPI_AVEncVideoROIEnabled` accepted at init).
+    roi_supported: bool,
     name: String,
+}
+
+/// `ROI_AREA` from codecapi.h (not projected by windows-rs): the payload of
+/// the per-sample `MFSampleExtension_ROIRectangle` blob. `qp_delta` < 0 →
+/// spend relatively more bits inside the rectangle.
+#[repr(C)]
+struct RoiArea {
+    rect: RECT,
+    qp_delta: i32,
 }
 
 // SAFETY: the encoder is owned by one session's video task and never shared;
@@ -291,6 +305,20 @@ impl MfH264Encoder {
             let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
             let _ = codec_api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &variant_u32(0));
 
+            // Region-of-interest rate control (docs/ROADMAP.md P0.3): if the
+            // encoder supports it, dirty-rect hints from the frame differ are
+            // attached per sample so changed content gets the bit budget and
+            // already-transmitted static regions get less.
+            let roi_supported = codec_api
+                .IsSupported(&CODECAPI_AVEncVideoROIEnabled)
+                .is_ok()
+                && codec_api
+                    .SetValue(&CODECAPI_AVEncVideoROIEnabled, &variant_u32(1))
+                    .is_ok();
+            if roi_supported {
+                tracing::info!(encoder = %name, "encoder ROI rate-control hints enabled");
+            }
+
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
@@ -308,6 +336,7 @@ impl MfH264Encoder {
                 current_fps: fps,
                 frame_index: 0,
                 need_input_credits: 0,
+                roi_supported,
                 name,
             })
         }
@@ -315,7 +344,13 @@ impl MfH264Encoder {
 
     /// Pump the MFT's event queue until we can submit input and collect any
     /// output. Returns encoded bytes if a full output sample was produced.
-    fn submit_and_drain(&mut self, timestamp_100ns: i64) -> anyhow::Result<Option<Vec<u8>>> {
+    /// `roi` optionally carries the dirty bounding rectangle (pixels) to
+    /// attach as a rate-control hint.
+    fn submit_and_drain(
+        &mut self,
+        timestamp_100ns: i64,
+        roi: Option<RECT>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         unsafe {
             // Wait for a NeedInput credit (hardware encoders grant them
             // almost immediately at queue depth ≤ 1).
@@ -355,6 +390,18 @@ impl MfH264Encoder {
             sample.AddBuffer(&buf)?;
             sample.SetSampleTime(timestamp_100ns)?;
             sample.SetSampleDuration(10_000_000i64 / self.current_fps.max(1) as i64)?;
+            if let Some(rect) = roi {
+                let roi_area = RoiArea {
+                    rect,
+                    qp_delta: -5, // spend the budget where pixels changed
+                };
+                let bytes = std::slice::from_raw_parts(
+                    (&roi_area as *const RoiArea).cast::<u8>(),
+                    std::mem::size_of::<RoiArea>(),
+                );
+                // Best-effort: a hint, never a hard failure.
+                let _ = sample.SetBlob(&MFSampleExtension_ROIRectangle, bytes);
+            }
             self.mft.ProcessInput(self.in_stream, &sample, 0)?;
             self.need_input_credits -= 1;
 
@@ -504,9 +551,29 @@ impl Encoder for MfH264Encoder {
         self.nv12.fill_from_bgra(&frame.bgra, w, h, Some(&dirty));
         let convert_us = t_conv.elapsed().as_micros() as u32;
 
+        // ROI hint: the dirty bounding rows (full width — the differ works
+        // in row pairs). Only meaningful for delta frames where part of the
+        // frame is static; keyframes refresh everything.
+        let roi = if self.roi_supported && !force_keyframe && dirty.dirty_pairs < dirty.total_pairs
+        {
+            let first = dirty.pairs.iter().position(|d| *d);
+            let last = dirty.pairs.iter().rposition(|d| *d);
+            match (first, last) {
+                (Some(f), Some(l)) => Some(RECT {
+                    left: 0,
+                    top: (f * 2) as i32,
+                    right: w as i32,
+                    bottom: ((l + 1) * 2).min(h) as i32,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         self.frame_index += 1;
         let ts_100ns = (self.frame_index as i64) * 10_000_000 / self.current_fps.max(1) as i64;
-        let payload = self.submit_and_drain(ts_100ns)?.unwrap_or_default();
+        let payload = self.submit_and_drain(ts_100ns, roi)?.unwrap_or_default();
         let keyframe = !payload.is_empty() && annexb_has_idr(&payload);
         Ok(Encoded {
             payload,

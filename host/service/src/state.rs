@@ -55,7 +55,16 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
+    SetClipboardGrant(bool),
     Kick { reason: String },
+}
+
+/// Latest host clipboard text published by the clipboard poll loop.
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardState {
+    /// Monotonic update counter (0 = never updated).
+    pub seq: u64,
+    pub text: Arc<String>,
 }
 
 /// Panel-visible live client entry.
@@ -66,6 +75,7 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
@@ -82,6 +92,10 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Host clipboard backend (Win32 clipboard / in-memory elsewhere).
+    pub clipboard: Arc<dyn crate::clipboard::ClipboardBackend>,
+    /// Latest host clipboard text; granted sessions `watch` and forward it.
+    pub clipboard_tx: watch::Sender<ClipboardState>,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -106,6 +120,7 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (clipboard_tx, _) = watch::channel(ClipboardState::default());
         Ok(Self {
             cfg,
             fingerprint,
@@ -113,6 +128,8 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            clipboard: crate::clipboard::create_backend(),
+            clipboard_tx,
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -206,6 +223,34 @@ impl AppState {
             }
         }
         Ok(found)
+    }
+
+    /// Push a clipboard-grant change both to the persistent store and any
+    /// live session for that device.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Publish new host clipboard text to granted sessions (called by the
+    /// clipboard poll loop).
+    pub fn publish_clipboard(&self, text: String) {
+        self.clipboard_tx.send_modify(|cs| {
+            cs.seq += 1;
+            cs.text = Arc::new(text);
+        });
     }
 
     /// Revoke trust and kick any live session for that device.

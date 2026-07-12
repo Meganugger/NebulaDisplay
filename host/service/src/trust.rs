@@ -1,10 +1,11 @@
 //! Persistent trusted-device store.
 //!
-//! Stored as JSON in the data dir (`devices.json`, mode 0600 on unix). Raw
-//! trust tokens are stored because reconnect proofs are keyed hashes over the
-//! token + handshake transcript (see `docs/SECURITY.md` §Trust store). The
-//! host machine is inside the trust boundary — it renders the screen content
-//! in the first place.
+//! Stored as JSON in the data dir (`devices.json`; DPAPI-protected on
+//! Windows via [`crate::keystore`], mode 0600 on unix). Raw trust tokens are
+//! stored because reconnect proofs are keyed hashes over the token +
+//! handshake transcript (see `docs/SECURITY.md` §Trust store). The host
+//! machine is inside the trust boundary — it renders the screen content in
+//! the first place.
 
 use ndsp_protocol::crypto::{random_bytes, reauth_transcript, token_proof, TOKEN_LEN};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub struct TrustedDevice {
     pub last_seen_unix: u64,
     /// Whether this device may inject input. **Deny by default.**
     pub input_allowed: bool,
+    /// Whether this device may sync clipboards. **Deny by default.**
+    #[serde(default)]
+    pub clipboard_allowed: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -45,11 +49,11 @@ fn now_unix() -> u64 {
 impl TrustStore {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let devices = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str::<StoreFile>(&raw)
-                .map(|f| f.devices)
+            let stored = std::fs::read(&path)?;
+            crate::keystore::unprotect(&stored)
+                .and_then(|raw| Ok(serde_json::from_slice::<StoreFile>(&raw)?.devices))
                 .unwrap_or_else(|e| {
-                    warn!("trust store corrupt ({e}); starting empty (old file kept as .bak)");
+                    warn!("trust store unreadable ({e}); starting empty (old file kept as .bak)");
                     let _ = std::fs::copy(&path, path.with_extension("json.bak"));
                     Vec::new()
                 })
@@ -64,7 +68,9 @@ impl TrustStore {
         let raw = serde_json::to_string_pretty(&StoreFile {
             devices: self.devices.clone(),
         })?;
-        std::fs::write(&tmp, raw)?;
+        // OS-keystore protection where available (DPAPI on Windows);
+        // plaintext + 0600 elsewhere.
+        std::fs::write(&tmp, crate::keystore::protect(raw.as_bytes()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -91,7 +97,8 @@ impl TrustStore {
             token_hex: hex::encode(token),
             created_unix: now_unix(),
             last_seen_unix: now_unix(),
-            input_allowed: false, // never grant input implicitly
+            input_allowed: false,     // never grant input implicitly
+            clipboard_allowed: false, // never grant clipboard implicitly
         });
         self.save()?;
         info!(device_id, name, "device enrolled (input DENIED by default)");
@@ -142,6 +149,20 @@ impl TrustStore {
         dev.input_allowed = allowed;
         self.save()?;
         info!(device_id, allowed, "input grant updated");
+        Ok(true)
+    }
+
+    pub fn set_clipboard_allowed(
+        &mut self,
+        device_id: &str,
+        allowed: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.clipboard_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "clipboard grant updated");
         Ok(true)
     }
 

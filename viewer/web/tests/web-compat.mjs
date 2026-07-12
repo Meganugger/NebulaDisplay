@@ -45,6 +45,18 @@ execSync(
   { cwd: webRoot, stdio: "inherit" },
 );
 const { Session } = await import("/tmp/ndsp-session-bundle.mjs");
+execSync(
+  `npx esbuild src/pake.ts --bundle --format=esm --outfile=/tmp/ndsp-pake-bundle.mjs --log-level=error`,
+  { cwd: webRoot, stdio: "inherit" },
+);
+const { rfc9380SelfTest } = await import("/tmp/ndsp-pake-bundle.mjs");
+
+// The JS hash-to-curve must match the RFC 9380 vector the Rust side pins.
+if (!rfc9380SelfTest()) {
+  console.error("FAIL: JS hash-to-curve does not match the RFC 9380 test vector");
+  process.exit(1);
+}
+console.log("RFC 9380 hash-to-curve vector OK (JS)");
 
 // ---- start a real host -----------------------------------------------------
 const dataDir = mkdtempSync(join(tmpdir(), "ndsp-webcompat-"));
@@ -101,9 +113,11 @@ const hostAddr = `127.0.0.1:${port}`;
 const s1 = await Session.connect(hostAddr, pin, "Node compat tester", events).catch((e) =>
   fail(`pairing failed: ${e.message}`),
 );
-console.log(`paired: codec=${s1.info.codec} mode=${s1.info.mode.width}x${s1.info.mode.height} newlyPaired=${s1.info.newlyPaired}`);
+console.log(`paired: codec=${s1.info.codec} mode=${s1.info.mode.width}x${s1.info.mode.height} newlyPaired=${s1.info.newlyPaired} pake=${s1.info.usedPake}`);
 if (!s1.info.newlyPaired) fail("expected newlyPaired=true");
+if (!s1.info.usedPake) fail("pairing against a current host must use the PAKE path");
 if (s1.info.inputAllowed) fail("input must be denied by default");
+if (s1.info.clipboardAllowed) fail("clipboard must be denied by default");
 
 // Clock-sync ping through the encrypted channel.
 await s1.send({ type: "ping", t0_us: 424242 });
@@ -120,6 +134,24 @@ const pong = controls.find((c) => c.type === "pong");
 if (!pong || pong.t0_us !== 424242) fail("no matching pong");
 console.log("encrypted ping/pong OK");
 if (new Set(frames.map((f) => f.seq)).size !== frames.length) fail("duplicate seq");
+
+// ---- clipboard grant flow (panel API → live clipboard_grant message) -------
+const grantRes = await fetch("http://127.0.0.1:41998/api/grant", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    device_id: store.get("ndsp.deviceId"),
+    allowed: true,
+    capability: "clipboard",
+  }),
+});
+if (!grantRes.ok) fail(`clipboard grant API failed: ${grantRes.status}`);
+for (let i = 0; i < 100 && !controls.some((c) => c.type === "clipboard_grant" && c.allowed); i++)
+  await sleep(50);
+if (!controls.some((c) => c.type === "clipboard_grant" && c.allowed))
+  fail("clipboard_grant never arrived after panel grant");
+await s1.send({ type: "clipboard", text: "web compat clipboard ✓" });
+console.log("clipboard grant + send OK");
 
 s1.close();
 await sleep(300);

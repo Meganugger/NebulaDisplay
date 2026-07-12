@@ -24,3 +24,10 @@ winit = "0.30"
 softbuffer = "0.4"
 zune-jpeg = "0.4"
 openh264 = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (OS keystore) protection for stored trust tokens.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

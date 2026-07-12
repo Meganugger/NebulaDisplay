@@ -99,10 +99,16 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// the *physical* key. `key` optionally carries the layout-resolved
+    /// character (`KeyboardEvent.key`) when it is a single printable char;
+    /// the host prefers it where its own layout can produce that character,
+    /// so typing stays correct across mismatched keyboard layouts.
     Key {
         code: String,
         pressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Touch {
         id: u32,
@@ -207,6 +213,11 @@ pub enum ControlMsg {
         /// Random per-connection nonce (base64, 16 bytes) bound into both
         /// the pairing transcript and token proofs to prevent replay.
         connection_nonce: String,
+        /// PAKE suite the server supports for pairing ("p256-v1"). Clients
+        /// that understand it send `PakeStart` instead of `PairStart`;
+        /// legacy clients ignore the field (unknown-field tolerance).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pake: Option<String>,
     },
     /// Client ephemeral P-256 public key (base64 SEC1 compressed).
     PairStart {
@@ -214,6 +225,16 @@ pub enum ControlMsg {
     },
     /// Server ephemeral key + HKDF salt (both base64).
     PairChallenge {
+        server_pubkey: String,
+        salt: String,
+    },
+    /// PAKE pairing (NDSP-PAKE v1): client share `Ya` (base64, uncompressed
+    /// SEC1). See [`crate::pake`].
+    PakeStart {
+        client_pubkey: String,
+    },
+    /// PAKE server share `Yb` + HKDF salt (both base64).
+    PakeChallenge {
         server_pubkey: String,
         salt: String,
     },
@@ -244,6 +265,9 @@ pub enum ControlMsg {
         mode: DisplayMode,
         /// Whether this device is currently allowed to inject input.
         input_allowed: bool,
+        /// Whether this device is currently allowed to sync clipboards.
+        #[serde(default)]
+        clipboard_allowed: bool,
     },
     AuthErr {
         error: String,
@@ -284,6 +308,16 @@ pub enum ControlMsg {
     /// Server informs the viewer its input grant changed (panel toggle).
     InputGrant {
         allowed: bool,
+    },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
+        allowed: bool,
+    },
+    /// Clipboard text sync, either direction. Only honored for devices with
+    /// the clipboard grant (deny by default) and for payloads within
+    /// [`crate::MAX_CLIPBOARD_BYTES`]. Text only in v1 (no files/images).
+    Clipboard {
+        text: String,
     },
     /// Server is about to switch modes (resolution change etc.).
     ModeChange {
@@ -338,6 +372,7 @@ mod tests {
                 InputEvent::Key {
                     code: "KeyA".into(),
                     pressed: true,
+                    key: Some("a".into()),
                 },
                 InputEvent::Touch {
                     id: 1,
@@ -356,6 +391,34 @@ mod tests {
     fn tagged_format_is_stable() {
         let json = ControlMsg::Ping { t0_us: 42 }.to_json().unwrap();
         assert_eq!(json, r#"{"type":"ping","t0_us":42}"#);
+    }
+
+    #[test]
+    fn key_event_without_layout_hint_still_parses() {
+        // Older clients (and non-printable keys) omit `key` entirely.
+        let msg = ControlMsg::from_json(
+            r#"{"type":"input","events":[{"kind":"key","code":"Enter","pressed":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::Input {
+                events: vec![InputEvent::Key {
+                    code: "Enter".into(),
+                    pressed: true,
+                    key: None,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_roundtrip() {
+        let msg = ControlMsg::Clipboard {
+            text: "hello 📋".into(),
+        };
+        let json = msg.to_json().unwrap();
+        assert_eq!(ControlMsg::from_json(&json).unwrap(), msg);
     }
 
     #[test]

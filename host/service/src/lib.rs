@@ -3,16 +3,19 @@
 
 pub mod adapt;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
 pub mod input;
+pub mod keystore;
 pub mod pairing;
 pub mod panel;
 pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+pub mod tls;
 pub mod trust;
 pub mod util;
 
@@ -28,6 +31,23 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Serve the viewer endpoint over TLS (self-signed per-install cert).
+    pub tls: bool,
+    /// Accept the legacy PIN-HKDF pairing handshake (default true).
+    pub allow_legacy_pairing: bool,
+}
+
+impl Default for EmbeddedOptions {
+    fn default() -> Self {
+        Self {
+            data_dir: std::path::PathBuf::from("nebuladisplay-embedded"),
+            name: "embedded".into(),
+            capture: (320, 240),
+            max_fps: 30,
+            tls: false,
+            allow_legacy_pairing: true,
+        }
+    }
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,6 +68,8 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
+                tls: opts.tls,
+                allow_legacy_pairing: opts.allow_legacy_pairing,
                 ..Default::default()
             },
         };
@@ -58,6 +80,9 @@ impl EmbeddedHost {
         let cap = tokio::spawn(async move {
             capture::run_capture_loop(cap_state, source).await;
         });
+
+        // Host-clipboard → viewers bridge (in-memory backend in tests).
+        let clip = tokio::spawn(clipboard::run_clipboard_loop(state.clone()));
 
         // Bind explicitly so we know the ephemeral port before returning.
         let listener =
@@ -75,15 +100,28 @@ impl EmbeddedHost {
         Ok(Self {
             state,
             port,
-            tasks: vec![cap, srv],
+            tasks: vec![cap, clip, srv],
         })
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.state.trigger_shutdown();
-        for t in self.tasks {
+        for t in std::mem::take(&mut self.tasks) {
             t.abort();
             let _ = t.await; // waits for the capture blocking thread to exit
+        }
+    }
+}
+
+/// A test that panics (or an embedder that forgets `shutdown`) must not
+/// leave the capture `spawn_blocking` thread running: tokio's runtime drop
+/// waits for blocking tasks, which would turn any failed assertion into an
+/// indefinite hang. Signal shutdown so the capture loop exits on its own.
+impl Drop for EmbeddedHost {
+    fn drop(&mut self) {
+        self.state.trigger_shutdown();
+        for t in &self.tasks {
+            t.abort();
         }
     }
 }
