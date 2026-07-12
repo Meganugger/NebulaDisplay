@@ -13,6 +13,7 @@ h264 = ["dep:openh264"]
 [dependencies]
 ndsp-protocol = { workspace = true }
 ndsp-client = { workspace = true }
+ndsp-keystore = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -1,4 +1,5 @@
 //! Credential persistence for the desktop viewer (per-host trust tokens).
+//! At rest: DPAPI-protected on Windows, 0600 file on unix.
 
 use ndsp_client::Credentials;
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,10 @@ fn store_path() -> PathBuf {
 }
 
 fn load_file() -> StoreFile {
-    std::fs::read_to_string(store_path())
+    std::fs::read(store_path())
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .and_then(|raw| ndsp_keystore::open_file(&raw).ok())
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
         .unwrap_or_default()
 }
 
@@ -44,7 +46,11 @@ fn save_file(f: &StoreFile) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(raw) = serde_json::to_string_pretty(f) {
-        let _ = std::fs::write(&path, raw);
+        let sealed = match ndsp_keystore::seal(raw.as_bytes()) {
+            Ok(s) => s,
+            Err(_) => raw.into_bytes(),
+        };
+        let _ = std::fs::write(&path, sealed);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

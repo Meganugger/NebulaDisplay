@@ -80,7 +80,7 @@ export class Renderer {
   }
 
   async push(frame: NdspFrame): Promise<void> {
-    if (frame.codec === "h264") {
+    if (frame.codec === "h264" || frame.codec === "hevc") {
       this.pushH264(frame);
     } else if (frame.codec === "jpeg") {
       await this.pushJpeg(frame);
@@ -203,19 +203,22 @@ export class Renderer {
 
   private pushH264(frame: NdspFrame): void {
     if (!caps.webCodecsH264) {
-      if (caps.mseH264) {
+      // The MSE remux fallback is H.264-only (no hevc on insecure origins —
+      // the client never advertises it there).
+      if (caps.mseH264 && frame.codec === "h264") {
         this.pushH264ViaMse(frame);
         return;
       }
-      // Defensive: the client never advertises h264 without a decoder, so a
-      // misbehaving host is the only way here — fail clearly, don't crash.
-      this.onError?.(new Error("received h264 but no H.264 decoder in this context"));
+      // Defensive: the client never advertises a codec without a decoder, so
+      // a misbehaving host is the only way here — fail clearly, don't crash.
+      this.onError?.(new Error(`received ${frame.codec} but no decoder in this context`));
       return;
     }
     const dec = this.ensureH264();
     if (!this.h264Configured) {
-      // Annex B (no description) → decoder parses SPS/PPS from the stream.
-      dec.configure({ codec: "avc1.42E01F", optimizeForLatency: true });
+      // Annex B (no description) → decoder parses parameter sets in-stream.
+      const codec = frame.codec === "hevc" ? "hev1.1.6.L120.90" : "avc1.42E01F";
+      dec.configure({ codec, optimizeForLatency: true });
       this.h264Configured = true;
     }
     if (this.skipUntilKeyframe && frame.keyframe) {

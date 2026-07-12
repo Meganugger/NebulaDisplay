@@ -118,13 +118,25 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     let pin = state.pins.current_pin();
     let ips = util::local_ips();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     println!("\n  NebulaDisplay host ready");
     println!("  ── Viewer URLs ─────────────────────────────");
     for ip in &ips {
-        println!("     http://{ip}:{port}/");
+        println!("     {scheme}://{ip}:{port}/");
     }
     if ips.is_empty() {
-        println!("     http://<this-machine-ip>:{port}/");
+        println!("     {scheme}://<this-machine-ip>:{port}/");
+    }
+    if state.cfg.file.https {
+        if let Ok(m) = nebulad::tls::load_or_create(&state.cfg.data_dir) {
+            println!("  ── TLS certificate (self-signed) ───────────");
+            println!("     SHA-256 {}", m.fingerprint);
+            println!("     Browsers warn once — compare this fingerprint.");
+        }
     }
     println!("  ── Pairing PIN (single-use) ────────────────");
     println!("     {pin}");

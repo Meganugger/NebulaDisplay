@@ -138,6 +138,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             online: online.contains(&d.device_id),
         })
         .collect();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     Json(StatusView {
         name: state.cfg.name.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -146,7 +151,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
         pin: state.pins.current_pin(),
         viewer_urls: local_ips()
             .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
+            .map(|ip| format!("{scheme}://{ip}:{port}/"))
             .collect(),
         mode: *state.mode.lock().unwrap(),
         host_stats: state.host_stats.lock().unwrap().clone(),
@@ -248,8 +253,13 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{scheme}://{ip}:{port}/?pin={pin}&fp={}",
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

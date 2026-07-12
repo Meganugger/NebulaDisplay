@@ -879,3 +879,111 @@ async fn audio_disabled_by_default_and_streams_opus_when_enabled() {
     session.close().await;
     host.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Optional HTTPS (roadmap P1.7)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_serves_viewer_with_persistent_self_signed_cert() {
+    use std::sync::Arc as StdArc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = std::env::temp_dir().join(format!("ndsp-e2e-https-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Cert material persists across "restarts".
+    let m1 = nebulad::tls::load_or_create(&dir).unwrap();
+    let m2 = nebulad::tls::load_or_create(&dir).unwrap();
+    assert_eq!(m1.fingerprint, m2.fingerprint);
+
+    // Boot a TLS host on a free port.
+    let port = {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        sock.local_addr().unwrap().port()
+    };
+    let cfg = nebulad::config::Config {
+        name: "https-host".into(),
+        data_dir: dir.clone(),
+        web_dir: None,
+        file: nebulad::config::FileConfig {
+            https: true,
+            ..Default::default()
+        },
+    };
+    let state = StdArc::new(nebulad::state::AppState::new(cfg).await.unwrap());
+    let srv_state = state.clone();
+    tokio::spawn(async move {
+        let _ = nebulad::server::run(srv_state, "127.0.0.1".parse().unwrap(), port).await;
+    });
+
+    // TLS client that pins nothing (test) but records the presented cert.
+    #[derive(Debug)]
+    struct NoVerify;
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    let tls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(StdArc::new(NoVerify))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(StdArc::new(tls_cfg));
+
+    // Retry until the server is up.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let mut tls = connector.connect(name, tcp).await?;
+            tls.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await?;
+            let mut buf = Vec::new();
+            tls.read_to_end(&mut buf).await?;
+            anyhow::Ok(String::from_utf8_lossy(&buf).to_string())
+        };
+        match attempt.await {
+            Ok(b) => break b,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("HTTPS endpoint never came up: {e:#}"),
+        }
+    };
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(body.ends_with("ok"), "{body}");
+
+    state.trigger_shutdown();
+}

@@ -1,6 +1,6 @@
 // NDSP session: connect → (pair | token reconnect) → encrypted session.
 
-import { caps, probeH264Decode } from "./caps";
+import { caps, probeH264Decode, probeHevcDecode } from "./caps";
 import {
   b64decode,
   b64encode,
@@ -289,6 +289,9 @@ async function supportedCodecs(): Promise<string[]> {
   //   origins, where WebCodecs doesn't exist at all).
   const codecs = ["jpeg"];
   if ((await probeH264Decode()) || caps.mseH264) codecs.unshift("h264");
+  // HEVC ahead of H.264 when decodable — better quality per bit, and the
+  // host only picks it when it has a hardware HEVC encoder.
+  if (await probeHevcDecode()) codecs.unshift("hevc");
   return codecs;
 }
 

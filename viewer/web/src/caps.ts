@@ -125,6 +125,32 @@ let h264Probe: Promise<boolean> | null = null;
  * codecs expose VideoDecoder yet reject avc1 configs — advertising h264
  * there would produce a black canvas. Memoized.
  */
+let hevcProbe: Promise<boolean> | null = null;
+
+/**
+ * WebCodecs HEVC decode probe (Annex-B, hardware-backed on most platforms).
+ * Only ever true in secure contexts; feeds codec negotiation so the host
+ * can pick its hardware HEVC encoder when both ends support it.
+ */
+export function probeHevcDecode(): Promise<boolean> {
+  if (!caps.webCodecsH264) return Promise.resolve(false); // no VideoDecoder at all
+  if (!hevcProbe) {
+    hevcProbe = (async () => {
+      try {
+        if (typeof VideoDecoder.isConfigSupported !== "function") return false;
+        const res = await VideoDecoder.isConfigSupported({
+          codec: "hev1.1.6.L120.90",
+          optimizeForLatency: true,
+        });
+        return res.supported === true;
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return hevcProbe;
+}
+
 export function probeH264Decode(): Promise<boolean> {
   if (!caps.webCodecsH264) return Promise.resolve(false);
   if (!h264Probe) {

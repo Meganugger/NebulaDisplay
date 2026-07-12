@@ -17,6 +17,7 @@ audio = ["dep:opus"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
+ndsp-keystore = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
@@ -38,6 +39,8 @@ uuid = { version = "1", features = ["v4"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 opus = { version = "0.3", optional = true }
+rcgen = "0.13"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 openh264 = { version = "0.9", optional = true }
 # Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
 openh264-sys2 = { version = "0.9", optional = true }
@@ -72,4 +75,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+tokio-rustls = "0.26"
+rustls = "0.23"
 ndsp-client = { workspace = true }

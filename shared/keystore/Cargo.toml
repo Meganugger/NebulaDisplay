@@ -1,0 +1,16 @@
+[package]
+name = "ndsp-keystore"
+description = "At-rest protection for NebulaDisplay secrets (DPAPI on Windows, 0600 files elsewhere)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

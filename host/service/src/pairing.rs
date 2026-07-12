@@ -98,13 +98,13 @@ impl ServerHandshake {
     }
 
     /// Codec the server will actually stream, honoring client preference
-    /// order among codecs the build supports.
+    /// order among codecs the build/hardware supports.
     fn select_codec(&self) -> Codec {
         for c in &self.client_codecs {
             match c {
                 Codec::Jpeg => return Codec::Jpeg,
-                #[cfg(feature = "h264")]
-                Codec::H264 => return Codec::H264,
+                Codec::H264 if crate::encode::h264_available() => return Codec::H264,
+                Codec::Hevc if crate::encode::hevc_hw_available() => return Codec::Hevc,
                 _ => continue,
             }
         }
