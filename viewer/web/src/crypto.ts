@@ -20,6 +20,8 @@ import { b64decode, b64encode, te } from "./protocol";
 export const CONFIRM_CONTEXT = te.encode("ndsp-confirm-v1");
 const PAIR_INFO = te.encode("ndsp-pair-v1");
 const SESSION_INFO = te.encode("ndsp-session-v1");
+const PAIR_PAKE_INFO = te.encode("ndsp-pair-pake-v1");
+const SESSION_PAKE_INFO = te.encode("ndsp-session-pake-v1");
 
 export interface HandshakeKeys {
   publicRaw: Uint8Array; // uncompressed SEC1 (65 bytes)
@@ -61,6 +63,26 @@ export async function sessionKeyBytes(
   nonce: Uint8Array,
 ): Promise<Uint8Array> {
   return hkdfSha256(shared, salt, concat(SESSION_INFO, nonce));
+}
+
+/** PAKE-augmented pairing key: ikm = ecdh_shared ‖ pake_secret. */
+export async function pairingKeyPake(
+  shared: Uint8Array,
+  pakeSecret: Uint8Array,
+  salt: Uint8Array,
+  nonce: Uint8Array,
+): Promise<Uint8Array> {
+  return hkdfSha256(concat(shared, pakeSecret), salt, concat(PAIR_PAKE_INFO, nonce));
+}
+
+/** Session key for PAKE-paired connections. */
+export async function sessionKeyBytesPake(
+  shared: Uint8Array,
+  pakeSecret: Uint8Array,
+  salt: Uint8Array,
+  nonce: Uint8Array,
+): Promise<Uint8Array> {
+  return hkdfSha256(concat(shared, pakeSecret), salt, concat(SESSION_PAKE_INFO, nonce));
 }
 
 export async function importAesKey(raw: Uint8Array): Promise<AesGcmKey> {

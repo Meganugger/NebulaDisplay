@@ -28,6 +28,9 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Full file-config knobs (PAKE policy, audio, clipboard/file caps, …).
+    /// `max_fps` above overrides `file.max_fps`.
+    pub file: FileConfig,
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,7 +51,7 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
-                ..Default::default()
+                ..opts.file
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);

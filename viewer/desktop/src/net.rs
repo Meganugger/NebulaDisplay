@@ -155,6 +155,9 @@ async fn session_loop(
             Err(_) => continue, // poll input again
             Ok(Err(e)) => return Ok(format!("connection error: {e:#}")),
             Ok(Ok(Incoming::Closed)) => return Ok("host closed the connection".into()),
+            // This viewer doesn't advertise the "audio" feature; ignore any
+            // stray audio frames rather than failing.
+            Ok(Ok(Incoming::Audio(_))) => {}
             Ok(Ok(Incoming::Video(frame))) => match decoder.decode(&frame) {
                 Ok(Some(rgba)) => {
                     *shared.latest.lock().unwrap() = Some(rgba);

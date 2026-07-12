@@ -69,6 +69,13 @@ pub enum Codec {
     Av1,
 }
 
+/// Audio codecs a peer can produce/consume (channel 3).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCodec {
+    Opus,
+}
+
 /// Input capabilities / modes a viewer may request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -99,10 +106,16 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// a *physical* key position. `key` is the layout-resolved
+    /// `KeyboardEvent.key` value when the viewer has one; the host prefers
+    /// the scancode from `code` and falls back to injecting the `key`
+    /// character for layouts where the two disagree (AZERTY, Dvorak, …).
     Key {
         code: String,
         pressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Touch {
         id: u32,
@@ -123,6 +136,20 @@ pub enum InputEvent {
     /// IME/committed text that has no single key code.
     Text {
         text: String,
+    },
+    /// Gamepad state snapshot (W3C Gamepad API "standard" mapping).
+    /// `buttons` is a bitmask indexed by standard-mapping button order
+    /// (bit 0 = A/Cross … bit 16 = Home). Sticks are `-1.0..=1.0`,
+    /// triggers `0.0..=1.0`. Injected on Windows via
+    /// `Windows.UI.Input.Preview.Injection` when available.
+    Gamepad {
+        buttons: u32,
+        left_x: f32,
+        left_y: f32,
+        right_x: f32,
+        right_y: f32,
+        left_trigger: f32,
+        right_trigger: f32,
     },
 }
 
@@ -211,11 +238,23 @@ pub enum ControlMsg {
     /// Client ephemeral P-256 public key (base64 SEC1 compressed).
     PairStart {
         client_pubkey: String,
+        /// PIN-bound PAKE share (base64 ristretto255 element, see
+        /// `crate::pake`). Present when the client supports PAKE pairing
+        /// and is authenticating with a PIN. Absent for token reconnects
+        /// and legacy clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pake_share: Option<String>,
     },
     /// Server ephemeral key + HKDF salt (both base64).
     PairChallenge {
         server_pubkey: String,
         salt: String,
+        /// Server's PAKE share; present iff the client sent one and the
+        /// server accepted PAKE mode. Both sides then derive keys with
+        /// `pairing_key_pake`/`session_key_pake` instead of the legacy
+        /// PIN-in-HKDF construction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pake_share: Option<String>,
     },
     /// AES-GCM(seal) of `"ndsp-confirm-v1" || connection_nonce` under the
     /// PIN-bound pairing key. Proves the client knew the PIN.
@@ -306,6 +345,59 @@ pub enum ControlMsg {
         y: f32,
         visible: bool,
     },
+    /// Clipboard content, either direction. Only honored when the device's
+    /// clipboard grant is on (deny by default, panel toggle) and the payload
+    /// is within the host's size cap. `data` is base64; `format` is "text"
+    /// (UTF-8) — reserved for future formats.
+    ClipboardData {
+        format: String,
+        data: String,
+    },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
+        allowed: bool,
+    },
+
+    /// Viewer offers a file (drag & drop). Nothing transfers until the host
+    /// user explicitly accepts in the panel. `sha256` is hex of the full file.
+    FileOffer {
+        transfer_id: u32,
+        name: String,
+        size: u64,
+        sha256: String,
+    },
+    /// Host user accepted the transfer — sender may stream chunks on the
+    /// file channel (4).
+    FileAccept {
+        transfer_id: u32,
+    },
+    FileReject {
+        transfer_id: u32,
+        reason: String,
+    },
+    /// Receiver → sender: transfer finished (hash verified) or failed.
+    FileDone {
+        transfer_id: u32,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Viewer requests host audio on/off for this session. The host only
+    /// streams when its global audio config is enabled AND the session asked.
+    SetAudio {
+        enabled: bool,
+    },
+    /// Server → client: audio streaming started with these parameters.
+    /// Frames follow on channel 3 (see `media::AudioFrame`).
+    AudioStart {
+        codec: AudioCodec,
+        sample_rate: u32,
+        channels: u8,
+    },
+    /// Server → client: audio streaming stopped.
+    AudioStop,
+
     /// Graceful shutdown/teardown with reason.
     Bye {
         reason: String,
@@ -338,6 +430,7 @@ mod tests {
                 InputEvent::Key {
                     code: "KeyA".into(),
                     pressed: true,
+                    key: Some("a".into()),
                 },
                 InputEvent::Touch {
                     id: 1,

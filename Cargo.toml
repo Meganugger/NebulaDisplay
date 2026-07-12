@@ -28,6 +28,7 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 p256 = { version = "0.13", features = ["ecdh"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize", "rand_core"] }
 hkdf = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"

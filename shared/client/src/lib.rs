@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys},
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, FileChunk, VideoFrame},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, DisplayMode},
     PROTOCOL_VERSION, WS_PATH,
 };
@@ -36,6 +36,23 @@ pub enum Auth<'a> {
     Token(&'a Credentials),
 }
 
+/// Knobs for [`connect_opts`]. [`connect`] uses the defaults.
+#[derive(Debug, Clone)]
+pub struct ConnectOptions {
+    /// Run the PAKE PIN pairing (`ndsp_protocol::pake`). On by default —
+    /// and *required*: if the server does not answer with a PAKE share the
+    /// connection fails rather than silently downgrading to the legacy
+    /// offline-grindable construction. Set to `false` only to talk to a
+    /// pre-PAKE host (or to exercise the legacy path in tests).
+    pub use_pake: bool,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self { use_pake: true }
+    }
+}
+
 /// An authenticated, encrypted session.
 pub struct Session {
     ws: Ws,
@@ -52,6 +69,7 @@ pub struct Session {
 /// Anything a session can yield to the app.
 pub enum Incoming {
     Video(VideoFrame),
+    Audio(AudioFrame),
     Control(ControlMsg),
     Closed,
 }
@@ -62,6 +80,17 @@ pub async fn connect(
     client: ClientInfo,
     auth: Auth<'_>,
     codecs: Vec<Codec>,
+) -> anyhow::Result<Session> {
+    connect_opts(host, port, client, auth, codecs, ConnectOptions::default()).await
+}
+
+pub async fn connect_opts(
+    host: &str,
+    port: u16,
+    client: ClientInfo,
+    auth: Auth<'_>,
+    codecs: Vec<Codec>,
+    opts: ConnectOptions,
 ) -> anyhow::Result<Session> {
     let url = format!("ws://{host}:{port}{WS_PATH}");
     let (mut ws, _) = connect_async(&url)
@@ -107,23 +136,30 @@ pub async fn connect(
         }
     }
 
-    // Ephemeral ECDH (both auth paths).
+    // Ephemeral ECDH (both auth paths) + PAKE share when PIN-pairing.
     let keys = HandshakeKeys::generate();
     let client_pub = keys.public_bytes().to_vec();
+    let pake = match (&auth, opts.use_pake) {
+        (Auth::Pin(pin), true) => Some(ndsp_protocol::pake::PakeState::start(pin, &nonce)),
+        _ => None,
+    };
     send_json(
         &mut ws,
         &ControlMsg::PairStart {
             client_pubkey: B64.encode(&client_pub),
+            pake_share: pake.as_ref().map(|p| B64.encode(p.share_bytes())),
         },
     )
     .await?;
-    let (server_pub, salt) = match recv_json(&mut ws).await? {
+    let (server_pub, salt, server_pake_share) = match recv_json(&mut ws).await? {
         ControlMsg::PairChallenge {
             server_pubkey,
             salt,
+            pake_share,
         } => (
             B64.decode(server_pubkey).context("server pub b64")?,
             B64.decode(salt).context("salt b64")?,
+            pake_share,
         ),
         ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
         other => bail!("expected pair_challenge, got {other:?}"),
@@ -131,12 +167,36 @@ pub async fn connect(
     let shared = keys
         .agree(&server_pub)
         .map_err(|e| anyhow::anyhow!("ECDH: {e}"))?;
-    let session_key = shared.session_key(&salt, &nonce);
+
+    // Complete the PAKE. No silent downgrade: if we offered a share, the
+    // server must answer with one (a stripped reply would reintroduce the
+    // offline-grinding weakness the PAKE exists to remove).
+    let pake_secret: Option<[u8; 32]> = match (pake, server_pake_share) {
+        (Some(st), Some(share_b64)) => {
+            let server_share = B64.decode(share_b64).context("server PAKE share b64")?;
+            Some(
+                st.finish(&server_share)
+                    .map_err(|e| anyhow::anyhow!("PAKE: {e}"))?,
+            )
+        }
+        (Some(_), None) => bail!(
+            "host did not complete PAKE pairing — it may predate PAKE support; \
+             refuse to downgrade (see ConnectOptions::use_pake)"
+        ),
+        (None, _) => None,
+    };
+    let session_key = match &pake_secret {
+        Some(pake) => shared.session_key_pake(pake, &salt, &nonce),
+        None => shared.session_key(&salt, &nonce),
+    };
 
     let mut new_credentials = None;
     match auth {
         Auth::Pin(pin) => {
-            let pair_key = shared.pairing_key(&salt, pin, &nonce);
+            let pair_key = match &pake_secret {
+                Some(p) => shared.pairing_key_pake(p, &salt, &nonce),
+                None => shared.pairing_key(&salt, pin, &nonce),
+            };
             let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
             confirm.extend_from_slice(&nonce);
             let sealed = crypto::seal(&pair_key, &confirm, b"");
@@ -216,6 +276,16 @@ impl Session {
         Ok(())
     }
 
+    /// Stream one file-drop chunk (only valid after the host accepted the
+    /// corresponding `FileOffer`).
+    pub async fn send_file_chunk(&mut self, chunk: &FileChunk) -> anyhow::Result<()> {
+        let env = self
+            .sealer
+            .seal_parts(Channel::File, &[&chunk.header(), &chunk.data]);
+        self.ws.send(Message::Binary(env.into())).await?;
+        Ok(())
+    }
+
     /// Receive the next decrypted item (video frame or control message).
     pub async fn recv(&mut self) -> anyhow::Result<Incoming> {
         loop {
@@ -239,7 +309,15 @@ impl Session {
                             let s = std::str::from_utf8(&pt).context("control utf8")?;
                             return Ok(Incoming::Control(ControlMsg::from_json(s)?));
                         }
-                        Channel::Audio => continue, // reserved
+                        Channel::Audio => {
+                            return Ok(Incoming::Audio(
+                                AudioFrame::decode(&pt)
+                                    .map_err(|e| anyhow::anyhow!("audio frame: {e}"))?,
+                            ))
+                        }
+                        // Host → client file transfers are not implemented in
+                        // this SDK (viewers only send files today).
+                        Channel::File => continue,
                     }
                 }
                 Message::Close(_) => return Ok(Incoming::Closed),

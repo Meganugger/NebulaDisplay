@@ -19,6 +19,10 @@ fn client_info(name: &str) -> ndsp_protocol::messages::ClientInfo {
 }
 
 async fn start_host(tag: &str) -> EmbeddedHost {
+    start_host_cfg(tag, Default::default()).await
+}
+
+async fn start_host_cfg(tag: &str, file: nebulad::config::FileConfig) -> EmbeddedHost {
     let dir = std::env::temp_dir().join(format!("ndsp-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     EmbeddedHost::start(EmbeddedOptions {
@@ -26,6 +30,7 @@ async fn start_host(tag: &str) -> EmbeddedHost {
         name: format!("e2e-host-{tag}"),
         capture: (320, 240),
         max_fps: 30,
+        file,
     })
     .await
     .expect("host starts")
@@ -74,7 +79,7 @@ async fn pairing_streams_video_and_ping_pong_works() {
                 assert!(t1_us > 0);
                 got_pong = true;
             }
-            Incoming::Control(_) => {}
+            Incoming::Control(_) | Incoming::Audio(_) => {}
             Incoming::Closed => panic!("server closed unexpectedly"),
         }
     }
@@ -373,7 +378,7 @@ async fn video_keeps_flowing_under_input_flood() {
         loop {
             match tokio::time::timeout(Duration::from_micros(100), session.recv()).await {
                 Ok(Ok(Incoming::Video(_))) => frames += 1,
-                Ok(Ok(Incoming::Control(_))) => {}
+                Ok(Ok(Incoming::Control(_) | Incoming::Audio(_))) => {}
                 Ok(Ok(Incoming::Closed)) => panic!("server closed during input flood"),
                 Ok(Err(e)) => panic!("recv error during flood: {e:#}"),
                 Err(_) => break, // nothing pending
@@ -401,6 +406,70 @@ async fn video_keeps_flowing_under_input_flood() {
         "video starved under input flood: only {frames} frames in 3s (expect ~90)"
     );
 
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pre_pake_client_can_still_pair() {
+    let host = start_host("legacy").await;
+    let pin = host.state.pins.current_pin();
+    let session = ndsp_client::connect_opts(
+        "127.0.0.1",
+        host.port,
+        client_info("Old viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+        ndsp_client::ConnectOptions { use_pake: false },
+    )
+    .await
+    .expect("legacy pairing must keep working by default");
+    assert!(session.new_credentials.is_some());
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn require_pake_rejects_legacy_pairing() {
+    let host = start_host_cfg(
+        "pakeonly",
+        nebulad::config::FileConfig {
+            require_pake: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pin = host.state.pins.current_pin();
+
+    // Legacy client is refused outright…
+    let err = must_fail(
+        ndsp_client::connect_opts(
+            "127.0.0.1",
+            host.port,
+            client_info("Old viewer"),
+            Auth::Pin(&pin),
+            vec![Codec::Jpeg],
+            ndsp_client::ConnectOptions { use_pake: false },
+        )
+        .await,
+        "legacy pairing under require_pake",
+    );
+    assert!(
+        format!("{err:#}").to_lowercase().contains("pake"),
+        "error should mention PAKE: {err:#}"
+    );
+
+    // …while a PAKE client pairs fine.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("New viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("PAKE pairing succeeds under require_pake");
+    assert!(session.new_credentials.is_some());
     session.close().await;
     host.shutdown().await;
 }

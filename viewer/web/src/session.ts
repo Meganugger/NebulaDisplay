@@ -12,12 +12,14 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
+  pairingKeyPake,
   saveCredentials,
   seal,
   sessionKeyBytes,
+  sessionKeyBytesPake,
   tokenProof,
 } from "./crypto";
+import { pakeStart } from "./pake";
 import {
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
@@ -113,23 +115,44 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
+    // Ephemeral ECDH — plus a PIN-bound PAKE share when pairing, which makes
+    // the recorded transcript useless for offline PIN grinding.
     const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+    const pake = useToken ? null : pakeStart(pin!, nonce);
+    send({
+      type: "pair_start",
+      client_pubkey: b64encode(keys.publicRaw),
+      ...(pake ? { pake_share: b64encode(pake.share) } : {}),
+    });
     const challenge = await nextText();
     if (challenge.type === "auth_err") throw new Error(String(challenge.error));
     if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
     const serverPub = b64decode(challenge.server_pubkey as string);
     const salt = b64decode(challenge.salt as string);
     const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
+
+    // No silent downgrade: if we offered a PAKE share the server must answer
+    // with one. A missing share means either a pre-PAKE host (update it) or
+    // an active attacker stripping the field.
+    let pakeSecret: Uint8Array | null = null;
+    if (pake) {
+      if (typeof challenge.pake_share !== "string") {
+        throw new Error(
+          "Host did not complete secure PIN pairing (PAKE) — update the host software.",
+        );
+      }
+      pakeSecret = pake.finish(b64decode(challenge.pake_share));
+    }
+    const sessionKeyRaw = pakeSecret
+      ? await sessionKeyBytesPake(shared, pakeSecret, salt, nonce)
+      : await sessionKeyBytes(shared, salt, nonce);
 
     let newlyPaired = false;
     if (useToken && stored) {
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
+      const pairKey = await pairingKeyPake(shared, pakeSecret!, salt, nonce);
       const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
       confirm.set(CONFIRM_CONTEXT, 0);
       confirm.set(nonce, CONFIRM_CONTEXT.length);
@@ -140,7 +163,7 @@ export class Session {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        pairKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
