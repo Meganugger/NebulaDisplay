@@ -16,6 +16,7 @@ pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+#[cfg(feature = "tls")]
 pub mod tls;
 pub mod trust;
 pub mod util;

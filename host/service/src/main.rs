@@ -131,6 +131,7 @@ fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     if ips.is_empty() {
         println!("     {scheme}://<this-machine-ip>:{port}/");
     }
+    #[cfg(feature = "tls")]
     if state.cfg.file.https {
         if let Ok(m) = nebulad::tls::load_or_create(&state.cfg.data_dir) {
             println!("  ── TLS certificate (self-signed) ───────────");

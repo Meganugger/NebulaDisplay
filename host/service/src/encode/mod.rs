@@ -79,7 +79,7 @@ pub fn create(
             #[cfg(windows)]
             {
                 match mf_h264::MfH264Encoder::new(Codec::Hevc, mode.width, mode.height, 6_000, 60) {
-                    Ok(enc) => return Ok(Box::new(enc)),
+                    Ok(enc) => Ok(Box::new(enc)),
                     Err(e) => anyhow::bail!("hardware HEVC encoder init failed: {e:#}"),
                 }
             }

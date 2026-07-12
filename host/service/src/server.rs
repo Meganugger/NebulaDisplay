@@ -27,16 +27,25 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub async fn run(state: Arc<AppState>, bind: IpAddr, port: u16) -> anyhow::Result<()> {
     if state.cfg.file.https {
+        #[cfg(feature = "tls")]
         return run_tls(state, bind, port).await;
+        #[cfg(not(feature = "tls"))]
+        anyhow::bail!(
+            "config has https = true but this nebulad was built without the `tls` feature"
+        );
     }
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind, port)).await?;
     serve_on(state, listener).await
 }
 
-/// TLS variant of the viewer endpoint (`https = true` in config): same
+/// TLS variant of the viewer endpoint (feature "tls") (`https = true` in config): same
 /// router, served through axum-server/rustls with the persisted self-signed
 /// certificate (see [`crate::tls`]).
+#[cfg(feature = "tls")]
 async fn run_tls(state: Arc<AppState>, bind: IpAddr, port: u16) -> anyhow::Result<()> {
+    // Process-wide rustls provider (ring — see Cargo.toml note). Ignore the
+    // error if something else installed one first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let material = crate::tls::load_or_create(&state.cfg.data_dir)?;
     info!(
         fingerprint = %material.fingerprint,

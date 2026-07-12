@@ -884,11 +884,13 @@ async fn audio_disabled_by_default_and_streams_opus_when_enabled() {
 // Optional HTTPS (roadmap P1.7)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tls")]
 #[tokio::test(flavor = "multi_thread")]
 async fn https_serves_viewer_with_persistent_self_signed_cert() {
     use std::sync::Arc as StdArc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = std::env::temp_dir().join(format!("ndsp-e2e-https-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -949,7 +951,7 @@ async fn https_serves_viewer_with_persistent_self_signed_cert() {
             Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
+            rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }

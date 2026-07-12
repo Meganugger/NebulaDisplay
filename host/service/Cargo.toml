@@ -7,13 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["h264", "audio"]
+default = ["h264", "audio", "tls"]
 # OpenH264 software encoder (built from source; BSD-2-Clause). Disable to fall
 # back to JPEG-only streaming: `cargo build --no-default-features`.
 h264 = ["dep:openh264", "dep:openh264-sys2"]
 # Opus audio streaming (libopus built from source). Disable for a lean,
 # pure-Rust build: `cargo build --no-default-features --features h264`.
 audio = ["dep:opus"]
+# Optional HTTPS viewer serving (rustls/ring + rcgen). Native-code deps, so
+# also feature-gated to keep `--no-default-features` builds pure Rust.
+tls = ["dep:axum-server", "dep:rustls", "dep:rcgen"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
@@ -39,8 +42,12 @@ uuid = { version = "1", features = ["v4"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 opus = { version = "0.3", optional = true }
-rcgen = "0.13"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = { version = "0.13", optional = true }
+# tls-rustls-no-provider + explicit ring: the default aws-lc-rs provider
+# needs NASM/cmake on windows-msvc (absent on stock CI runners); ring builds
+# everywhere with a plain C compiler.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 openh264 = { version = "0.9", optional = true }
 # Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
 openh264-sys2 = { version = "0.9", optional = true }
@@ -75,6 +82,5 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-tokio-rustls = "0.26"
-rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 ndsp-client = { workspace = true }
