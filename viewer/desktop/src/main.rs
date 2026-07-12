@@ -43,6 +43,10 @@ struct Args {
     /// Quality profile: office | video | drawing | gaming
     #[arg(long, default_value = "office")]
     profile: String,
+    /// SHA-256 fingerprint of the host's HTTPS certificate (shown in the
+    /// host banner/panel). Connects over TLS and refuses any other cert.
+    #[arg(long)]
+    tls_fingerprint: Option<String>,
 }
 
 /// One decoded RGBA frame ready for presentation.
@@ -89,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             pin: args.pin.clone(),
             name: args.name.clone(),
             profile: args.profile.clone(),
+            tls_fingerprint: args.tls_fingerprint.clone(),
         };
         std::thread::spawn(move || net::run(args_net, shared, proxy, input_rx));
     }

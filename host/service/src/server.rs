@@ -54,8 +54,47 @@ pub async fn serve_on(
         }
     }
 
-    let app = app.with_state((state, input_sink));
-    info!("viewer endpoint listening on {local}");
+    let https = state.cfg.file.https;
+    let app = app.with_state((state.clone(), input_sink));
+    info!(
+        "viewer endpoint listening on {local} ({})",
+        if https { "https" } else { "http" }
+    );
+
+    #[cfg(not(feature = "https"))]
+    if https {
+        anyhow::bail!("https = true, but this build lacks the `https` feature");
+    }
+    #[cfg(feature = "https")]
+    if https {
+        // Optional TLS (P1.7): protects the *viewer page code* on hostile
+        // LANs; NDSP payloads are end-to-end encrypted either way.
+        crate::tls::install_crypto_provider();
+        let identity = crate::tls::load_or_create(&state.cfg.data_dir, &state.cfg.name)?;
+        *state.tls_cert_fingerprint.lock().unwrap() = Some(identity.fingerprint.clone());
+        info!(
+            fingerprint = %identity.fingerprint,
+            "HTTPS enabled — verify this certificate fingerprint on first connect"
+        );
+        let config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![identity.cert_der],
+            identity.key_der,
+        )
+        .await?;
+        let std_listener = listener.into_std()?;
+        // NoDelayAcceptor nested *inside* the TLS acceptor (it preps the raw
+        // TCP stream before the handshake): Nagle would coalesce small
+        // control/video writes — poison for input echo latency. Note that
+        // `Server::acceptor(..)` would *replace* the TLS acceptor entirely.
+        let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
+            .acceptor(axum_server::accept::NoDelayAcceptor);
+        axum_server::from_tcp(std_listener)
+            .acceptor(acceptor)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+        return Ok(());
+    }
+
     // TCP_NODELAY: Nagle would coalesce small control/video writes with up
     // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
     use axum::serve::ListenerExt;

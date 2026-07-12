@@ -45,6 +45,10 @@ pub struct Args {
     /// Viewers still opt in per session; off by default.
     #[arg(long)]
     pub audio: bool,
+    /// Serve the viewer endpoint over HTTPS with a persistent self-signed
+    /// certificate (fingerprint printed at startup for pinning).
+    #[arg(long)]
+    pub https: bool,
     /// Exit after N seconds (for smoke tests).
     #[arg(long)]
     pub exit_after: Option<u64>,
@@ -79,6 +83,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let mut cfg = config::Config::load(&(&args).into())?;
     if args.audio {
         cfg.file.audio = true;
+    }
+    if args.https {
+        cfg.file.https = true;
     }
     info!(name = %cfg.name, data_dir = %cfg.data_dir.display(), "starting nebulad v{}", env!("CARGO_PKG_VERSION"));
 
@@ -138,13 +145,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     let pin = state.pins.current_pin();
     let ips = util::local_ips();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     println!("\n  NebulaDisplay host ready");
     println!("  ── Viewer URLs ─────────────────────────────");
     for ip in &ips {
-        println!("     http://{ip}:{port}/");
+        println!("     {scheme}://{ip}:{port}/");
     }
     if ips.is_empty() {
-        println!("     http://<this-machine-ip>:{port}/");
+        println!("     {scheme}://<this-machine-ip>:{port}/");
+    }
+    if state.cfg.file.https {
+        // Give the TLS listener a moment to publish the fingerprint.
+        for _ in 0..50 {
+            if state.tls_cert_fingerprint.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Some(fp) = state.tls_cert_fingerprint.lock().unwrap().clone() {
+            println!("  ── HTTPS certificate SHA-256 (verify once) ─");
+            println!("     {fp}");
+        }
     }
     println!("  ── Pairing PIN (single-use) ────────────────");
     println!("     {pin}");

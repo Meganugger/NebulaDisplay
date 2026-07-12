@@ -86,6 +86,10 @@ struct StatusView {
     pin: String,
     viewer_urls: Vec<String>,
     mode: ndsp_protocol::messages::DisplayMode,
+    /// Viewer endpoint scheme is https (self-signed, fingerprint below).
+    https: bool,
+    /// SHA-256 of the HTTPS certificate (verify on first connect).
+    https_cert_fingerprint: Option<String>,
     audio: AudioView,
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
@@ -140,11 +144,20 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
         fingerprint: state.fingerprint.clone(),
         port,
         pin: state.pins.current_pin(),
-        viewer_urls: local_ips()
-            .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
-            .collect(),
+        viewer_urls: {
+            let scheme = if state.cfg.file.https {
+                "https"
+            } else {
+                "http"
+            };
+            local_ips()
+                .iter()
+                .map(|ip| format!("{scheme}://{ip}:{port}/"))
+                .collect()
+        },
         mode: *state.mode.lock().unwrap(),
+        https: state.cfg.file.https,
+        https_cert_fingerprint: state.tls_cert_fingerprint.lock().unwrap().clone(),
         audio: AudioView {
             available: state
                 .audio_available
@@ -217,8 +230,13 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{scheme}://{ip}:{port}/?pin={pin}&fp={}",
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

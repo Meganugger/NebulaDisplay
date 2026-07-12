@@ -585,9 +585,10 @@ async fn audio_is_opt_in_and_delivers_decodable_opus() {
         .send(&ControlMsg::SetAudio { enabled: false })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    // Drain anything sent before the disable landed.
-    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(50), session.recv()).await {}
+    // Bounded grace period for in-flight audio packets (video keeps flowing
+    // continuously, so the drain must be time-bounded, not idle-bounded).
+    let grace_end = tokio::time::Instant::now() + Duration::from_millis(400);
+    while (tokio::time::timeout_at(grace_end, session.recv()).await).is_ok() {}
     let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
     loop {
         match tokio::time::timeout_at(deadline, session.recv()).await {
@@ -652,6 +653,98 @@ async fn audio_unavailable_is_reported() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Optional HTTPS (P1.7): pairing works over wss with the pinned self-signed
+/// certificate; a wrong pin (fingerprint) aborts before any NDSP message.
+#[tokio::test(flavor = "multi_thread")]
+async fn https_viewer_endpoint_with_certificate_pinning() {
+    use ndsp_client::{connect_with_tls, TlsPin};
+    let host = start_host_with(
+        "https",
+        EmbeddedOptions {
+            https: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The TLS listener publishes its fingerprint once up.
+    let mut fingerprint = None;
+    for _ in 0..100 {
+        fingerprint = host.state.tls_cert_fingerprint.lock().unwrap().clone();
+        if fingerprint.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let fingerprint = fingerprint.expect("https endpoint must publish its cert fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+
+    // Plain ws:// must fail against an https endpoint.
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Plain"),
+            Auth::Pin(&host.state.pins.current_pin()),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "plain ws against https endpoint",
+    );
+    drop(err);
+
+    // Wrong pin (impostor certificate scenario) is rejected in the TLS layer.
+    let bad_pin = TlsPin {
+        cert_sha256_hex: "ab".repeat(32),
+    };
+    let err = must_fail(
+        connect_with_tls(
+            "127.0.0.1",
+            host.port,
+            client_info("Pin checker"),
+            Auth::Pin(&host.state.pins.current_pin()),
+            vec![Codec::Jpeg],
+            Some(&bad_pin),
+        )
+        .await,
+        "wrong TLS pin",
+    );
+    assert!(
+        format!("{err:#}").contains("fingerprint mismatch") || format!("{err:#}").contains("TLS"),
+        "error should surface the pin mismatch: {err:#}"
+    );
+
+    // Correct pin: full SPAKE2 pairing + streaming over wss.
+    let pin = host.state.pins.current_pin();
+    let good = TlsPin {
+        cert_sha256_hex: fingerprint,
+    };
+    let mut session = connect_with_tls(
+        "127.0.0.1",
+        host.port,
+        client_info("Secure viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+        Some(&good),
+    )
+    .await
+    .expect("pinned TLS pairing succeeds");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut got_video = false;
+    while !got_video {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("video over wss timeout")
+            .unwrap()
+        {
+            Incoming::Video(_) => got_video = true,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
     session.close().await;
     host.shutdown().await;
 }

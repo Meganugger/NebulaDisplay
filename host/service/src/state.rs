@@ -90,6 +90,9 @@ pub struct AppState {
     pub cursor_tx: watch::Sender<CursorState>,
     /// Host clipboard bridge (permission-gated per device).
     pub clipboard: Clipboard,
+    /// SHA-256 fingerprint of the HTTPS certificate when `https = true`
+    /// (set once the viewer endpoint is up).
+    pub tls_cert_fingerprint: Mutex<Option<String>>,
     /// Latest encoded audio packet (None until the audio pipeline runs).
     /// Sessions subscribe when their client opts in. A `watch` (latest-only)
     /// is the right shape: Opus conceals an occasionally skipped packet and
@@ -133,6 +136,7 @@ impl AppState {
             frame_tx,
             cursor_tx,
             clipboard: Clipboard::new(),
+            tls_cert_fingerprint: Mutex::new(None),
             audio_tx,
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {

@@ -15,6 +15,8 @@ pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+#[cfg(feature = "https")]
+pub mod tls;
 pub mod trust;
 pub mod util;
 
@@ -34,6 +36,8 @@ pub struct EmbeddedOptions {
     pub allow_legacy_pair: bool,
     /// Stream a synthetic test tone as audio (channel 3) for e2e tests.
     pub audio: bool,
+    /// Serve the viewer endpoint over HTTPS (self-signed).
+    pub https: bool,
 }
 
 impl Default for EmbeddedOptions {
@@ -45,6 +49,7 @@ impl Default for EmbeddedOptions {
             max_fps: 30,
             allow_legacy_pair: true,
             audio: false,
+            https: false,
         }
     }
 }
@@ -69,6 +74,7 @@ impl EmbeddedHost {
                 max_fps: opts.max_fps,
                 allow_legacy_pair: opts.allow_legacy_pair,
                 audio: opts.audio,
+                https: opts.https,
                 ..Default::default()
             },
         };

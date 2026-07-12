@@ -71,21 +71,141 @@ pub async fn connect(
     auth: Auth<'_>,
     codecs: Vec<Codec>,
 ) -> anyhow::Result<Session> {
+    connect_with_tls(host, port, client, auth, codecs, None).await
+}
+
+/// Like [`connect`], but over TLS (`wss://`) when `tls` is set. The host's
+/// self-signed certificate is accepted **only** if its SHA-256 matches the
+/// pinned fingerprint the host printed at startup — a wrong or substituted
+/// certificate aborts before any NDSP message is sent.
+pub async fn connect_with_tls(
+    host: &str,
+    port: u16,
+    client: ClientInfo,
+    auth: Auth<'_>,
+    codecs: Vec<Codec>,
+    tls: Option<&TlsPin>,
+) -> anyhow::Result<Session> {
     if let Auth::Pin(pin) = auth {
         // Prefer SPAKE2. A pre-SPAKE2 host cannot parse the auth method and
         // drops the socket during the handshake — retry once with legacy.
-        return match connect_once(host, port, client.clone(), Auth::Pin(pin), codecs.clone()).await
+        return match connect_once(
+            host,
+            port,
+            client.clone(),
+            Auth::Pin(pin),
+            codecs.clone(),
+            tls,
+        )
+        .await
         {
             Err(e) if handshake_dropped(&e) => {
                 tracing::warn!(
                     "host closed during SPAKE2 pairing (pre-PAKE host?); retrying legacy pairing"
                 );
-                connect_once(host, port, client, Auth::PinLegacy(pin), codecs).await
+                connect_once(host, port, client, Auth::PinLegacy(pin), codecs, tls).await
             }
             r => r,
         };
     }
-    connect_once(host, port, client, auth, codecs).await
+    connect_once(host, port, client, auth, codecs, tls).await
+}
+
+/// Certificate pin for [`connect_with_tls`]: the SHA-256 (hex) of the host's
+/// HTTPS certificate, as printed in the host banner / shown in the panel.
+pub struct TlsPin {
+    pub cert_sha256_hex: String,
+}
+
+#[cfg(feature = "tls")]
+mod pinned_tls {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use sha2::{Digest, Sha256};
+
+    /// Accepts exactly one certificate: the one whose SHA-256 was pinned.
+    /// Chain, expiry, and hostname are irrelevant — the pin *is* the trust
+    /// statement (same model as SSH known_hosts).
+    #[derive(Debug)]
+    pub(super) struct PinVerifier {
+        pub expected_sha256: [u8; 32],
+        pub provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    }
+
+    impl ServerCertVerifier for PinVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            let got: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+            if got == self.expected_sha256 {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(format!(
+                    "certificate fingerprint mismatch (got {}, pinned {})",
+                    hex::encode(got),
+                    hex::encode(self.expected_sha256)
+                )))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+fn pinned_tls_config(pin: &TlsPin) -> anyhow::Result<rustls::ClientConfig> {
+    let expected: Vec<u8> = hex::decode(pin.cert_sha256_hex.trim())
+        .context("TLS pin must be the hex SHA-256 of the host certificate")?;
+    let expected_sha256: [u8; 32] = expected
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("TLS pin must be 32 bytes (64 hex chars)"))?;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(pinned_tls::PinVerifier {
+            expected_sha256,
+            provider,
+        }))
+        .with_no_client_auth();
+    Ok(config)
 }
 
 /// True when the failure looks like "the server dropped the socket during
@@ -102,11 +222,31 @@ async fn connect_once(
     client: ClientInfo,
     auth: Auth<'_>,
     codecs: Vec<Codec>,
+    tls: Option<&TlsPin>,
 ) -> anyhow::Result<Session> {
-    let url = format!("ws://{host}:{port}{WS_PATH}");
-    let (mut ws, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("connecting {url}"))?;
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    let url = format!("{scheme}://{host}:{port}{WS_PATH}");
+    let (mut ws, _) = match tls {
+        #[cfg(feature = "tls")]
+        Some(pin) => {
+            let config = pinned_tls_config(pin)?;
+            tokio_tungstenite::connect_async_tls_with_config(
+                &url,
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+                    config,
+                ))),
+            )
+            .await
+            .with_context(|| format!("connecting {url} (TLS, pinned cert)"))?
+        }
+        #[cfg(not(feature = "tls"))]
+        Some(_) => anyhow::bail!("this build lacks the `tls` feature (pinned TLS unavailable)"),
+        None => connect_async(&url)
+            .await
+            .with_context(|| format!("connecting {url}"))?,
+    };
 
     let auth_method = match &auth {
         Auth::Pin(_) => AuthMethod::PairSpake2,
