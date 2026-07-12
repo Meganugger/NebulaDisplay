@@ -4,13 +4,15 @@
 
 | Component | Needs |
 |---|---|
-| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`) |
+| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`), CMake + a C compiler (libopus for the default `audio` feature; `--no-default-features` builds pure-Rust) |
 | Web viewer + panel | Node 22+ / npm |
 | Windows virtual display driver | Windows + VS2022 + WDK (see `host/windows-driver/README.md`) |
 | Android viewer | Android SDK 35, JDK 17 (see `viewer/android/README.md`) |
 | iOS viewer | Xcode 15+ on macOS (see `viewer/ios/README.md`) |
 
 Everything in the first two rows builds and tests on Linux/macOS/Windows.
+(`.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` so libopus's
+older CMakeLists configures under CMake 4.x too.)
 
 ## Quick start (host + web viewer)
 

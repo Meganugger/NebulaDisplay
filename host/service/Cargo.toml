@@ -7,10 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["h264"]
+default = ["h264", "audio", "https"]
 # OpenH264 software encoder (built from source; BSD-2-Clause). Disable to fall
 # back to JPEG-only streaming: `cargo build --no-default-features`.
 h264 = ["dep:openh264", "dep:openh264-sys2"]
+# Opus audio streaming (libopus built from source via cmake; BSD-3-Clause).
+audio = ["dep:opus"]
+# Optional HTTPS viewer endpoint (rustls/ring — native code, so this is a
+# feature to keep pure-Rust cross-target checks possible).
+https = ["dep:axum-server", "dep:rustls", "dep:rcgen"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
@@ -34,9 +39,15 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Optional HTTPS for the viewer endpoint (self-signed, fingerprint-pinned).
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.13", optional = true }
+
 openh264 = { version = "0.9", optional = true }
 # Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
 openh264-sys2 = { version = "0.9", optional = true }
+opus = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -47,15 +58,24 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Devices_Display",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Memory",
+    "Win32_System_DataExchange",
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }
 
 [dev-dependencies]
-ndsp-client = { workspace = true }
+ndsp-client = { workspace = true, features = ["tls"] }
+# e2e tests decode the streamed audio to prove packets are real Opus.
+opus = "0.3"
+

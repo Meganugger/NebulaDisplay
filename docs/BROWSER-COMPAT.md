@@ -37,6 +37,7 @@ touch a modern API without going through it:
 | `crypto.randomUUID` | RFC4122 v4 via `getRandomValues` (last resort: `Math.random`, flagged insecure, never hard-crashes) |
 | `crypto.subtle` | pure-JS backend selected once in `src/cryptobox.ts` |
 | WebCodecs H.264 | **probed with `VideoDecoder.isConfigSupported`** — API existence is not enough: codec-less Chromium/Electron builds expose `VideoDecoder` but reject `avc1` configs. JPEG otherwise. Repeated decoder errors surface a visible error instead of a black canvas. |
+| WebCodecs `AudioDecoder` (Opus playback) | none bundled — the audio button is **disabled with an explanatory tooltip** where `AudioDecoder` is missing (Firefox, insecure-origin pages). A ~100 KB WASM Opus decoder for those cases was considered and rejected (see ROADMAP "deliberately rejected"). Chromium ≥94 / Safari ≥16.4 on secure or localhost origins play audio. |
 | `createImageBitmap` | JPEG decode through an `<img>` element (older iOS Safari) |
 | `PointerEvent` | raw `touch*` + `mouse*` listeners (older iOS Safari / WebViews) |
 | `pointerrawupdate` | `pointermove` (display-rate instead of device-rate move sampling) |

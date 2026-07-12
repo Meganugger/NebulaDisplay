@@ -36,6 +36,7 @@ const host = spawn(
     "--data-dir", dataDir,
     "--capture-size", "1280x720",
     "--name", "Browser E2E Host",
+    "--audio",
     "--web-dir", join(webRoot, "dist"),
   ],
   { stdio: ["ignore", "pipe", "pipe"] },
@@ -180,6 +181,35 @@ await sleep(500);
 const p4 = await probe();
 if (p3.hash === p4.hash) await fail("stream stalled after profile switch");
 console.log("profile switch to gaming OK, stream continues");
+
+// ---- audio channel: opt-in, decode, panel indicator -------------------------
+// The host runs with --audio (test-tone source). Playback needs WebCodecs
+// AudioDecoder; where the headless build lacks it the button must stay
+// disabled with an explanatory tooltip (graceful degradation is part of the
+// contract).
+const audioSupported = await page.evaluate(() => typeof AudioDecoder !== "undefined");
+const audioBtnDisabled = await page.locator("#audio-btn").isDisabled();
+if (!audioSupported) {
+  if (!audioBtnDisabled) await fail("audio button enabled without AudioDecoder support");
+  console.log("audio: AudioDecoder unavailable in this Chromium build — degradation verified");
+} else {
+  if (audioBtnDisabled) await fail("audio button disabled although host streams audio and AudioDecoder exists");
+  await page.click("#audio-btn");
+  await sleep(1500);
+  const label = await page.textContent("#audio-btn");
+  if (!label.includes("🔊")) await fail(`audio button did not switch on: "${label}"`);
+  const st = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+  if (!st.audio?.available) await fail("panel does not report audio available");
+  if (st.audio.listeners !== 1) await fail(`panel audio listeners = ${st.audio.listeners}, expected 1`);
+  const audioErrors = await page.evaluate(() => window.__ndspAudioErrors ?? 0);
+  if (audioErrors > 0) await fail(`${audioErrors} audio decode errors`);
+  // Mute again → listener slot released.
+  await page.click("#audio-btn");
+  await sleep(800);
+  const st2 = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+  if (st2.audio.listeners !== 0) await fail(`listeners after mute = ${st2.audio.listeners}, expected 0`);
+  console.log("audio verified (opt-in start/stop, panel indicator, no decode errors)");
+}
 
 // ---- cursor channel: the host cursor renders as a moving overlay -----------
 // The test-pattern source emits a synthetic cursor circling the center, so a

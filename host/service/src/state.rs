@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
+use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
@@ -55,6 +56,7 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
+    SetClipboardGrant(bool),
     Kick { reason: String },
 }
 
@@ -66,6 +68,10 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
+    /// This session is currently receiving audio (viewer opted in and the
+    /// host has a source).
+    pub audio_active: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
@@ -82,6 +88,16 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Host clipboard bridge (permission-gated per device).
+    pub clipboard: Clipboard,
+    /// SHA-256 fingerprint of the HTTPS certificate when `https = true`
+    /// (set once the viewer endpoint is up).
+    pub tls_cert_fingerprint: Mutex<Option<String>>,
+    /// Latest encoded audio packet (None until the audio pipeline runs).
+    /// Sessions subscribe when their client opts in. A `watch` (latest-only)
+    /// is the right shape: Opus conceals an occasionally skipped packet and
+    /// a slow client must never accumulate an audio backlog.
+    pub audio_tx: watch::Sender<Option<Arc<ndsp_protocol::media::AudioFrame>>>,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -89,6 +105,11 @@ pub struct AppState {
     /// when the platform exposes one — used for multi-monitor input mapping.
     pub capture_rect: Mutex<Option<(i32, i32, i32, i32)>>,
     pub clients: Mutex<HashMap<u64, Arc<ClientHandle>>>,
+    /// Number of sessions currently opted into audio — lets the audio
+    /// pipeline skip Opus encoding entirely while nobody listens.
+    pub audio_listeners: AtomicU64,
+    /// An audio pipeline is running (config `audio = true` and spawn ok).
+    pub audio_available: AtomicBool,
     next_client_id: AtomicU64,
     serving_port: AtomicU64,
     shutdown: AtomicBool,
@@ -106,6 +127,7 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (audio_tx, _) = watch::channel(None);
         Ok(Self {
             cfg,
             fingerprint,
@@ -113,6 +135,9 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            clipboard: Clipboard::new(),
+            tls_cert_fingerprint: Mutex::new(None),
+            audio_tx,
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -121,6 +146,8 @@ impl AppState {
             }),
             capture_rect: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
+            audio_listeners: AtomicU64::new(0),
+            audio_available: AtomicBool::new(false),
             next_client_id: AtomicU64::new(1),
             serving_port: AtomicU64::new(ndsp_protocol::DEFAULT_PORT as u64),
             shutdown: AtomicBool::new(false),
@@ -203,6 +230,25 @@ impl AppState {
                 let _ = client
                     .commands
                     .try_send(SessionCommand::SetInputGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Push a clipboard-grant change to the persistent store and any live
+    /// session for that device.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
             }
         }
         Ok(found)

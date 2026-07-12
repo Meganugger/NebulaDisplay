@@ -36,7 +36,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
+      # Granular feature builds first: when a native dependency (openh264,
+      # libopus/cmake, ring) breaks on the runner image, the failing step
+      # names the culprit instead of burying it in one huge clippy log.
+      - name: Check (no default features — pure Rust incl. all cfg(windows) code)
+        run: cargo check --workspace --no-default-features
+      - name: Check nebulad +https (rustls/ring)
+        run: cargo check -p nebulad --no-default-features --features https
+      - name: Check nebulad +audio (libopus via cmake, WASAPI path)
+        run: cargo check -p nebulad --no-default-features --features audio
+      - name: Check nebulad +h264 (OpenH264 build)
+        run: cargo check -p nebulad --no-default-features --features h264
+      - name: Clippy (deny warnings) — validates DXGI/SendInput/pen/WASAPI/clipboard/IDD-ring/tray code
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace

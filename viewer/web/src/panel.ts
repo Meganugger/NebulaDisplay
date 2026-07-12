@@ -11,6 +11,8 @@ interface ClientView {
   addr: string;
   connected_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
+  audio_active: boolean;
   stats: ViewerStats;
 }
 
@@ -21,6 +23,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -32,6 +35,7 @@ interface Status {
   pin: string;
   viewer_urls: string[];
   mode: { width: number; height: number; refresh_hz: number };
+  audio: { available: boolean; listeners: number };
   host_stats: HostStats;
   clients: ClientView[];
   trusted: TrustedView[];
@@ -77,6 +81,14 @@ async function refresh(): Promise<void> {
     line("Version", esc(st.version)),
     line("Mode", `${st.mode.width}×${st.mode.height}`),
     line("Identity", `<span class="mono">${esc(st.fingerprint.slice(0, 16))}…</span>`),
+    line(
+      "Audio",
+      st.audio.available
+        ? st.audio.listeners > 0
+          ? `<span class="tag on">🔊 streaming to ${st.audio.listeners}</span>`
+          : "enabled, no listeners"
+        : "off",
+    ),
   ].join("");
   $("urls").innerHTML =
     st.viewer_urls.map((u) => `<a href="${esc(u)}" target="_blank">${esc(u)}</a>`).join("<br>") ||
@@ -102,7 +114,9 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.fps_decoded.toFixed(0)}</td>
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
-        <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span>${
+          c.audio_active ? ' <span class="tag on" title="This viewer is receiving host audio">🔊 audio</span>' : ""
+        }</td>
       </tr>`,
     )
     .join("");
@@ -119,6 +133,9 @@ async function refresh(): Promise<void> {
         <td>
           <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
         </td>
+        <td>
+          <label class="switch"><input type="checkbox" data-grant-clip="${esc(d.device_id)}" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
+        </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
     )
@@ -131,6 +148,18 @@ async function refresh(): Promise<void> {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+      }).catch(console.error);
+  });
+  ttbody.querySelectorAll<HTMLInputElement>("input[data-grant-clip]").forEach((el) => {
+    el.onchange = () =>
+      void api("/api/grant", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          device_id: el.dataset["grantClip"],
+          allowed: el.checked,
+          kind: "clipboard",
+        }),
       }).catch(console.error);
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {

@@ -41,6 +41,14 @@ pub struct Args {
     /// driver exposes several. Ignored in mirror/test-pattern modes.
     #[arg(long, default_value_t = 0)]
     pub display_index: u32,
+    /// Capture and stream host audio (same as `audio = true` in config).
+    /// Viewers still opt in per session; off by default.
+    #[arg(long)]
+    pub audio: bool,
+    /// Serve the viewer endpoint over HTTPS with a persistent self-signed
+    /// certificate (fingerprint printed at startup for pinning).
+    #[arg(long)]
+    pub https: bool,
     /// Exit after N seconds (for smoke tests).
     #[arg(long)]
     pub exit_after: Option<u64>,
@@ -72,7 +80,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let cfg = config::Config::load(&(&args).into())?;
+    let mut cfg = config::Config::load(&(&args).into())?;
+    if args.audio {
+        cfg.file.audio = true;
+    }
+    if args.https {
+        cfg.file.https = true;
+    }
     info!(name = %cfg.name, data_dir = %cfg.data_dir.display(), "starting nebulad v{}", env!("CARGO_PKG_VERSION"));
 
     let state = Arc::new(state::AppState::new(cfg).await?);
@@ -81,6 +95,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (w, h) = util::parse_size(&args.capture_size)?;
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
+
+    // Audio pipeline (WASAPI loopback / test tone), only when enabled in
+    // config — and even then each viewer must opt in per session.
+    if nebulad::audio::spawn_if_enabled(state.clone()) {
+        state
+            .audio_available
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Host clipboard watcher (Windows) — publishes host copies to granted
+    // viewers. Grant checks happen per session; nothing leaves the machine
+    // for devices without the clipboard permission.
+    nebulad::clipboard::spawn_watcher(state.clone());
 
     // UDP discovery responder.
     if args.discovery_port != 0 {
@@ -118,13 +145,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     let pin = state.pins.current_pin();
     let ips = util::local_ips();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     println!("\n  NebulaDisplay host ready");
     println!("  ── Viewer URLs ─────────────────────────────");
     for ip in &ips {
-        println!("     http://{ip}:{port}/");
+        println!("     {scheme}://{ip}:{port}/");
     }
     if ips.is_empty() {
-        println!("     http://<this-machine-ip>:{port}/");
+        println!("     {scheme}://<this-machine-ip>:{port}/");
+    }
+    if state.cfg.file.https {
+        // Give the TLS listener a moment to publish the fingerprint.
+        for _ in 0..50 {
+            if state.tls_cert_fingerprint.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Some(fp) = state.tls_cert_fingerprint.lock().unwrap().clone() {
+            println!("  ── HTTPS certificate SHA-256 (verify once) ─");
+            println!("     {fp}");
+        }
     }
     println!("  ── Pairing PIN (single-use) ────────────────");
     println!("     {pin}");

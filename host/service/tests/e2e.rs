@@ -19,6 +19,10 @@ fn client_info(name: &str) -> ndsp_protocol::messages::ClientInfo {
 }
 
 async fn start_host(tag: &str) -> EmbeddedHost {
+    start_host_with(tag, EmbeddedOptions::default()).await
+}
+
+async fn start_host_with(tag: &str, opts: EmbeddedOptions) -> EmbeddedHost {
     let dir = std::env::temp_dir().join(format!("ndsp-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     EmbeddedHost::start(EmbeddedOptions {
@@ -26,6 +30,7 @@ async fn start_host(tag: &str) -> EmbeddedHost {
         name: format!("e2e-host-{tag}"),
         capture: (320, 240),
         max_fps: 30,
+        ..opts
     })
     .await
     .expect("host starts")
@@ -74,7 +79,7 @@ async fn pairing_streams_video_and_ping_pong_works() {
                 assert!(t1_us > 0);
                 got_pong = true;
             }
-            Incoming::Control(_) => {}
+            Incoming::Audio(_) | Incoming::Control(_) => {}
             Incoming::Closed => panic!("server closed unexpectedly"),
         }
     }
@@ -92,6 +97,84 @@ async fn pairing_streams_video_and_ping_pong_works() {
     #[cfg(feature = "h264")]
     assert_eq!(frames[0].codec, Codec::H264, "H264 preferred when offered");
 
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Older clients (mobile viewers) still pair via the legacy PIN-bound-HKDF
+/// method — the host must keep accepting it by default, and the issued
+/// token must interoperate with normal token reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_still_works_and_tokens_interoperate() {
+    let host = start_host("legacy").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Old phone");
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::PinLegacy(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("legacy pairing succeeds");
+    let creds = session.new_credentials.clone().expect("credentials issued");
+    session.close().await;
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        info,
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("token reconnect after legacy pairing");
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// With `allow_legacy_pair = false`, legacy pairing is refused with a clear
+/// error while SPAKE2 pairing keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pairing_can_be_disabled() {
+    let host = start_host_with(
+        "nolegacy",
+        EmbeddedOptions {
+            allow_legacy_pair: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pin = host.state.pins.current_pin();
+
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Old phone"),
+            Auth::PinLegacy(&pin),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "legacy pairing disabled",
+    );
+    assert!(
+        format!("{err:#}").contains("legacy"),
+        "error should explain legacy pairing is off: {err:#}"
+    );
+
+    // SPAKE2 path unaffected.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("New phone"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("SPAKE2 pairing works with legacy disabled");
     session.close().await;
     host.shutdown().await;
 }
@@ -253,6 +336,419 @@ async fn token_reconnect_and_input_grant_flow() {
     host.shutdown().await;
 }
 
+/// Clipboard sync: denied by default in both directions, live-granted via
+/// the panel path, size-capped, and revocable.
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_is_permission_gated_and_size_capped() {
+    use ndsp_protocol::messages::MAX_CLIPBOARD_BYTES;
+    let host = start_host("clipboard").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Clip tablet");
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+
+    // The session announces the (denied) clipboard grant up front.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("initial clipboard grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed }) => {
+                assert!(!allowed, "clipboard must be denied by default");
+                break;
+            }
+            Incoming::Closed => panic!("closed early"),
+            _ => {}
+        }
+    }
+
+    // Viewer → host while denied: dropped, host clipboard untouched.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "stolen?".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(host.state.clipboard.last_applied(), None);
+
+    // Host → viewer while denied: nothing arrives.
+    host.state.clipboard.publish_from_host("host secret".into());
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::Clipboard { .. }))) => {
+                panic!("clipboard leaked without grant")
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Grant clipboard (panel action) → client is notified live.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed: true }) => break,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    // Viewer → host now lands.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "from viewer ✓".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while host.state.clipboard.last_applied().as_deref() != Some("from viewer ✓") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "clipboard never applied on host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Host → viewer flows too.
+    host.state.clipboard.publish_from_host("from host ✓".into());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("host clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { mime, data }) => {
+                assert_eq!(mime, "text/plain");
+                assert_eq!(data, "from host ✓");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    // Oversize events are refused with a structured error, not applied.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "x".repeat(MAX_CLIPBOARD_BYTES + 1),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("size-cap error timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Error { code, .. }) => {
+                assert_eq!(code, "clipboard_too_large");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.state.clipboard.last_applied().as_deref(),
+        Some("from viewer ✓"),
+        "oversize clipboard must not be applied"
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Audio (channel 3): opt-in per session, real Opus packets that decode,
+/// clean disable, and never streamed to sessions that didn't ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_is_opt_in_and_delivers_decodable_opus() {
+    let host = start_host_with(
+        "audio",
+        EmbeddedOptions {
+            audio: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let pin = host.state.pins.current_pin();
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Audio tablet"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+
+    // Initial status announces availability without activity.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("initial audio status timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::AudioStatus { available, active }) => {
+                assert!(available, "test host has the audio pipeline enabled");
+                assert!(!active, "audio must be off until requested");
+                break;
+            }
+            Incoming::Audio(_) => panic!("audio frame before opt-in"),
+            Incoming::Closed => panic!("closed early"),
+            _ => {}
+        }
+    }
+
+    // No audio without opt-in (while video flows).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio frame before opt-in"),
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Opt in → status flips active and Opus packets arrive.
+    session
+        .send(&ControlMsg::SetAudio { enabled: true })
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    let mut got_active = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while frames.len() < 5 {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("audio frames timeout")
+            .unwrap()
+        {
+            Incoming::Audio(f) => frames.push(f),
+            Incoming::Control(ControlMsg::AudioStatus { active, .. }) => got_active = active,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert!(got_active, "server must confirm audio is active");
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // Packets are valid 20 ms 48 kHz stereo Opus with increasing seq.
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut pcm = vec![0f32; 960 * 2];
+    let mut nonzero = false;
+    for f in &frames {
+        assert_eq!(f.sample_rate, 48_000);
+        assert_eq!(f.channels, 2);
+        let n = decoder.decode_float(&f.payload, &mut pcm, false).unwrap();
+        assert_eq!(n, 960, "one 20 ms packet per frame");
+        nonzero |= pcm.iter().any(|s| s.abs() > 1e-4);
+    }
+    assert!(nonzero, "test tone must not decode to pure silence");
+    for w in frames.windows(2) {
+        assert!(w[1].seq > w[0].seq, "audio seq must increase");
+    }
+
+    // Disable → stream stops and the listener slot is released.
+    session
+        .send(&ControlMsg::SetAudio { enabled: false })
+        .await
+        .unwrap();
+    // Bounded grace period for in-flight audio packets (video keeps flowing
+    // continuously, so the drain must be time-bounded, not idle-bounded).
+    let grace_end = tokio::time::Instant::now() + Duration::from_millis(400);
+    while (tokio::time::timeout_at(grace_end, session.recv()).await).is_ok() {}
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio kept flowing after disable"),
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// A host without the audio pipeline reports unavailability and ignores
+/// opt-ins gracefully.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_unavailable_is_reported() {
+    let host = start_host("noaudio").await;
+    let pin = host.state.pins.current_pin();
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Silent viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    session
+        .send(&ControlMsg::SetAudio { enabled: true })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_reply = false;
+    while !saw_reply {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("status timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::AudioStatus { available, active }) => {
+                // Initial notice and the opt-in reply both must say "no".
+                assert!(!available);
+                if !active {
+                    saw_reply = true;
+                }
+            }
+            Incoming::Audio(_) => panic!("audio from a host without a pipeline"),
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.state
+            .audio_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    session.close().await;
+    host.shutdown().await;
+}
+
+/// Optional HTTPS (P1.7): pairing works over wss with the pinned self-signed
+/// certificate; a wrong pin (fingerprint) aborts before any NDSP message.
+#[tokio::test(flavor = "multi_thread")]
+async fn https_viewer_endpoint_with_certificate_pinning() {
+    use ndsp_client::{connect_with_tls, TlsPin};
+    let host = start_host_with(
+        "https",
+        EmbeddedOptions {
+            https: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The TLS listener publishes its fingerprint once up.
+    let mut fingerprint = None;
+    for _ in 0..100 {
+        fingerprint = host.state.tls_cert_fingerprint.lock().unwrap().clone();
+        if fingerprint.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let fingerprint = fingerprint.expect("https endpoint must publish its cert fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+
+    // Plain ws:// must fail against an https endpoint.
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Plain"),
+            Auth::Pin(&host.state.pins.current_pin()),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "plain ws against https endpoint",
+    );
+    drop(err);
+
+    // Wrong pin (impostor certificate scenario) is rejected in the TLS layer.
+    let bad_pin = TlsPin {
+        cert_sha256_hex: "ab".repeat(32),
+    };
+    let err = must_fail(
+        connect_with_tls(
+            "127.0.0.1",
+            host.port,
+            client_info("Pin checker"),
+            Auth::Pin(&host.state.pins.current_pin()),
+            vec![Codec::Jpeg],
+            Some(&bad_pin),
+        )
+        .await,
+        "wrong TLS pin",
+    );
+    assert!(
+        format!("{err:#}").contains("fingerprint mismatch") || format!("{err:#}").contains("TLS"),
+        "error should surface the pin mismatch: {err:#}"
+    );
+
+    // Correct pin: full SPAKE2 pairing + streaming over wss.
+    let pin = host.state.pins.current_pin();
+    let good = TlsPin {
+        cert_sha256_hex: fingerprint,
+    };
+    let mut session = connect_with_tls(
+        "127.0.0.1",
+        host.port,
+        client_info("Secure viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+        Some(&good),
+    )
+    .await
+    .expect("pinned TLS pairing succeeds");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut got_video = false;
+    while !got_video {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("video over wss timeout")
+            .unwrap()
+        {
+            Incoming::Video(_) => got_video = true,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    session.close().await;
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fingerprint_mismatch_blocks_token_send() {
     let host = start_host("fp").await;
@@ -373,7 +869,7 @@ async fn video_keeps_flowing_under_input_flood() {
         loop {
             match tokio::time::timeout(Duration::from_micros(100), session.recv()).await {
                 Ok(Ok(Incoming::Video(_))) => frames += 1,
-                Ok(Ok(Incoming::Control(_))) => {}
+                Ok(Ok(Incoming::Audio(_) | Incoming::Control(_))) => {}
                 Ok(Ok(Incoming::Closed)) => panic!("server closed during input flood"),
                 Ok(Err(e)) => panic!("recv error during flood: {e:#}"),
                 Err(_) => break, // nothing pending

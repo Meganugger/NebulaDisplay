@@ -50,6 +50,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,7 +63,18 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    /// Audio is currently streaming to this viewer (visible indicator).
+    audio_active: bool,
     stats: ndsp_protocol::messages::ViewerStats,
+}
+
+#[derive(Serialize)]
+struct AudioView {
+    /// Host audio pipeline is running (config `audio = true`).
+    available: bool,
+    /// Sessions currently receiving audio (the visible indicator).
+    listeners: u64,
 }
 
 #[derive(Serialize)]
@@ -74,6 +86,11 @@ struct StatusView {
     pin: String,
     viewer_urls: Vec<String>,
     mode: ndsp_protocol::messages::DisplayMode,
+    /// Viewer endpoint scheme is https (self-signed, fingerprint below).
+    https: bool,
+    /// SHA-256 of the HTTPS certificate (verify on first connect).
+    https_cert_fingerprint: Option<String>,
+    audio: AudioView,
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
     trusted: Vec<TrustedDeviceView>,
@@ -94,6 +111,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            audio_active: c.audio_active.load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,6 +134,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
@@ -122,11 +144,28 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
         fingerprint: state.fingerprint.clone(),
         port,
         pin: state.pins.current_pin(),
-        viewer_urls: local_ips()
-            .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
-            .collect(),
+        viewer_urls: {
+            let scheme = if state.cfg.file.https {
+                "https"
+            } else {
+                "http"
+            };
+            local_ips()
+                .iter()
+                .map(|ip| format!("{scheme}://{ip}:{port}/"))
+                .collect()
+        },
         mode: *state.mode.lock().unwrap(),
+        https: state.cfg.file.https,
+        https_cert_fingerprint: state.tls_cert_fingerprint.lock().unwrap().clone(),
+        audio: AudioView {
+            available: state
+                .audio_available
+                .load(std::sync::atomic::Ordering::Relaxed),
+            listeners: state
+                .audio_listeners
+                .load(std::sync::atomic::Ordering::Relaxed),
+        },
         host_stats: state.host_stats.lock().unwrap().clone(),
         clients,
         trusted,
@@ -142,10 +181,24 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// "input" (default, backward compatible) or "clipboard".
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.kind.as_deref() {
+        None | Some("input") => state.set_input_grant(&req.device_id, req.allowed),
+        Some("clipboard") => state.set_clipboard_grant(&req.device_id, req.allowed),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown grant kind {other:?}"),
+            )
+                .into_response()
+        }
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
@@ -177,8 +230,13 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{scheme}://{ip}:{port}/?pin={pin}&fp={}",
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

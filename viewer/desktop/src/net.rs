@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use winit::event_loop::EventLoopProxy;
 
-use ndsp_client::{connect, Auth, Incoming, Session};
+use ndsp_client::{connect_with_tls, Auth, Incoming, Session, TlsPin};
 use ndsp_protocol::messages::{ClientInfo, Codec, ControlMsg, InputEvent, InputMode, Profile};
 
 use crate::decode::Decoder;
@@ -18,6 +18,9 @@ pub struct NetArgs {
     pub pin: Option<String>,
     pub name: String,
     pub profile: String,
+    /// SHA-256 fingerprint of the host's HTTPS certificate → connect with
+    /// pinned TLS (`--https` hosts).
+    pub tls_fingerprint: Option<String>,
 }
 
 /// UI thread → network thread.
@@ -82,10 +85,23 @@ async fn session_loop(
     };
 
     set_status(shared, proxy, format!("connecting to {host_key}…"));
+    let tls_pin = args.tls_fingerprint.as_ref().map(|fp| TlsPin {
+        cert_sha256_hex: fp.clone(),
+    });
+    let tls = tls_pin.as_ref();
     let stored = store::load(&host_key);
     let mut session: Session = match (&stored, &args.pin) {
         (Some(creds), _) => {
-            match connect(&host, port, client.clone(), Auth::Token(creds), codecs()).await {
+            match connect_with_tls(
+                &host,
+                port,
+                client.clone(),
+                Auth::Token(creds),
+                codecs(),
+                tls,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) if format!("{e:#}").contains("pair") => {
                     // Token stale → try PIN if we have one, else tell the user.
@@ -95,12 +111,15 @@ async fn session_loop(
                             "stored trust was rejected by the host — run again with --pin <PIN>"
                         );
                     };
-                    connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?
+                    connect_with_tls(&host, port, client.clone(), Auth::Pin(pin), codecs(), tls)
+                        .await?
                 }
                 Err(e) => return Err(e),
             }
         }
-        (None, Some(pin)) => connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?,
+        (None, Some(pin)) => {
+            connect_with_tls(&host, port, client.clone(), Auth::Pin(pin), codecs(), tls).await?
+        }
         (None, None) => anyhow::bail!("first connection needs --pin <PIN shown on the host>"),
     };
 
@@ -166,6 +185,10 @@ async fn session_loop(
                     session.send(&ControlMsg::RequestKeyframe).await?;
                 }
             },
+            // Audio playback is not implemented in the desktop viewer yet
+            // (see docs/ROADMAP.md); it also never requests audio, so this
+            // arm is defensive.
+            Ok(Ok(Incoming::Audio(_))) => {}
             Ok(Ok(Incoming::Control(msg))) => match msg {
                 ControlMsg::InputGrant { allowed } => {
                     shared.input_allowed.store(allowed, Ordering::Relaxed);

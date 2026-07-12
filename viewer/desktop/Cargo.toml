@@ -7,12 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["h264"]
+default = ["h264", "tls"]
 h264 = ["dep:openh264"]
+# Pinned-TLS connections to `--https` hosts.
+tls = ["ndsp-client/tls"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
-ndsp-client = { workspace = true }
+ndsp-client = { workspace = true, default-features = false }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -24,3 +26,11 @@ winit = "0.30"
 softbuffer = "0.4"
 zune-jpeg = "0.4"
 openh264 = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (CryptProtectData) keeps stored trust tokens encrypted at rest,
+# bound to the Windows user account (ROADMAP P1.6).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

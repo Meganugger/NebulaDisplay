@@ -30,7 +30,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, VideoFrame},
     messages::{ControlMsg, InputMode, Profile},
 };
 use std::net::SocketAddr;
@@ -56,6 +56,7 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -133,8 +134,11 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
+    let audio_active = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -161,6 +165,8 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_active: audio_active.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -181,10 +187,13 @@ pub async fn run(
         sealer,
         ctl_rx,
         vid_rx,
+        state.audio_tx.subscribe(),
+        audio_active.clone(),
         shared.clone(),
         consumed_seq.clone(),
     ));
     let pump = tokio::spawn(incoming_pump(
+        state.clone(),
         ws_rx,
         opener,
         shared.clone(),
@@ -214,12 +223,45 @@ pub async fn run(
     cursor_rx.mark_changed();
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
+    // Host clipboard changes → granted clients. Subscribing *now* marks the
+    // current value seen: a viewer only receives copies made after it
+    // connected, never whatever happened to be on the clipboard before.
+    let mut clipboard_rx = state.clipboard.subscribe();
+    // Tell the client its clipboard grant + audio availability up front
+    // (input arrives in AuthOk; these ride the control channel to keep
+    // AuthOk stable).
+    let initial = [
+        ControlMsg::ClipboardGrant {
+            allowed: clipboard_allowed.load(Ordering::Relaxed),
+        },
+        ControlMsg::AudioStatus {
+            available: state.audio_available.load(Ordering::Relaxed),
+            active: false,
+        },
+    ];
+    let mut initial_send_failed = false;
+    for msg in initial {
+        if ctl_tx.send(msg).await.is_err() {
+            initial_send_failed = true;
+            break;
+        }
+    }
+    if initial_send_failed {
+        state.unregister_client(client_id);
+        pump.abort();
+        video.abort();
+        return;
+    }
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -263,6 +305,21 @@ pub async fn run(
                 if ctl_tx.send(ControlMsg::CursorPos { x: cs.x, y: cs.y, visible: cs.visible }).await.is_err() { break; }
             }
 
+            changed = clipboard_rx.changed() => {
+                if changed.is_err() { continue; }
+                let ev = clipboard_rx.borrow_and_update().clone();
+                if ev.seq == 0 || !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                if ev.text.len() > ndsp_protocol::messages::MAX_CLIPBOARD_BYTES {
+                    debug!(len = ev.text.len(), "outbound clipboard exceeds cap; skipped");
+                    continue;
+                }
+                let msg = ControlMsg::Clipboard {
+                    mime: "text/plain".into(),
+                    data: ev.text.as_ref().clone(),
+                };
+                if ctl_tx.send(msg).await.is_err() { break; }
+            }
+
             _ = host_stats_timer.tick() => {
                 if shared.recv_age() > RECV_TIMEOUT {
                     warn!(client_id, "client unresponsive; closing");
@@ -300,17 +357,28 @@ pub async fn run(
     state.unregister_client(client_id);
     pump.abort();
     video.abort();
+    // Wait for the pump to actually stop: afterwards nothing can flip
+    // audio_active anymore, so the listener slot is released exactly once.
+    let _ = (&mut pump).await;
+    if handle.audio_active.swap(false, Ordering::Relaxed) {
+        state.audio_listeners.fetch_sub(1, Ordering::Relaxed);
+    }
     drop(ctl_tx); // writer exits once both inputs are gone
     writer.abort();
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts video; video is latest-only.
+/// Owns the socket sink. Priority: control > audio > video; video is
+/// latest-only, audio is latest-only too (Opus PLC absorbs a skipped 20 ms
+/// packet; a queue would turn one slow write into permanent audio delay).
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
+    mut aud_rx: watch::Receiver<Option<Arc<AudioFrame>>>,
+    audio_on: Arc<AtomicBool>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
 ) {
@@ -322,6 +390,15 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+            }
+
+            changed = aud_rx.changed(), if audio_on.load(Ordering::Relaxed) => {
+                if changed.is_err() { break; }
+                let frame = aud_rx.borrow_and_update().clone();
+                let Some(af) = frame else { continue };
+                let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &af.payload]);
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
 
@@ -534,6 +611,7 @@ async fn video_task(
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
 async fn incoming_pump(
+    state: Arc<AppState>,
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
     shared: Arc<Shared>,
@@ -588,8 +666,51 @@ async fn incoming_pump(
                         ControlMsg::SetInputMode { mode } => {
                             shared.input_mode.store(mode_to_u8(mode), Ordering::Relaxed);
                         }
+                        ControlMsg::SetAudio { enabled } => {
+                            let available = state.audio_available.load(Ordering::Relaxed);
+                            let effective = enabled && available;
+                            let was = handle.audio_active.swap(effective, Ordering::Relaxed);
+                            if !was && effective {
+                                state.audio_listeners.fetch_add(1, Ordering::Relaxed);
+                            } else if was && !effective {
+                                state.audio_listeners.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            debug!(enabled, available, "viewer set audio");
+                            let _ = ctl_tx.try_send(ControlMsg::AudioStatus {
+                                available,
+                                active: effective,
+                            });
+                        }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        ControlMsg::Clipboard { mime, data } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard event (no grant)");
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "clipboard_denied".into(),
+                                    message: "host has not granted clipboard access to this device"
+                                        .into(),
+                                });
+                                continue;
+                            }
+                            if data.len() > ndsp_protocol::messages::MAX_CLIPBOARD_BYTES {
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "clipboard_too_large".into(),
+                                    message: format!(
+                                        "clipboard events are capped at {} bytes",
+                                        ndsp_protocol::messages::MAX_CLIPBOARD_BYTES
+                                    ),
+                                });
+                                continue;
+                            }
+                            if mime != "text/plain" {
+                                debug!(%mime, "unsupported clipboard mime; dropped");
+                                continue;
+                            }
+                            if let Err(e) = state.clipboard.apply_from_client(&data) {
+                                warn!("clipboard apply failed: {e:#}");
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");

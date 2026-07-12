@@ -12,13 +12,15 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
   saveCredentials,
   seal,
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { Spake2Client } from "./pake";
 import {
+  AudioFrame,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
   ControlMsg,
@@ -30,6 +32,7 @@ import {
   Sealer,
   VideoFrame,
   WS_PATH,
+  parseAudioFrame,
   parseVideoFrame,
   td,
   te,
@@ -39,6 +42,8 @@ export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
+  /** Encrypted audio channel (only flows after SetAudio{enabled:true}). */
+  onAudio?(frame: AudioFrame): void;
 }
 
 export interface SessionInfo {
@@ -92,12 +97,14 @@ export class Session {
         device_id: deviceId(),
         name: clientName,
         platform: "web",
-        app_version: "0.2.0",
+        app_version: "0.5.0",
         // This viewer renders the host cursor from the dedicated cursor
         // channel (CursorShape/CursorPos) — never baked into video frames.
         features: ["cursor"],
       },
-      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
+      // Pairing uses SPAKE2 (PAKE): recorded handshakes cannot be used to
+      // grind the PIN offline. Token reconnects use ephemeral ECDH.
+      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair_spake2" },
       codecs: await supportedCodecs(),
     });
 
@@ -113,34 +120,38 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
-    const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+    // First flight: SPAKE2 element (pairing) or ephemeral ECDH key (token).
+    const ecdhKeys = useToken ? await generateHandshakeKeys() : null;
+    const spake = useToken ? null : await Spake2Client.start(pin!, nonce);
+    const clientPub = useToken ? ecdhKeys!.publicRaw : spake!.publicRaw;
+    send({ type: "pair_start", client_pubkey: b64encode(clientPub) });
     const challenge = await nextText();
     if (challenge.type === "auth_err") throw new Error(String(challenge.error));
     if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
     const serverPub = b64decode(challenge.server_pubkey as string);
     const salt = b64decode(challenge.salt as string);
-    const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
 
     let newlyPaired = false;
+    let sessionKeyRaw: Uint8Array;
     if (useToken && stored) {
-      const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
+      const shared = await agree(ecdhKeys!, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
+      const proof = await tokenProof(b64decode(stored.tokenB64), nonce, clientPub, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
+      const keys = await spake!.finish(serverPub, nonce, salt);
+      sessionKeyRaw = keys.sessionKey;
       const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
       confirm.set(CONFIRM_CONTEXT, 0);
       confirm.set(nonce, CONFIRM_CONTEXT.length);
-      const sealed = await seal(pairKey, confirm, new Uint8Array(0));
+      const sealed = await seal(keys.pairingKey, confirm, new Uint8Array(0));
       send({ type: "pair_confirm", sealed: b64encode(sealed) });
       const result = await nextText();
       if (result.type !== "pair_result" || !result.ok) {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        keys.pairingKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -187,6 +198,8 @@ export class Session {
           const { chan, plaintext } = await opener.open(data);
           if (chan === CHANNEL_VIDEO) {
             events.onVideo(parseVideoFrame(plaintext));
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio?.(parseAudioFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
           }

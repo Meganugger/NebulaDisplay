@@ -17,11 +17,13 @@
 //! session_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-session-v1"||nonce)
 //! ```
 //!
-//! The PIN never crosses the wire. A passive attacker recording the exchange
-//! can offline-brute-force the (short) PIN, which is why PINs are single-use,
-//! short-lived, and rate-limited; a PAKE (SPAKE2/OPAQUE) upgrade is planned —
-//! see `docs/SECURITY.md`. An *active* MITM without the PIN cannot complete
-//! `PairConfirm` and is rejected before any screen data flows.
+//! The PIN never crosses the wire. A passive attacker recording *this legacy
+//! exchange* can offline-brute-force the (short) PIN, which is why PINs are
+//! single-use, short-lived, and rate-limited — and why current clients pair
+//! via SPAKE2 instead (see [`crate::pake`]); this module remains for older
+//! viewers and can be refused host-side (`allow_legacy_pair = false`). An
+//! *active* MITM without the PIN cannot complete `PairConfirm` and is
+//! rejected before any screen data flows.
 //!
 //! ## Returning devices
 //!

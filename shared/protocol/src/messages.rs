@@ -37,8 +37,13 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// First contact: run the PIN-bound pairing handshake.
+    /// First contact, legacy: PIN-bound-HKDF pairing (see `crate::crypto`).
+    /// A recorded transcript can be PIN-ground offline — kept only for older
+    /// clients and can be disabled host-side (`allow_legacy_pair = false`).
     Pair,
+    /// First contact, preferred: SPAKE2 PAKE pairing (see `crate::pake`).
+    /// Same four-message flow as `Pair`; passive transcripts reveal nothing.
+    PairSpake2,
     /// Returning device: prove possession of a previously issued trust token.
     /// The token itself is never sent; see `TokenProof`.
     Token { device_id: String },
@@ -99,9 +104,15 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// a *physical* key position. `key` optionally carries the layout-aware
+    /// `KeyboardEvent.key` value ("a", "é", "Enter", …) so hosts can inject
+    /// the intended character when the physical position has no mapping
+    /// (non-US layouts, exotic keys). Absent on older clients.
     Key {
         code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
         pressed: bool,
     },
     Touch {
@@ -306,6 +317,32 @@ pub enum ControlMsg {
         y: f32,
         visible: bool,
     },
+    /// Clipboard content, either direction. Only text for now (`mime` is
+    /// forward-extensible). Both sides enforce [`MAX_CLIPBOARD_BYTES`] and
+    /// the per-device clipboard grant (deny by default, like input).
+    Clipboard {
+        /// Currently always `"text/plain"`.
+        mime: String,
+        /// The clipboard text (UTF-8).
+        data: String,
+    },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
+        allowed: bool,
+    },
+    /// Viewer requests audio streaming on/off for this session (channel 3).
+    /// The host only streams when audio capture is enabled host-side *and*
+    /// the client asked for it — audio is opt-in on both ends.
+    SetAudio {
+        enabled: bool,
+    },
+    /// Server → client: audio availability/state for this session.
+    /// `available` — host has an audio source configured; `active` — frames
+    /// are currently being streamed to *this* client.
+    AudioStatus {
+        available: bool,
+        active: bool,
+    },
     /// Graceful shutdown/teardown with reason.
     Bye {
         reason: String,
@@ -316,6 +353,11 @@ pub enum ControlMsg {
         message: String,
     },
 }
+
+/// Upper bound for a single [`ControlMsg::Clipboard`] `data` payload (bytes
+/// of UTF-8). Enforced by both peers: oversize events are dropped with an
+/// `Error { code: "clipboard_too_large" }`, never truncated silently.
+pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
 impl ControlMsg {
     pub fn to_json(&self) -> serde_json::Result<String> {
@@ -337,6 +379,7 @@ mod tests {
                 InputEvent::MouseMove { x: 0.5, y: 0.25 },
                 InputEvent::Key {
                     code: "KeyA".into(),
+                    key: Some("a".into()),
                     pressed: true,
                 },
                 InputEvent::Touch {
@@ -363,5 +406,53 @@ mod tests {
         let msg =
             ControlMsg::from_json(r#"{"type":"ping","t0_us":7,"future_field":true}"#).unwrap();
         assert_eq!(msg, ControlMsg::Ping { t0_us: 7 });
+    }
+
+    #[test]
+    fn key_event_without_layout_key_still_parses() {
+        // Older clients send only `code` — must keep deserializing.
+        let msg = ControlMsg::from_json(
+            r#"{"type":"input","events":[{"kind":"key","code":"KeyA","pressed":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::Input {
+                events: vec![InputEvent::Key {
+                    code: "KeyA".into(),
+                    key: None,
+                    pressed: true,
+                }],
+            }
+        );
+        // And when we serialize without a key, the field is omitted (older
+        // servers must not choke on an unexpected null). Note `"kind":"key"`
+        // is the enum tag — only the `"key":` *field* must be absent.
+        assert!(!msg.to_json().unwrap().contains("\"key\":"));
+    }
+
+    #[test]
+    fn spake2_auth_method_wire_format() {
+        let json = serde_json::to_string(&AuthMethod::PairSpake2).unwrap();
+        assert_eq!(json, r#"{"method":"pair_spake2"}"#);
+    }
+
+    #[test]
+    fn clipboard_and_audio_roundtrip() {
+        for msg in [
+            ControlMsg::Clipboard {
+                mime: "text/plain".into(),
+                data: "héllo".into(),
+            },
+            ControlMsg::ClipboardGrant { allowed: true },
+            ControlMsg::SetAudio { enabled: true },
+            ControlMsg::AudioStatus {
+                available: true,
+                active: false,
+            },
+        ] {
+            let json = msg.to_json().unwrap();
+            assert_eq!(ControlMsg::from_json(&json).unwrap(), msg);
+        }
     }
 }

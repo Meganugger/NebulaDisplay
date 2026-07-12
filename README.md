@@ -22,10 +22,16 @@ Windows PC (host)                            any device (viewer)
   driver — plus a zero-driver **mirror mode** that works out of the box.
 - **Web viewer with no install**: WebCodecs H.264 decode, touch/pen/keyboard,
   stats overlay with *measured* end-to-end latency.
-- **Encrypted by default**: ECDH P-256 + single-use PIN pairing → AES-256-GCM
-  on every frame; per-device trust tokens; input **denied until you allow it**.
+- **Encrypted by default**: SPAKE2 (PAKE) PIN pairing → AES-256-GCM on every
+  frame — recorded handshakes can't be PIN-ground offline; per-device trust
+  tokens; input **and clipboard denied until you allow them**; optional
+  HTTPS with a pinnable self-signed certificate.
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
   for Office / Video / Drawing / Gaming.
+- **Audio, opt-in twice**: WASAPI loopback → Opus, off by default on the
+  host *and* per viewer, with a live 🔊 indicator in the panel.
+- **Clipboard sync** (text) with per-device permission and size caps; true
+  stylus injection (pressure/tilt) and layout-aware typing on Windows.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
   required, nothing phones home.
 - Control panel with QR pairing, live client stats, per-device input grants,
@@ -62,13 +68,17 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (32 Rust tests + Node compat + full Chromium E2E
-in CI): protocol/crypto, pairing/trust/grants, H.264+JPEG streaming, web
-viewer, adaptation, discovery, panel. Written but **needing a Windows/WDK/SDK
-machine to build & validate**: the IddCx driver (extend mode), DXGI
-mirror/SendInput runtime behavior, tray app runtime, Android/iOS apps. Not
-implemented yet (designed, reserved in the protocol): audio, clipboard,
-hardware encoders, PAKE pairing — see [ROADMAP](docs/ROADMAP.md).
+Verified by automated tests (70 Rust tests + Node compat on two crypto
+backends + full Chromium E2E in CI): protocol/crypto, SPAKE2 + legacy
+pairing, trust/grants (input & clipboard), H.264+JPEG streaming, Opus audio
+(opt-in, decodable packets), clipboard permission/size gating, HTTPS with
+certificate pinning, adaptation, discovery, panel. Written and
+compile-verified for Windows but **needing a Windows/WDK/SDK machine to
+build & runtime-validate**: the IddCx driver (extend mode), DXGI
+mirror/SendInput/pen/clipboard/WASAPI runtime behavior, MF hardware
+encoders, tray app runtime, Android/iOS apps. Not implemented yet (designed,
+reserved in the protocol): file drop, QUIC, multi-monitor layout — see
+[ROADMAP](docs/ROADMAP.md).
 
 ## Clean-room statement
 

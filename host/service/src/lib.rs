@@ -2,7 +2,9 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
@@ -13,6 +15,8 @@ pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+#[cfg(feature = "https")]
+pub mod tls;
 pub mod trust;
 pub mod util;
 
@@ -28,6 +32,26 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Accept the legacy (pre-PAKE) pairing method.
+    pub allow_legacy_pair: bool,
+    /// Stream a synthetic test tone as audio (channel 3) for e2e tests.
+    pub audio: bool,
+    /// Serve the viewer endpoint over HTTPS (self-signed).
+    pub https: bool,
+}
+
+impl Default for EmbeddedOptions {
+    fn default() -> Self {
+        Self {
+            data_dir: std::env::temp_dir().join("ndsp-embedded"),
+            name: "embedded-host".into(),
+            capture: (320, 240),
+            max_fps: 30,
+            allow_legacy_pair: true,
+            audio: false,
+            https: false,
+        }
+    }
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,10 +72,20 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
+                allow_legacy_pair: opts.allow_legacy_pair,
+                audio: opts.audio,
+                https: opts.https,
                 ..Default::default()
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);
+
+        // Embedded hosts are for tests: never touch real audio devices.
+        if audio::spawn_test_tone_if_enabled(state.clone()) {
+            state
+                .audio_available
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();

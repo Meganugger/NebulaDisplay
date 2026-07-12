@@ -9,6 +9,12 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["tls"]
+# TLS (wss) with certificate-fingerprint pinning for `--https` hosts.
+# Feature-gated because rustls/ring contain native code.
+tls = ["dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
+
 [dependencies]
 ndsp-protocol = { workspace = true }
 tokio = { workspace = true }
@@ -21,4 +27,7 @@ tracing = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# TLS with certificate-fingerprint pinning for HTTPS hosts (`--https`).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+
 uuid = { version = "1", features = ["v4"] }

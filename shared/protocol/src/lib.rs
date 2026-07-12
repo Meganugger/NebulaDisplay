@@ -16,7 +16,7 @@
 //! ```text
 //! transport   WebSocket (binary) — QUIC/WebTransport planned
 //! envelope    [chan u8][counter u64 BE][AES-256-GCM ciphertext+tag]
-//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (reserved)
+//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (Opus)
 //! ```
 
 pub mod crypto;
@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod envelope;
 pub mod media;
 pub mod messages;
+pub mod pake;
 
 /// Current protocol version. Bump on breaking changes; peers negotiate
 /// `min(client, server)` and refuse to talk below [`MIN_PROTOCOL_VERSION`].
