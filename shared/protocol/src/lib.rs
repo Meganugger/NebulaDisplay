@@ -41,6 +41,11 @@ pub const DEFAULT_DISCOVERY_PORT: u16 = 41799;
 /// WebSocket route on the host that speaks NDSP.
 pub const WS_PATH: &str = "/ndsp";
 
+/// Maximum clipboard text size (UTF-8 bytes) either side will send or apply.
+/// Enforced by host and viewers alike; larger payloads are dropped with an
+/// error, never truncated silently.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("malformed frame: {0}")]

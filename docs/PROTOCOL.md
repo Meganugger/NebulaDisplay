@@ -18,7 +18,7 @@ Authority: `shared/protocol` — this document describes what that code does.
 
 ```
 C→S  hello        {protocol, client{device_id,name,platform,app_version,
-                   features?[]}, auth{method: pair | token+device_id},
+                   features?[]}, auth{method: pair_pake | pair | token+device_id},
                    codecs[]}
                    # features: optional capability flags. "cursor" → this
                    # viewer renders the host cursor from cursor_shape/
@@ -30,10 +30,30 @@ C→S  pair_start   {client_pubkey}                           # P-256, uncompres
 S→C  pair_challenge {server_pubkey, salt}                   # salt: 16B
 ```
 
-Both sides compute `shared = ECDH(eph_c, eph_s)` and
-`session_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-session-v1"‖nonce)`.
+The `pair_start`/`pair_challenge` points and key derivation depend on the
+auth method; the message flow is identical for all three.
 
-**Pairing path** (first contact; host displays a PIN):
+**PAKE pairing path** (`pair_pake` — default for current clients; host
+displays a PIN): SPAKE2 over P-256 with the RFC 9382 blinding constants
+M/N. `w = int(HKDF(ikm=PIN, salt=nonce, info="ndsp-pake-w-v1")) mod n`
+(0 maps to 1):
+
+```
+pair_start.client_pubkey    X = x·G + w·M
+pair_challenge.server_pubkey Y = y·G + w·N
+Z = x·(Y − w·N) = y·(X − w·M)          # abort on identity/off-curve
+pair_key    = HKDF(ikm=Z_uncompressed, salt, "ndsp-pake-pair-v1"‖nonce‖X‖Y‖w)
+session_key = HKDF(ikm=Z_uncompressed, salt, "ndsp-pake-session-v1"‖nonce‖X‖Y‖w)
+C→S  pair_confirm {sealed}    # AES-GCM(pair_key, "ndsp-confirm-v1"‖nonce)
+S→C  pair_result  {ok, sealed_token?}   # 32B trust token, sealed under pair_key (AAD "token")
+```
+
+A recorded `pair_pake` transcript is **not offline-grindable** — each PIN
+guess requires solving EC Diffie–Hellman.
+
+**Legacy pairing path** (`pair` — kept for older mobile viewers):
+`shared = ECDH(eph_c, eph_s)`,
+`session_key = HKDF-SHA256(ikm=shared, salt, "ndsp-session-v1"‖nonce)`,
 
 ```
 pair_key = HKDF-SHA256(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)
@@ -41,10 +61,12 @@ C→S  pair_confirm {sealed}    # AES-GCM(pair_key, "ndsp-confirm-v1"‖nonce)
 S→C  pair_result  {ok, sealed_token?}   # 32B trust token, sealed under pair_key (AAD "token")
 ```
 
-The PIN never crosses the wire. A wrong PIN fails the AEAD open; the host
-rotates the PIN and counts the failure against the source IP.
+Under either method the PIN never crosses the wire. A wrong PIN fails the
+AEAD open; the host rotates the PIN and counts the failure against the
+source IP.
 
-**Token path** (returning device):
+**Token path** (returning device): plain ephemeral ECDH
+(`session_key = HKDF(shared, salt, "ndsp-session-v1"‖nonce)`) plus:
 
 ```
 C→S  token_proof {proof}   # b64 SHA-256(token ‖ nonce ‖ client_pub ‖ server_pub)
@@ -57,7 +79,8 @@ host `fingerprint` from pairing and refuse to send proofs to a changed host.
 Finally:
 
 ```
-S→C  auth_ok  {codec, mode{width,height,refresh_hz}, input_allowed}
+S→C  auth_ok  {codec, mode{width,height,refresh_hz}, input_allowed,
+               clipboard_allowed}
      (or auth_err {error})
 ```
 
@@ -99,6 +122,8 @@ ts_us: host-clock capture timestamp (for measured e2e latency)
 | `stats {stats}` | C→S | fps/decode/queue/rtt/e2e/net/present-wait — drives adaptation + panel |
 | `host_stats {stats}` | S→C | capture fps, encode/convert ms, capture age, seal+send ms, bitrate, drops |
 | `input_grant {allowed}` | S→C | live grant change from the panel |
+| `clipboard {text}` | both | clipboard text sync — only honored under an explicit per-device grant; ≤ 256 KiB, oversize answered with `error {code:"clipboard_too_large"}` |
+| `clipboard_grant {allowed}` | S→C | live clipboard-grant change from the panel |
 | `cursor_shape {width,height,hot_x,hot_y,rgba}` | S→C | host cursor image (b64 RGBA8), sent on change to "cursor" viewers |
 | `cursor_pos {x,y,visible}` | S→C | host cursor moved (normalized coords); `visible:false` also = hide overlay (e.g. legacy client joined) |
 | `mode_change {mode}` | S→C | resolution/refresh switch |
@@ -107,9 +132,13 @@ ts_us: host-clock capture timestamp (for measured e2e latency)
 
 Input events (coordinates normalized 0..1 on the streamed surface):
 `mouse_move{x,y}`, `mouse_button{button,pressed}` (0=L,1=M,2=R,3/4=X),
-`wheel{dx,dy}`, `key{code,pressed}` (W3C `KeyboardEvent.code` strings),
-`touch{id,phase,x,y,pressure}`, `pen{phase,x,y,pressure,tilt_x,tilt_y}`,
-`text{text}`.
+`wheel{dx,dy}`, `key{code,pressed,key?}` (`code` = W3C `KeyboardEvent.code`
+physical position; optional `key` = layout-resolved `KeyboardEvent.key`
+character so the host can inject correctly across mismatched keyboard
+layouts — see `host/service/src/input/windows_inject.rs`),
+`touch{id,phase,x,y,pressure}`, `pen{phase,x,y,pressure,tilt_x,tilt_y}`
+(injected as a true Windows Ink pen with pressure/tilt/hover where the host
+supports synthetic pointers), `text{text}`.
 
 ## Versioning & compatibility
 

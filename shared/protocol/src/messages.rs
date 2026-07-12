@@ -37,8 +37,15 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// First contact: run the PIN-bound pairing handshake.
+    /// First contact, legacy method: PIN-bound HKDF pairing. Kept for older
+    /// viewers; a recorded transcript is offline-grindable, so new clients
+    /// should use [`AuthMethod::PairPake`].
     Pair,
+    /// First contact, current method: SPAKE2 (P-256) PIN pairing. The same
+    /// `PairStart`/`PairChallenge`/`PairConfirm` flow, but the exchanged
+    /// points are password-blinded so recorded transcripts cannot be ground
+    /// offline (see `crypto::pake`).
+    PairPake,
     /// Returning device: prove possession of a previously issued trust token.
     /// The token itself is never sent; see `TokenProof`.
     Token { device_id: String },
@@ -99,10 +106,16 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// the *physical* key position. `key` optionally carries the W3C
+    /// `KeyboardEvent.key` value ("a", "A", "é", "Enter", ...) — the
+    /// *layout-resolved* meaning on the viewer — so the host can pick the
+    /// best injection strategy when host and viewer keyboard layouts differ.
     Key {
         code: String,
         pressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Touch {
         id: u32,
@@ -244,6 +257,10 @@ pub enum ControlMsg {
         mode: DisplayMode,
         /// Whether this device is currently allowed to inject input.
         input_allowed: bool,
+        /// Whether this device is currently allowed to sync clipboard text.
+        /// Deny by default; toggled per device in the host panel.
+        #[serde(default)]
+        clipboard_allowed: bool,
     },
     AuthErr {
         error: String,
@@ -283,6 +300,16 @@ pub enum ControlMsg {
     },
     /// Server informs the viewer its input grant changed (panel toggle).
     InputGrant {
+        allowed: bool,
+    },
+    /// Clipboard text sync, either direction. Only honored when the device's
+    /// clipboard grant is on (deny by default); both ends enforce
+    /// [`MAX_CLIPBOARD_TEXT_BYTES`](crate::MAX_CLIPBOARD_TEXT_BYTES).
+    Clipboard {
+        text: String,
+    },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
         allowed: bool,
     },
     /// Server is about to switch modes (resolution change etc.).
@@ -338,6 +365,7 @@ mod tests {
                 InputEvent::Key {
                     code: "KeyA".into(),
                     pressed: true,
+                    key: Some("a".into()),
                 },
                 InputEvent::Touch {
                     id: 1,
@@ -363,5 +391,51 @@ mod tests {
         let msg =
             ControlMsg::from_json(r#"{"type":"ping","t0_us":7,"future_field":true}"#).unwrap();
         assert_eq!(msg, ControlMsg::Ping { t0_us: 7 });
+    }
+
+    /// Old viewers send `key` events without the layout field, and old hosts
+    /// must accept `auth_ok` without `clipboard_allowed` — both directions of
+    /// the v0.4 wire format keep parsing.
+    #[test]
+    fn v04_wire_compat_for_new_optional_fields() {
+        let msg = ControlMsg::from_json(
+            r#"{"type":"input","events":[{"kind":"key","code":"KeyA","pressed":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::Input {
+                events: vec![InputEvent::Key {
+                    code: "KeyA".into(),
+                    pressed: true,
+                    key: None,
+                }],
+            }
+        );
+        // Key without layout info serializes without the field (old hosts
+        // that reject unknown fields would still be fine — but don't emit it).
+        let json = msg.to_json().unwrap();
+        assert!(
+            !json.contains("\"key\":"),
+            "absent key must be omitted: {json}"
+        );
+
+        let auth_ok = ControlMsg::from_json(
+            r#"{"type":"auth_ok","codec":"jpeg","mode":{"width":1,"height":1,"refresh_hz":60},"input_allowed":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            auth_ok,
+            ControlMsg::AuthOk {
+                clipboard_allowed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_method_pake_tag() {
+        let json = serde_json::to_string(&AuthMethod::PairPake).unwrap();
+        assert_eq!(json, r#"{"method":"pair_pake"}"#);
     }
 }

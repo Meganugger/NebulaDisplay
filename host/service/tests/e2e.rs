@@ -404,3 +404,242 @@ async fn video_keeps_flowing_under_input_flood() {
     session.close().await;
     host.shutdown().await;
 }
+
+/// Older mobile viewers still speak the legacy PIN-bound-HKDF pairing; the
+/// host must keep accepting it alongside the default SPAKE2 method.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pin_pairing_still_works() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        legacy_pin_pairing_still_works_inner(),
+    )
+    .await
+    .expect("legacy pairing test watchdog expired");
+}
+
+async fn legacy_pin_pairing_still_works_inner() {
+    let host = start_host("legacy").await;
+    let pin = host.state.pins.current_pin();
+
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Old Android"),
+        Auth::PinLegacy(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("legacy pairing succeeds");
+    assert!(session.new_credentials.is_some());
+    assert!(!session.input_allowed);
+    let creds = session.new_credentials.clone().unwrap();
+    session.close().await;
+
+    // Tokens issued through the legacy path work for reconnect too.
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Old Android"),
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("token reconnect after legacy pairing");
+    session.close().await;
+
+    // And a wrong legacy PIN is still rejected.
+    let wrong = if host.state.pins.current_pin() == "000000" {
+        "000001".to_string()
+    } else {
+        "000000".to_string()
+    };
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Evil legacy"),
+            Auth::PinLegacy(&wrong),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "wrong legacy PIN",
+    );
+    assert!(format!("{err:#}").to_lowercase().contains("pin"));
+    host.shutdown().await;
+}
+
+/// Clipboard sync: deny-by-default, live grant notification, host application,
+/// fan-out to *other* granted viewers only (no echo to the origin).
+///
+/// Host-clipboard *content* assertions run against the in-process backend
+/// only (non-Windows): on Windows CI the real OS clipboard is shared runner
+/// state — reading it can even block indefinitely on a delayed-render format
+/// whose owner no longer pumps messages. The protocol-visible behavior
+/// (grants, fan-out, no-echo, size cap) is asserted on every platform.
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_grant_flow() {
+    // Watchdog: a wedged step must fail loudly, never hang CI.
+    tokio::time::timeout(Duration::from_secs(120), clipboard_sync_grant_flow_inner())
+        .await
+        .expect("clipboard test watchdog expired (something blocked)");
+}
+
+async fn clipboard_sync_grant_flow_inner() {
+    let host = start_host("clipboard").await;
+
+    // Pair two viewers (PIN is single-use → fetch it fresh for each).
+    let info_a = client_info("Tablet A");
+    let pin = host.state.pins.current_pin();
+    let mut a = connect(
+        "127.0.0.1",
+        host.port,
+        info_a.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("A pairs");
+    assert!(!a.clipboard_allowed, "clipboard must be denied by default");
+
+    let info_b = client_info("Phone B");
+    let pin = host.state.pins.current_pin();
+    let mut b = connect(
+        "127.0.0.1",
+        host.port,
+        info_b.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("B pairs");
+    tokio::time::sleep(Duration::from_millis(200)).await; // sessions register
+
+    // Without a grant, A's clipboard push must be ignored by the host.
+    a.send(&ControlMsg::Clipboard {
+        text: "stolen?".into(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    #[cfg(not(windows))]
+    assert_ne!(
+        host.state.clipboard.host_text().as_deref(),
+        Some("stolen?"),
+        "ungranted clipboard push must be dropped"
+    );
+
+    // Grant both; each session is notified live.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info_a.device_id, true)
+        .unwrap());
+    assert!(host
+        .state
+        .set_clipboard_grant(&info_b.device_id, true)
+        .unwrap());
+    for (name, s) in [("A", &mut a), ("B", &mut b)] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, s.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{name} grant notification timeout"))
+                .unwrap()
+            {
+                Incoming::Control(ControlMsg::ClipboardGrant { allowed }) => {
+                    assert!(allowed);
+                    break;
+                }
+                Incoming::Closed => panic!("{name} closed"),
+                _ => {}
+            }
+        }
+    }
+
+    // A pushes text: the host clipboard gets it, and B (not A) receives it.
+    a.send(&ControlMsg::Clipboard {
+        text: "hello from A".into(),
+    })
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut b_got = None;
+    while b_got.is_none() {
+        match tokio::time::timeout_at(deadline, b.recv())
+            .await
+            .expect("B clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { text }) => b_got = Some(text),
+            Incoming::Closed => panic!("B closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(b_got.as_deref(), Some("hello from A"));
+    #[cfg(not(windows))]
+    assert_eq!(
+        host.state.clipboard.host_text().as_deref(),
+        Some("hello from A")
+    );
+
+    // A must NOT receive an echo of its own push: drain briefly and check.
+    let drain = tokio::time::Instant::now() + Duration::from_millis(700);
+    loop {
+        match tokio::time::timeout_at(drain, a.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::Clipboard { text }))) => {
+                panic!("A received its own clipboard back: {text:?}")
+            }
+            Ok(Ok(Incoming::Closed)) => panic!("A closed"),
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Host-local copy reaches both granted viewers.
+    host.state.clipboard.publish_local("host copy".into());
+    for (name, s) in [("A", &mut a), ("B", &mut b)] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, s.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{name} host-copy timeout"))
+                .unwrap()
+            {
+                Incoming::Control(ControlMsg::Clipboard { text }) => {
+                    assert_eq!(text, "host copy");
+                    break;
+                }
+                Incoming::Closed => panic!("{name} closed"),
+                _ => {}
+            }
+        }
+    }
+
+    // Oversized pushes are rejected with an error, not applied.
+    let huge = "x".repeat(ndsp_protocol::MAX_CLIPBOARD_TEXT_BYTES + 1);
+    a.send(&ControlMsg::Clipboard { text: huge }).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, a.recv())
+            .await
+            .expect("size-cap error timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Error { code, .. }) => {
+                assert_eq!(code, "clipboard_too_large");
+                break;
+            }
+            Incoming::Closed => panic!("A closed"),
+            _ => {}
+        }
+    }
+    #[cfg(not(windows))]
+    assert_eq!(
+        host.state.clipboard.host_text().as_deref(),
+        Some("host copy"),
+        "oversized clipboard must not be applied"
+    );
+
+    a.close().await;
+    b.close().await;
+    host.shutdown().await;
+}

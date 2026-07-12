@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
+use crate::clipboard::ClipboardService;
 use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
@@ -55,6 +56,7 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
+    SetClipboardGrant(bool),
     Kick { reason: String },
 }
 
@@ -66,6 +68,7 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
@@ -82,6 +85,8 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Host clipboard bridge (permission-gated text sync).
+    pub clipboard: Arc<ClipboardService>,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -113,6 +118,7 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            clipboard: Arc::new(ClipboardService::new()),
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -203,6 +209,25 @@ impl AppState {
                 let _ = client
                     .commands
                     .try_send(SessionCommand::SetInputGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Push a clipboard-grant change both to the persistent store and any
+    /// live session for that device.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
             }
         }
         Ok(found)

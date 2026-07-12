@@ -12,12 +12,12 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
   saveCredentials,
   seal,
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { PakeClient } from "./pake";
 import {
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
@@ -45,6 +45,7 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
@@ -97,7 +98,7 @@ export class Session {
         // channel (CursorShape/CursorPos) — never baked into video frames.
         features: ["cursor"],
       },
-      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
+      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair_pake" },
       codecs: await supportedCodecs(),
     });
 
@@ -113,34 +114,44 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
-    const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
-    const challenge = await nextText();
-    if (challenge.type === "auth_err") throw new Error(String(challenge.error));
-    if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
-    const serverPub = b64decode(challenge.server_pubkey as string);
-    const salt = b64decode(challenge.salt as string);
-    const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
-
+    // Handshake share: plain ephemeral ECDH for token reconnect, SPAKE2
+    // (PIN-blinded points, offline-grind-proof) for pairing.
+    let sessionKeyRaw: Uint8Array;
     let newlyPaired = false;
     if (useToken && stored) {
+      const keys = await generateHandshakeKeys();
+      send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverPub = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const shared = await agree(keys, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
+      const pake = await PakeClient.start(pin!, nonce);
+      send({ type: "pair_start", client_pubkey: b64encode(pake.publicShare) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverShare = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const keys = await pake.complete(serverShare, salt, nonce);
+      sessionKeyRaw = keys.sessionKey;
+
       const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
       confirm.set(CONFIRM_CONTEXT, 0);
       confirm.set(nonce, CONFIRM_CONTEXT.length);
-      const sealed = await seal(pairKey, confirm, new Uint8Array(0));
+      const sealed = await seal(keys.pairKey, confirm, new Uint8Array(0));
       send({ type: "pair_confirm", sealed: b64encode(sealed) });
       const result = await nextText();
       if (result.type !== "pair_result" || !result.ok) {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        keys.pairKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -171,6 +182,7 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,

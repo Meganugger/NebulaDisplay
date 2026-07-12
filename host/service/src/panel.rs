@@ -27,6 +27,7 @@ pub async fn run(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         .route("/api/status", get(status))
         .route("/api/pin/rotate", post(rotate_pin))
         .route("/api/grant", post(grant))
+        .route("/api/clipboard-grant", post(clipboard_grant))
         .route("/api/revoke", post(revoke))
         .route("/api/qr.svg", get(qr_svg));
 
@@ -50,6 +51,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,6 +64,7 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     stats: ndsp_protocol::messages::ViewerStats,
 }
 
@@ -94,6 +97,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,6 +119,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
@@ -146,6 +153,19 @@ struct GrantReq {
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
     match state.set_input_grant(&req.device_id, req.allowed) {
+        Ok(true) => (StatusCode::OK, "ok").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Toggle the per-device clipboard-sync grant (same request shape as
+/// `/api/grant`).
+async fn clipboard_grant(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GrantReq>,
+) -> impl IntoResponse {
+    match state.set_clipboard_grant(&req.device_id, req.allowed) {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
