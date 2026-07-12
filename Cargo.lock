@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "ndsp-client"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "ndsp-protocol"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-tray"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ndsp-protocol",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-viewer"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "nebulad"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",

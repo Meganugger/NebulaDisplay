@@ -145,6 +145,30 @@ decrypt (never queued behind video) after checking the device's grant
 (deny by default, toggled live from the panel) → `SendInput` mapped through
 the captured monitor's desktop rect (multi-monitor correct).
 
+### Audio (off by default)
+
+```
+default output device ─► WASAPI loopback (Windows) / test tone (other, tests)
+      └► downmix→stereo, resample→48 kHz ─► Opus 20 ms packets (only while
+         someone listens) ─► watch (latest-only) ─► per-session writer
+         (priority: control > audio > video) ─► channel 3 envelopes
+viewer: AudioDecoder (WebCodecs) ─► Web Audio, ~60 ms jitter cushion
+```
+
+Latest-only on purpose: Opus PLC turns a skipped 20 ms packet into a barely
+audible artifact, whereas queueing would convert one slow write into
+permanent audio delay. Sessions opt in via `set_audio`; the panel shows a
+live 🔊 indicator per listener.
+
+### Clipboard (deny by default)
+
+```
+host copy ─► sequence-number poll (Windows) ─► Clipboard.publish_from_host
+      └► watch ─► sessions with the clipboard grant ─► clipboard message
+viewer paste/button ─► clipboard message ─► grant + 256 KiB checks ─►
+      Clipboard.apply_from_client (echo-suppressed against the watcher)
+```
+
 ### Control/health
 2 Hz Ping/Pong (clock sync + RTT, answered off the fast path), 2 s HostStats
 push, 30 s dead-peer timeout, single-use PINs with per-IP lockout, revocation
