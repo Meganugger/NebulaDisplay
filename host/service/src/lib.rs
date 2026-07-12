@@ -53,6 +53,10 @@ impl EmbeddedHost {
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);
+        // Tests must be deterministic (and must not touch the CI machine's
+        // real clipboard), so the embedded host always uses the in-memory
+        // backend regardless of platform.
+        *state.clipboard.lock().unwrap() = Box::new(clipboard::MemoryClipboard::default());
 
         let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();

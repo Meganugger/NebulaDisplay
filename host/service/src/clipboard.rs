@@ -75,10 +75,12 @@ impl MemoryClipboard {
 pub fn create_backend() -> Box<dyn ClipboardBackend> {
     #[cfg(windows)]
     {
-        return Box::new(windows_impl::WindowsClipboard::new());
+        Box::new(windows_impl::WindowsClipboard::new())
     }
     #[cfg(not(windows))]
-    Box::new(MemoryClipboard::default())
+    {
+        Box::new(MemoryClipboard::default())
+    }
 }
 
 /// Poll the host clipboard and broadcast changes to granted sessions.
