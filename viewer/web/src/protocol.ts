@@ -51,10 +51,20 @@ export type InputEvent =
   | { kind: "mouse_move"; x: number; y: number }
   | { kind: "mouse_button"; button: number; pressed: boolean }
   | { kind: "wheel"; dx: number; dy: number }
-  | { kind: "key"; code: string; pressed: boolean }
+  | { kind: "key"; code: string; pressed: boolean; key?: string }
   | { kind: "touch"; id: number; phase: TouchPhase; x: number; y: number; pressure: number }
   | { kind: "pen"; phase: TouchPhase; x: number; y: number; pressure: number; tilt_x: number; tilt_y: number }
-  | { kind: "text"; text: string };
+  | { kind: "text"; text: string }
+  | {
+      kind: "gamepad";
+      buttons: number;
+      left_x: number;
+      left_y: number;
+      right_x: number;
+      right_y: number;
+      left_trigger: number;
+      right_trigger: number;
+    };
 
 // Control messages — a permissive structural type keyed on `type`.
 export type ControlMsg = { type: string } & Record<string, unknown>;
@@ -158,4 +168,36 @@ export function b64decode(s: string): Uint8Array {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+export const CHANNEL_AUDIO = 3;
+export const CHANNEL_FILE = 4;
+
+/** Audio frame framing on channel 3 (mirrors media::AudioFrame). */
+export interface AudioFrameMsg {
+  codec: "opus";
+  seq: number;
+  timestampUs: bigint;
+  payload: Uint8Array;
+}
+
+export function parseAudioFrame(buf: Uint8Array): AudioFrameMsg {
+  if (buf.length < 14) throw new Error("audio frame header truncated");
+  if (buf[0] !== 0) throw new Error(`unknown audio codec id ${buf[0]}`);
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    codec: "opus",
+    seq: dv.getUint32(2),
+    timestampUs: readU64BE(dv, 6),
+    payload: buf.subarray(14),
+  };
+}
+
+/** File chunk header on channel 4 (mirrors media::FileChunk). */
+export function encodeFileChunkHeader(transferId: number, offset: number): Uint8Array {
+  const h = new Uint8Array(12);
+  const dv = new DataView(h.buffer);
+  dv.setUint32(0, transferId);
+  writeU64BE(dv, 4, BigInt(offset));
+  return h;
 }

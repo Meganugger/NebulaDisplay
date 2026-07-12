@@ -9,7 +9,11 @@
 //! * Non-Windows hosts: structured log sink (useful for tests/CI).
 
 #[cfg(windows)]
+mod windows_gamepad;
+#[cfg(windows)]
 mod windows_inject;
+#[cfg(windows)]
+mod windows_pen;
 
 use ndsp_protocol::messages::InputEvent;
 use std::sync::Arc;

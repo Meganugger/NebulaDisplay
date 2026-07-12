@@ -2,10 +2,13 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
+pub mod filedrop;
 pub mod input;
 pub mod pairing;
 pub mod panel;
@@ -13,6 +16,8 @@ pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod trust;
 pub mod util;
 
@@ -28,6 +33,9 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Full file-config knobs (PAKE policy, audio, clipboard/file caps, …).
+    /// `max_fps` above overrides `file.max_fps`.
+    pub file: FileConfig,
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,7 +56,7 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
-                ..Default::default()
+                ..opts.file
             },
         };
         let state = Arc::new(AppState::new(cfg).await?);

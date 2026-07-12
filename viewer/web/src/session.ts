@@ -1,6 +1,6 @@
 // NDSP session: connect → (pair | token reconnect) → encrypted session.
 
-import { caps, probeH264Decode } from "./caps";
+import { caps, probeH264Decode, probeHevcDecode } from "./caps";
 import {
   b64decode,
   b64encode,
@@ -12,31 +12,39 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
+  pairingKeyPake,
   saveCredentials,
   seal,
   sessionKeyBytes,
+  sessionKeyBytesPake,
   tokenProof,
 } from "./crypto";
+import { pakeStart } from "./pake";
 import {
+  AudioFrameMsg,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
+  CHANNEL_FILE,
   CHANNEL_VIDEO,
   ControlMsg,
   DIR_CLIENT_TO_SERVER,
   DIR_SERVER_TO_CLIENT,
   DisplayMode,
+  encodeFileChunkHeader,
   Opener,
+  parseAudioFrame,
+  parseVideoFrame,
   PROTOCOL_VERSION,
   Sealer,
-  VideoFrame,
-  WS_PATH,
-  parseVideoFrame,
   td,
   te,
+  VideoFrame,
+  WS_PATH,
 } from "./protocol";
 
 export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
+  onAudio(frame: AudioFrameMsg): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
 }
@@ -45,6 +53,8 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
+  audioAvailable: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
@@ -93,9 +103,11 @@ export class Session {
         name: clientName,
         platform: "web",
         app_version: "0.2.0",
-        // This viewer renders the host cursor from the dedicated cursor
+        // "cursor": renders the host cursor from the dedicated cursor
         // channel (CursorShape/CursorPos) — never baked into video frames.
-        features: ["cursor"],
+        // "clipboard"/"file_drop"/"audio": this build understands those
+        // messages/channels; actual use is still permission-gated host-side.
+        features: viewerFeatures(),
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
       codecs: await supportedCodecs(),
@@ -113,23 +125,44 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
+    // Ephemeral ECDH — plus a PIN-bound PAKE share when pairing, which makes
+    // the recorded transcript useless for offline PIN grinding.
     const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+    const pake = useToken ? null : pakeStart(pin!, nonce);
+    send({
+      type: "pair_start",
+      client_pubkey: b64encode(keys.publicRaw),
+      ...(pake ? { pake_share: b64encode(pake.share) } : {}),
+    });
     const challenge = await nextText();
     if (challenge.type === "auth_err") throw new Error(String(challenge.error));
     if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
     const serverPub = b64decode(challenge.server_pubkey as string);
     const salt = b64decode(challenge.salt as string);
     const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
+
+    // No silent downgrade: if we offered a PAKE share the server must answer
+    // with one. A missing share means either a pre-PAKE host (update it) or
+    // an active attacker stripping the field.
+    let pakeSecret: Uint8Array | null = null;
+    if (pake) {
+      if (typeof challenge.pake_share !== "string") {
+        throw new Error(
+          "Host did not complete secure PIN pairing (PAKE) — update the host software.",
+        );
+      }
+      pakeSecret = pake.finish(b64decode(challenge.pake_share));
+    }
+    const sessionKeyRaw = pakeSecret
+      ? await sessionKeyBytesPake(shared, pakeSecret, salt, nonce)
+      : await sessionKeyBytes(shared, salt, nonce);
 
     let newlyPaired = false;
     if (useToken && stored) {
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
+      const pairKey = await pairingKeyPake(shared, pakeSecret!, salt, nonce);
       const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
       confirm.set(CONFIRM_CONTEXT, 0);
       confirm.set(nonce, CONFIRM_CONTEXT.length);
@@ -140,7 +173,7 @@ export class Session {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        pairKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -171,6 +204,8 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
+      audioAvailable: Boolean(authOk.audio_available),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,
@@ -189,6 +224,8 @@ export class Session {
             events.onVideo(parseVideoFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio(parseAudioFrame(plaintext));
           }
         } catch (e) {
           console.error("envelope error", e);
@@ -217,6 +254,23 @@ export class Session {
     return this.sendChain;
   }
 
+  /**
+   * Stream one file-drop chunk on channel 4 (only after the host accepted
+   * the offer). Shares the send chain so envelope counters stay ordered.
+   */
+  sendFileChunk(transferId: number, offset: number, data: Uint8Array): Promise<void> {
+    this.sendChain = this.sendChain.then(async () => {
+      if (this.ws.readyState !== WebSocket.OPEN) return;
+      const header = encodeFileChunkHeader(transferId, offset);
+      const plaintext = new Uint8Array(header.length + data.length);
+      plaintext.set(header, 0);
+      plaintext.set(data, header.length);
+      const env = await this.sealer.seal(CHANNEL_FILE, plaintext);
+      this.ws.send(env);
+    });
+    return this.sendChain;
+  }
+
   /** Bytes currently queued on the socket (backpressure indicator). */
   get buffered(): number {
     return this.ws.bufferedAmount;
@@ -235,7 +289,17 @@ async function supportedCodecs(): Promise<string[]> {
   //   origins, where WebCodecs doesn't exist at all).
   const codecs = ["jpeg"];
   if ((await probeH264Decode()) || caps.mseH264) codecs.unshift("h264");
+  // HEVC ahead of H.264 when decodable — better quality per bit, and the
+  // host only picks it when it has a hardware HEVC encoder.
+  if (await probeHevcDecode()) codecs.unshift("hevc");
   return codecs;
+}
+
+function viewerFeatures(): string[] {
+  const features = ["cursor", "file_drop"];
+  if (typeof navigator !== "undefined" && navigator.clipboard) features.push("clipboard");
+  if (typeof AudioDecoder === "function") features.push("audio");
+  return features;
 }
 
 function protoErr(expected: string, got: ControlMsg): Error {

@@ -30,21 +30,30 @@
           <div id="host-stats"></div>
         </div>
       </div>
+      <div class="tile" style="margin-top:1rem; display:none" id="pending-files-tile">
+        <h2>File transfers waiting for your decision</h2>
+        <table id="pending-files">
+          <thead>
+            <tr><th>File</th><th>Size</th><th>From</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
       <div class="tile" style="margin-top:1rem">
         <h2>Connected now</h2>
         <table id="clients">
           <thead>
-            <tr><th>Device</th><th>From</th><th>FPS</th><th>Latency</th><th>RTT</th><th>Input</th></tr>
+            <tr><th>Device</th><th>From</th><th>FPS</th><th>Latency</th><th>RTT</th><th>Input</th><th>Audio</th></tr>
           </thead>
           <tbody></tbody>
         </table>
         <p id="no-clients" style="color:var(--fg-dim)">No viewers connected.</p>
       </div>
       <div class="tile" style="margin-top:1rem">
-        <h2>Trusted devices <span style="text-transform:none;letter-spacing:0">(input is <b>off by default</b> — enable per device)</span></h2>
+        <h2>Trusted devices <span style="text-transform:none;letter-spacing:0">(input &amp; clipboard are <b>off by default</b> — enable per device)</span></h2>
         <table id="trusted">
           <thead>
-            <tr><th>Device</th><th>Platform</th><th>Last seen</th><th>Allow input</th><th></th></tr>
+            <tr><th>Device</th><th>Platform</th><th>Last seen</th><th>Allow input</th><th>Allow clipboard</th><th></th></tr>
           </thead>
           <tbody></tbody>
         </table>

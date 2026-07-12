@@ -11,7 +11,19 @@ interface ClientView {
   addr: string;
   connected_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
+  audio_on: boolean;
   stats: ViewerStats;
+}
+
+interface PendingFileView {
+  client_id: number;
+  transfer_id: number;
+  device_id: string;
+  device_name: string;
+  file_name: string;
+  size: number;
+  offered_unix: number;
 }
 
 interface TrustedView {
@@ -21,6 +33,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -35,6 +48,8 @@ interface Status {
   host_stats: HostStats;
   clients: ClientView[];
   trusted: TrustedView[];
+  pending_files: PendingFileView[];
+  audio_available: boolean;
 }
 
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
@@ -103,6 +118,7 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
         <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td><span class="tag ${c.audio_on ? "on" : "off"}">${c.audio_on ? "🔊 live" : "off"}</span></td>
       </tr>`,
     )
     .join("");
@@ -119,6 +135,9 @@ async function refresh(): Promise<void> {
         <td>
           <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
         </td>
+        <td>
+          <label class="switch"><input type="checkbox" data-clipgrant="${esc(d.device_id)}" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
+        </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
     )
@@ -130,8 +149,54 @@ async function refresh(): Promise<void> {
       void api("/api/grant", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+        body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked, what: "input" }),
       }).catch(console.error);
+  });
+  ttbody.querySelectorAll<HTMLInputElement>("input[data-clipgrant]").forEach((el) => {
+    el.onchange = () =>
+      void api("/api/grant", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          device_id: el.dataset["clipgrant"],
+          allowed: el.checked,
+          what: "clipboard",
+        }),
+      }).catch(console.error);
+  });
+
+  // Pending file-drop offers (explicit accept per transfer).
+  const tile = $("pending-files-tile");
+  tile.style.display = st.pending_files.length ? "" : "none";
+  const ftbody = $("pending-files").querySelector("tbody")!;
+  ftbody.innerHTML = st.pending_files
+    .map(
+      (f) => `<tr>
+        <td><b>${esc(f.file_name)}</b></td>
+        <td class="mono">${fmtSize(f.size)}</td>
+        <td>${esc(f.device_name)}</td>
+        <td>
+          <button data-fdec="${f.client_id}:${f.transfer_id}:1">Accept</button>
+          <button class="danger" data-fdec="${f.client_id}:${f.transfer_id}:0">Decline</button>
+        </td>
+      </tr>`,
+    )
+    .join("");
+  ftbody.querySelectorAll<HTMLButtonElement>("button[data-fdec]").forEach((el) => {
+    el.onclick = () => {
+      const [clientId, transferId, accept] = el.dataset["fdec"]!.split(":");
+      void api("/api/files/decide", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_id: Number(clientId),
+          transfer_id: Number(transferId),
+          accept: accept === "1",
+        }),
+      })
+        .then(refresh)
+        .catch(console.error);
+    };
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {
     el.onclick = () => {
@@ -145,6 +210,13 @@ async function refresh(): Promise<void> {
         .catch(console.error);
     };
   });
+}
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }
 
 function line(k: string, v: string): string {

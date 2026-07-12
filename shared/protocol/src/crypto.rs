@@ -44,6 +44,9 @@ use crate::{ProtocolError, Result};
 pub const CONFIRM_CONTEXT: &[u8] = b"ndsp-confirm-v1";
 pub const PAIR_INFO: &[u8] = b"ndsp-pair-v1";
 pub const SESSION_INFO: &[u8] = b"ndsp-session-v1";
+/// HKDF info labels for the PAKE-augmented pairing (see [`crate::pake`]).
+pub const PAIR_PAKE_INFO: &[u8] = b"ndsp-pair-pake-v1";
+pub const SESSION_PAKE_INFO: &[u8] = b"ndsp-session-pake-v1";
 pub const TOKEN_LEN: usize = 32;
 
 /// One side's ephemeral ECDH keypair for a handshake.
@@ -99,6 +102,33 @@ impl SharedSecret {
     /// leak can't decrypt recorded sessions beyond the pairing exchange).
     pub fn session_key(&self, salt: &[u8], connection_nonce: &[u8]) -> [u8; 32] {
         derive(&self.0, salt, &[SESSION_INFO, connection_nonce])
+    }
+
+    /// PAKE-augmented pairing key: the ikm is `ecdh_shared ‖ pake_secret`,
+    /// so recovering it requires breaking *both* exchanges. A recorded
+    /// transcript can no longer be ground offline against candidate PINs —
+    /// each guess would require solving CDH in ristretto255 (see
+    /// [`crate::pake`]).
+    pub fn pairing_key_pake(
+        &self,
+        pake_secret: &[u8; 32],
+        salt: &[u8],
+        connection_nonce: &[u8],
+    ) -> [u8; 32] {
+        let ikm: Vec<u8> = [self.0.as_slice(), pake_secret].concat();
+        derive(&ikm, salt, &[PAIR_PAKE_INFO, connection_nonce])
+    }
+
+    /// Session key for PAKE-paired connections. Mixing the PAKE secret in
+    /// makes the transport key PIN-authenticated as well as ECDH-fresh.
+    pub fn session_key_pake(
+        &self,
+        pake_secret: &[u8; 32],
+        salt: &[u8],
+        connection_nonce: &[u8],
+    ) -> [u8; 32] {
+        let ikm: Vec<u8> = [self.0.as_slice(), pake_secret].concat();
+        derive(&ikm, salt, &[SESSION_PAKE_INFO, connection_nonce])
     }
 }
 

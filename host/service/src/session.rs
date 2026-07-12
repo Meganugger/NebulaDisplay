@@ -26,11 +26,12 @@
 //!   so a slow socket drops stale frames instead of queueing them.
 
 use axum::extract::ws::{Message, WebSocket};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, FileChunk, VideoFrame},
     messages::{ControlMsg, InputMode, Profile},
 };
 use std::net::SocketAddr;
@@ -41,9 +42,10 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::adapt::AdaptiveController;
+use crate::filedrop::{FileReceiver, Progress};
 use crate::input::InputSink;
 use crate::pairing::AuthComplete;
-use crate::state::{AppState, ClientHandle, SessionCommand};
+use crate::state::{AppState, ClientHandle, PendingFileOffer, SessionCommand};
 use crate::util::now_us;
 
 /// Liveness: drop the session if nothing (not even pings) arrives for this long.
@@ -56,6 +58,9 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
+    /// Session opted into host audio (and the host config allows it).
+    audio_enabled: Arc<AtomicBool>,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -133,8 +138,12 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
+    let audio_enabled = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_enabled: audio_enabled.clone(),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -150,6 +159,7 @@ pub async fn run(
     });
 
     let supports_cursor = auth.client.features.iter().any(|f| f == "cursor");
+    let supports_clipboard = auth.client.features.iter().any(|f| f == "clipboard");
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(8);
     let handle = Arc::new(ClientHandle {
         device_id: auth.client.device_id.clone(),
@@ -161,6 +171,8 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_on: audio_enabled.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -176,11 +188,19 @@ pub async fn run(
     let (vid_tx, vid_rx) = watch::channel::<Option<(u64, Arc<VideoFrame>)>>(None);
     let consumed_seq = Arc::new(AtomicU64::new(0));
 
+    // File-drop receiver: shared between the pump (chunks/offers) and the
+    // supervisor (panel accept/reject decisions).
+    let file_rx = Arc::new(Mutex::new(FileReceiver::new(
+        crate::filedrop::download_dir(&state.cfg),
+        state.cfg.file.file_max_bytes,
+    )));
+
     let writer = tokio::spawn(writer_task(
         ws_tx,
         sealer,
         ctl_rx,
         vid_rx,
+        state.audio_tx.subscribe(),
         shared.clone(),
         consumed_seq.clone(),
     ));
@@ -191,6 +211,9 @@ pub async fn run(
         ctl_tx.clone(),
         input_sink,
         handle.clone(),
+        state.clone(),
+        file_rx.clone(),
+        client_id,
     ));
     let video = tokio::spawn(video_task(
         state.clone(),
@@ -214,12 +237,34 @@ pub async fn run(
     cursor_rx.mark_changed();
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
+    // Clipboard forwarding (only for clipboard-capable clients with a grant).
+    let mut clipboard_rx = state.clipboard_tx.subscribe();
+    clipboard_rx.mark_changed(); // deliver current content on connect
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::FileDecision { transfer_id, accept } => {
+                    let reply = if accept {
+                        match file_rx.lock().unwrap().accept(transfer_id) {
+                            Ok(()) => ControlMsg::FileAccept { transfer_id },
+                            Err(e) => {
+                                warn!(transfer_id, "file accept failed: {e:#}");
+                                ControlMsg::FileReject { transfer_id, reason: "host storage error".into() }
+                            }
+                        }
+                    } else {
+                        file_rx.lock().unwrap().reject(transfer_id);
+                        ControlMsg::FileReject { transfer_id, reason: "declined by host".into() }
+                    };
+                    if ctl_tx.send(reply).await.is_err() { break; }
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -230,6 +275,21 @@ pub async fn run(
             },
 
             _ = &mut pump => break, // client went away / protocol violation
+
+            changed = clipboard_rx.changed(), if supports_clipboard => {
+                if changed.is_err() { continue; }
+                let item = clipboard_rx.borrow_and_update().clone();
+                let Some(item) = item else { continue };
+                if !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                // Never echo a viewer's own clipboard back at it.
+                if item.origin.as_deref() == Some(handle.device_id.as_str()) { continue; }
+                if item.text.len() > state.cfg.file.clipboard_max_bytes { continue; }
+                let msg = ControlMsg::ClipboardData {
+                    format: "text".into(),
+                    data: B64.encode(item.text.as_bytes()),
+                };
+                if ctl_tx.send(msg).await.is_err() { break; }
+            }
 
             changed = cursor_rx.changed(), if supports_cursor => {
                 if changed.is_err() { continue; }
@@ -298,6 +358,17 @@ pub async fn run(
     }
 
     state.unregister_client(client_id);
+    // Release the audio listener slot and drop any pending file offers.
+    if audio_enabled.swap(false, Ordering::AcqRel) {
+        state
+            .audio_listeners
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    state
+        .pending_files
+        .lock()
+        .unwrap()
+        .retain(|p| p.client_id != client_id);
     pump.abort();
     video.abort();
     drop(ctl_tx); // writer exits once both inputs are gone
@@ -305,15 +376,18 @@ pub async fn run(
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts video; video is latest-only.
+/// Owns the socket sink. Control preempts audio preempts video; audio and
+/// video are latest-only (a slow socket drops stale media, never queues it).
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
+    mut audio_rx: watch::Receiver<Option<Arc<crate::audio::AudioPacket>>>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
 ) {
+    let mut last_audio_seq: u32 = 0;
     loop {
         tokio::select! {
             biased;
@@ -322,6 +396,24 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+            }
+
+            changed = audio_rx.changed() => {
+                if changed.is_err() { continue; } // pipeline idle/gone — not fatal
+                let pkt = { audio_rx.borrow_and_update().clone() };
+                let Some(pkt) = pkt else { continue };
+                if !shared.audio_enabled.load(Ordering::Relaxed) { continue; }
+                if pkt.seq == last_audio_seq { continue; }
+                last_audio_seq = pkt.seq;
+                let af = AudioFrame {
+                    codec: ndsp_protocol::messages::AudioCodec::Opus,
+                    seq: pkt.seq,
+                    timestamp_us: pkt.timestamp_us,
+                    payload: Vec::new(), // header only; payload sealed in parts
+                };
+                let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &pkt.opus]);
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
 
@@ -533,6 +625,7 @@ async fn video_task(
 /// Latency-critical handling happens *right here* — input events go straight
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
+#[allow(clippy::too_many_arguments)]
 async fn incoming_pump(
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
@@ -540,6 +633,9 @@ async fn incoming_pump(
     ctl_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
     handle: Arc<ClientHandle>,
+    state: Arc<AppState>,
+    file_rx: Arc<Mutex<FileReceiver>>,
+    client_id: u64,
 ) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
@@ -591,11 +687,113 @@ async fn incoming_pump(
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
                         }
+                        ControlMsg::ClipboardData { format, data } => {
+                            handle_clipboard_from_client(&shared, &handle, &state, &format, &data);
+                        }
+                        ControlMsg::SetAudio { enabled } => {
+                            let available = state.cfg.file.audio && cfg!(feature = "audio");
+                            if enabled && !available {
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "audio_disabled".into(),
+                                    message: "host audio is disabled in its config".into(),
+                                });
+                                continue;
+                            }
+                            let was = shared.audio_enabled.swap(enabled, Ordering::AcqRel);
+                            if enabled && !was {
+                                state.audio_listeners.fetch_add(1, Ordering::AcqRel);
+                                let (codec, sample_rate, channels) = crate::audio::stream_params();
+                                let _ = ctl_tx.try_send(ControlMsg::AudioStart {
+                                    codec,
+                                    sample_rate,
+                                    channels,
+                                });
+                            } else if !enabled && was {
+                                state.audio_listeners.fetch_sub(1, Ordering::AcqRel);
+                                let _ = ctl_tx.try_send(ControlMsg::AudioStop);
+                            }
+                        }
+                        ControlMsg::FileOffer {
+                            transfer_id,
+                            name,
+                            size,
+                            sha256,
+                        } => {
+                            let res =
+                                file_rx
+                                    .lock()
+                                    .unwrap()
+                                    .offer(transfer_id, &name, size, &sha256);
+                            match res {
+                                Ok(clean_name) => {
+                                    info!(
+                                        transfer_id,
+                                        name = %clean_name,
+                                        size,
+                                        "file offered — awaiting panel decision"
+                                    );
+                                    state.add_pending_file(PendingFileOffer {
+                                        transfer_id,
+                                        client_id,
+                                        device_id: handle.device_id.clone(),
+                                        device_name: handle.name.clone(),
+                                        file_name: clean_name,
+                                        size,
+                                        offered_unix: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                    });
+                                }
+                                Err(reason) => {
+                                    let _ = ctl_tx.try_send(ControlMsg::FileReject {
+                                        transfer_id,
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");
                             return;
                         }
                         other => debug!(?other, "ignoring unexpected control message"),
+                    }
+                }
+                Ok((Channel::File, plaintext)) => {
+                    shared.touch_recv();
+                    let Ok(chunk) = FileChunk::decode(&plaintext) else {
+                        warn!("malformed file chunk; dropping");
+                        continue;
+                    };
+                    let transfer_id = chunk.transfer_id;
+                    let res = {
+                        let mut rx = file_rx.lock().unwrap();
+                        if !rx.is_active(transfer_id) {
+                            // Chunk without acceptance — protocol misuse.
+                            debug!(transfer_id, "chunk for non-accepted transfer dropped");
+                            continue;
+                        }
+                        rx.chunk(&chunk)
+                    };
+                    match res {
+                        Ok(Progress::Done { path }) => {
+                            info!(transfer_id, path = %path.display(), "file received ✓");
+                            let _ = ctl_tx.try_send(ControlMsg::FileDone {
+                                transfer_id,
+                                ok: true,
+                                error: None,
+                            });
+                        }
+                        Ok(Progress::Receiving { .. }) => {}
+                        Err(e) => {
+                            warn!(transfer_id, "file transfer failed: {e}");
+                            let _ = ctl_tx.try_send(ControlMsg::FileDone {
+                                transfer_id,
+                                ok: false,
+                                error: Some(e),
+                            });
+                        }
                     }
                 }
                 Ok((chan, _)) => debug!(?chan, "unexpected inbound channel; dropping"),
@@ -613,4 +811,54 @@ async fn incoming_pump(
             _ => {}
         }
     }
+}
+
+/// Viewer → host clipboard write: grant + cap enforced, then published to
+/// the backend and to every *other* session (origin-tagged).
+fn handle_clipboard_from_client(
+    shared: &Shared,
+    handle: &ClientHandle,
+    state: &AppState,
+    format: &str,
+    data_b64: &str,
+) {
+    if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+        debug!("dropping clipboard payload (no grant)");
+        return;
+    }
+    if format != "text" {
+        debug!(format, "unsupported clipboard format ignored");
+        return;
+    }
+    let Ok(bytes) = B64.decode(data_b64) else {
+        debug!("bad clipboard b64; dropping");
+        return;
+    };
+    if bytes.len() > state.cfg.file.clipboard_max_bytes {
+        debug!(
+            len = bytes.len(),
+            cap = state.cfg.file.clipboard_max_bytes,
+            "clipboard payload over cap; dropping"
+        );
+        return;
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        debug!("clipboard payload not UTF-8; dropping");
+        return;
+    };
+    if let Err(e) = state.clipboard.set_text(&text) {
+        warn!("host clipboard write failed: {e:#}");
+        return;
+    }
+    // Remember the resulting backend seq so the watcher doesn't re-broadcast
+    // this change as a host-local copy.
+    let seq = state.clipboard.change_seq();
+    state
+        .clipboard_own_seq
+        .store(seq, std::sync::atomic::Ordering::Release);
+    state.publish_clipboard(crate::clipboard::ClipboardItem {
+        seq,
+        text,
+        origin: Some(handle.device_id.clone()),
+    });
 }

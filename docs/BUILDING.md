@@ -4,13 +4,17 @@
 
 | Component | Needs |
 |---|---|
-| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`) |
+| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`); a C compiler + CMake for the default `h264`/`audio` features (`--no-default-features` for pure Rust) |
 | Web viewer + panel | Node 22+ / npm |
 | Windows virtual display driver | Windows + VS2022 + WDK (see `host/windows-driver/README.md`) |
 | Android viewer | Android SDK 35, JDK 17 (see `viewer/android/README.md`) |
 | iOS viewer | Xcode 15+ on macOS (see `viewer/ios/README.md`) |
 
 Everything in the first two rows builds and tests on Linux/macOS/Windows.
+
+> **CMake ≥ 4?** The bundled Opus build (audio feature) declares an old
+> minimum version; set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment
+> (CI does this) or build with `--no-default-features --features h264,tls`.
 
 ## Quick start (host + web viewer)
 

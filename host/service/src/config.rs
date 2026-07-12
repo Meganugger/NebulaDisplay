@@ -29,6 +29,22 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Refuse legacy (pre-PAKE) PIN pairing. Off by default so old viewers
+    /// can still pair; turn on once every device runs a PAKE-capable viewer.
+    pub require_pake: bool,
+    /// Stream host audio (WASAPI loopback) to sessions that request it.
+    /// Off by default — a visible privacy toggle, like input grants.
+    pub audio: bool,
+    /// Byte cap for a single clipboard sync payload (either direction).
+    pub clipboard_max_bytes: usize,
+    /// Byte cap for a single dropped file.
+    pub file_max_bytes: u64,
+    /// Where accepted file drops are stored. Default: `<data_dir>/downloads`.
+    pub file_dir: Option<std::path::PathBuf>,
+    /// Serve the viewer endpoint over HTTPS with a persisted self-signed
+    /// certificate (printed fingerprint). Gives browsers a secure context
+    /// (native WebCrypto/WebCodecs) at the cost of a one-time warning.
+    pub https: bool,
 }
 
 impl Default for FileConfig {
@@ -40,6 +56,12 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            require_pake: false,
+            audio: false,
+            clipboard_max_bytes: 256 * 1024,
+            file_max_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
+            file_dir: None,
+            https: false,
         }
     }
 }

@@ -26,8 +26,44 @@ use crate::state::AppState;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub async fn run(state: Arc<AppState>, bind: IpAddr, port: u16) -> anyhow::Result<()> {
+    if state.cfg.file.https {
+        #[cfg(feature = "tls")]
+        return run_tls(state, bind, port).await;
+        #[cfg(not(feature = "tls"))]
+        anyhow::bail!(
+            "config has https = true but this nebulad was built without the `tls` feature"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind, port)).await?;
     serve_on(state, listener).await
+}
+
+/// TLS variant of the viewer endpoint (feature "tls") (`https = true` in config): same
+/// router, served through axum-server/rustls with the persisted self-signed
+/// certificate (see [`crate::tls`]).
+#[cfg(feature = "tls")]
+async fn run_tls(state: Arc<AppState>, bind: IpAddr, port: u16) -> anyhow::Result<()> {
+    // Process-wide rustls provider (ring — see Cargo.toml note). Ignore the
+    // error if something else installed one first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let material = crate::tls::load_or_create(&state.cfg.data_dir)?;
+    info!(
+        fingerprint = %material.fingerprint,
+        "HTTPS enabled — browsers will warn once for the self-signed cert; \
+         compare this fingerprint before accepting"
+    );
+    let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        &material.cert_pem_path,
+        &material.key_pem_path,
+    )
+    .await?;
+    state.set_serving_port(port);
+    let app = build_router(state.clone());
+    info!("viewer endpoint listening on https://{bind}:{port}");
+    axum_server::bind_rustls(SocketAddr::new(bind, port), rustls_cfg)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
+    Ok(())
 }
 
 /// Serve on an already-bound listener (embedded/test mode uses ephemeral ports).
@@ -37,7 +73,33 @@ pub async fn serve_on(
 ) -> anyhow::Result<()> {
     let local = listener.local_addr()?;
     state.set_serving_port(local.port());
+    let app = build_router(state.clone());
+    info!("viewer endpoint listening on {local}");
+    // TCP_NODELAY: Nagle would coalesce small control/video writes with up
+    // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("set_nodelay failed: {e}");
+        }
+    });
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The viewer router + feature side-loops (shared by HTTP and HTTPS paths).
+fn build_router(state: Arc<AppState>) -> Router {
     let input_sink: Arc<dyn crate::input::InputSink> = Arc::from(create_sink(state.clone()));
+
+    // Feature side-loops: host-clipboard watcher (publishes local copies to
+    // granted sessions) and the audio pipeline supervisor (idle until a
+    // session opts in — returns immediately when audio is off in config).
+    tokio::spawn(crate::clipboard::watch_loop(state.clone()));
+    tokio::spawn(crate::audio::run_audio_pipeline(state.clone()));
 
     let mut app = Router::new()
         .route(ndsp_protocol::WS_PATH, any(ws_handler))
@@ -54,22 +116,7 @@ pub async fn serve_on(
         }
     }
 
-    let app = app.with_state((state, input_sink));
-    info!("viewer endpoint listening on {local}");
-    // TCP_NODELAY: Nagle would coalesce small control/video writes with up
-    // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|tcp| {
-        if let Err(e) = tcp.set_nodelay(true) {
-            tracing::debug!("set_nodelay failed: {e}");
-        }
-    });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    app.with_state((state, input_sink))
 }
 
 async fn no_viewer_page() -> impl IntoResponse {

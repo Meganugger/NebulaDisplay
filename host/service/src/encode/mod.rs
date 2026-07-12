@@ -58,8 +58,8 @@ pub fn create(
         Codec::Jpeg => Ok(Box::new(jpeg::JpegEncoder::new())),
         Codec::H264 => {
             #[cfg(windows)]
-            if mf_h264::hw_encoder_available() {
-                match mf_h264::MfH264Encoder::new(mode.width, mode.height, 6_000, 60) {
+            if mf_h264::hw_encoder_available(Codec::H264) {
+                match mf_h264::MfH264Encoder::new(Codec::H264, mode.width, mode.height, 6_000, 60) {
                     Ok(enc) => return Ok(Box::new(enc)),
                     Err(e) => {
                         tracing::warn!("hardware encoder init failed ({e:#}); using software");
@@ -73,8 +73,46 @@ pub fn create(
             #[cfg(not(feature = "h264"))]
             anyhow::bail!("built without the h264 feature and no hardware encoder")
         }
+        Codec::Hevc => {
+            // HEVC is hardware-only (no software fallback in clean-room
+            // scope) — only negotiated when `hevc_hw_available()` is true.
+            #[cfg(windows)]
+            {
+                match mf_h264::MfH264Encoder::new(Codec::Hevc, mode.width, mode.height, 6_000, 60) {
+                    Ok(enc) => Ok(Box::new(enc)),
+                    Err(e) => anyhow::bail!("hardware HEVC encoder init failed: {e:#}"),
+                }
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("HEVC encoding requires a Windows hardware encoder")
+        }
         other => anyhow::bail!("codec {other:?} not implemented yet"),
     }
+}
+
+/// True when this host can encode H.264 (software feature or hardware MFT).
+pub fn h264_available() -> bool {
+    if cfg!(feature = "h264") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        mf_h264::hw_encoder_available(Codec::H264)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// True when this host can encode HEVC (hardware MFT present). Used during
+/// codec negotiation — HEVC is only selected when a client prefers it AND
+/// the hardware is there; H.264/JPEG remain the universal fallbacks.
+pub fn hevc_hw_available() -> bool {
+    #[cfg(windows)]
+    {
+        mf_h264::hw_encoder_available(Codec::Hevc)
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 #[cfg(test)]

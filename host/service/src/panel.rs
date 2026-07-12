@@ -28,6 +28,7 @@ pub async fn run(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         .route("/api/pin/rotate", post(rotate_pin))
         .route("/api/grant", post(grant))
         .route("/api/revoke", post(revoke))
+        .route("/api/files/decide", post(file_decide))
         .route("/api/qr.svg", get(qr_svg));
 
     if let Some(dir) = &state.cfg.web_dir {
@@ -50,6 +51,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,7 +64,20 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    audio_on: bool,
     stats: ndsp_protocol::messages::ViewerStats,
+}
+
+#[derive(Serialize)]
+struct PendingFileView {
+    client_id: u64,
+    transfer_id: u32,
+    device_id: String,
+    device_name: String,
+    file_name: String,
+    size: u64,
+    offered_unix: u64,
 }
 
 #[derive(Serialize)]
@@ -77,6 +92,8 @@ struct StatusView {
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
     trusted: Vec<TrustedDeviceView>,
+    pending_files: Vec<PendingFileView>,
+    audio_available: bool,
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
@@ -94,6 +111,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            audio_on: c.audio_on.load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,9 +134,15 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     Json(StatusView {
         name: state.cfg.name.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -124,12 +151,28 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
         pin: state.pins.current_pin(),
         viewer_urls: local_ips()
             .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
+            .map(|ip| format!("{scheme}://{ip}:{port}/"))
             .collect(),
         mode: *state.mode.lock().unwrap(),
         host_stats: state.host_stats.lock().unwrap().clone(),
         clients,
         trusted,
+        pending_files: state
+            .pending_files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| PendingFileView {
+                client_id: p.client_id,
+                transfer_id: p.transfer_id,
+                device_id: p.device_id.clone(),
+                device_name: p.device_name.clone(),
+                file_name: p.file_name.clone(),
+                size: p.size,
+                offered_unix: p.offered_unix,
+            })
+            .collect(),
+        audio_available: state.cfg.file.audio,
     })
 }
 
@@ -142,13 +185,46 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// "input" (default, backward compatible) or "clipboard".
+    #[serde(default)]
+    what: Option<String>,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let res = match req.what.as_deref() {
+        None | Some("input") => state.set_input_grant(&req.device_id, req.allowed),
+        Some("clipboard") => state.set_clipboard_grant(&req.device_id, req.allowed),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown grant kind {other:?}"),
+            )
+                .into_response()
+        }
+    };
+    match res {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FileDecideReq {
+    client_id: u64,
+    transfer_id: u32,
+    accept: bool,
+}
+
+/// Host user's decision on a pending file-drop offer.
+async fn file_decide(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FileDecideReq>,
+) -> impl IntoResponse {
+    if state.decide_file(req.client_id, req.transfer_id, req.accept) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such pending transfer").into_response()
     }
 }
 
@@ -177,8 +253,13 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
+    let scheme = if state.cfg.file.https {
+        "https"
+    } else {
+        "http"
+    };
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{scheme}://{ip}:{port}/?pin={pin}&fp={}",
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

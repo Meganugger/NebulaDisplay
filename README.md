@@ -22,10 +22,15 @@ Windows PC (host)                            any device (viewer)
   driver — plus a zero-driver **mirror mode** that works out of the box.
 - **Web viewer with no install**: WebCodecs H.264 decode, touch/pen/keyboard,
   stats overlay with *measured* end-to-end latency.
-- **Encrypted by default**: ECDH P-256 + single-use PIN pairing → AES-256-GCM
-  on every frame; per-device trust tokens; input **denied until you allow it**.
+- **Encrypted by default**: ECDH P-256 + a real **PAKE** (PIN pairing whose
+  transcript can't be brute-forced offline) → AES-256-GCM on every frame;
+  per-device trust tokens (DPAPI-protected at rest on Windows); input,
+  clipboard and file transfers **denied until you allow them**.
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
-  for Office / Video / Drawing / Gaming.
+  for Office / Video / Drawing / Gaming; hardware H.264/HEVC when available.
+- **More than pixels**: opt-in host audio (Opus), permission-gated clipboard
+  sync and drag-&-drop file transfer (explicit accept per file), pen with
+  pressure/tilt via Windows Ink, layout-aware keyboard, gamepad forwarding.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
   required, nothing phones home.
 - Control panel with QR pairing, live client stats, per-device input grants,
@@ -45,6 +50,24 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 `http://127.0.0.1:41888/panel.html`. Extend mode (true extra monitor):
 [host/windows-driver/README.md](host/windows-driver/README.md).
 
+## Configuration
+
+`config.toml` lives in the data dir (`%APPDATA%\NebulaDisplay` /
+`~/.config/nebuladisplay`). Notable knobs (all default-off / safe):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `audio` | `false` | Stream host audio (WASAPI loopback → Opus) to sessions that opt in; panel shows a live indicator |
+| `require_pake` | `false` | Refuse legacy (pre-PAKE) PIN pairing once all your viewers are updated |
+| `https` | `false` | Serve the viewer over TLS with a persisted self-signed cert (fingerprint printed) |
+| `clipboard_max_bytes` | `262144` | Per-payload clipboard sync cap |
+| `file_max_bytes` | `2147483648` | Per-file drop cap; accepted files land in `<data_dir>/downloads` (`file_dir` overrides) |
+| `pin_digits` / `pin_ttl_secs` / `max_pin_attempts` / `lockout_secs` | `6/300/5/300` | Pairing PIN policy |
+| `max_fps` | `60` | Global FPS cap on top of profiles |
+
+Clipboard and file-drop access are additionally **per-device grants** in the
+panel, exactly like input — deny by default, live-revocable.
+
 ## Repository layout
 
 | Path | What |
@@ -62,13 +85,16 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (32 Rust tests + Node compat + full Chromium E2E
-in CI): protocol/crypto, pairing/trust/grants, H.264+JPEG streaming, web
-viewer, adaptation, discovery, panel. Written but **needing a Windows/WDK/SDK
-machine to build & validate**: the IddCx driver (extend mode), DXGI
-mirror/SendInput runtime behavior, tray app runtime, Android/iOS apps. Not
-implemented yet (designed, reserved in the protocol): audio, clipboard,
-hardware encoders, PAKE pairing — see [ROADMAP](docs/ROADMAP.md).
+Verified by automated tests (70+ Rust tests + Node compat + full Chromium
+E2E in CI): protocol/crypto, **PAKE pairing** (cross-implementation vectors
+Rust ↔ web), trust/grants, H.264+JPEG streaming, adaptation, discovery,
+panel, **clipboard sync**, **file drop** (explicit accept + SHA-256),
+**audio** (Opus over channel 3, test-tone source in CI), optional **HTTPS**.
+Written and compile-verified against the msvc target but **needing a real
+Windows machine for runtime validation**: the IddCx driver (extend mode),
+DXGI mirror/SendInput, WASAPI loopback, Win32 clipboard, Windows Ink pen,
+gamepad injection, DPAPI stores, hardware H.264/HEVC MFTs, tray app,
+Android/iOS apps. See [ROADMAP](docs/ROADMAP.md) for what remains.
 
 ## Clean-room statement
 

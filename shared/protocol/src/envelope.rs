@@ -26,6 +26,10 @@ pub enum Channel {
     Control = 1,
     Video = 2,
     Audio = 3,
+    /// File-drop chunk stream (see `media::FileChunk`). Only used after an
+    /// explicit `FileAccept`, and only with peers that advertised the
+    /// "file_drop" feature.
+    File = 4,
 }
 
 impl TryFrom<u8> for Channel {
@@ -35,6 +39,7 @@ impl TryFrom<u8> for Channel {
             1 => Ok(Channel::Control),
             2 => Ok(Channel::Video),
             3 => Ok(Channel::Audio),
+            4 => Ok(Channel::File),
             _ => Err(ProtocolError::Malformed("unknown channel")),
         }
     }
@@ -61,7 +66,7 @@ fn nonce_for(dir: Direction, chan: Channel, counter: u64) -> [u8; 12] {
 pub struct Sealer {
     cipher: Aes256Gcm,
     dir: Direction,
-    counters: [u64; 4], // indexed by channel discriminant
+    counters: [u64; 5], // indexed by channel discriminant
 }
 
 impl Sealer {
@@ -69,7 +74,7 @@ impl Sealer {
         Self {
             cipher: Aes256Gcm::new(session_key.into()),
             dir,
-            counters: [0; 4],
+            counters: [0; 5],
         }
     }
 
@@ -108,7 +113,7 @@ impl Sealer {
 pub struct Opener {
     cipher: Aes256Gcm,
     dir: Direction,
-    next_expected: [u64; 4],
+    next_expected: [u64; 5],
 }
 
 impl Opener {
@@ -117,7 +122,7 @@ impl Opener {
         Self {
             cipher: Aes256Gcm::new(session_key.into()),
             dir,
-            next_expected: [0; 4],
+            next_expected: [0; 5],
         }
     }
 
