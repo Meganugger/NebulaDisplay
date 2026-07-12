@@ -50,12 +50,15 @@
           <option value="drawing_tablet">Drawing tablet</option>
         </select>
         <span id="input-denied">input not granted by host</span>
+        <button id="audio-btn" title="Host audio" style="display: none">🔇</button>
+        <input id="volume" type="range" min="0" max="100" value="80" title="Volume" style="display: none; width: 70px" />
         <button id="stats-btn" title="Toggle stats overlay">Stats</button>
         <button id="fullscreen-btn" title="Fullscreen">⛶</button>
         <button id="disconnect-btn" class="danger">Disconnect</button>
       </div>
       <div id="stats-overlay"></div>
       <div id="toast"></div>
+      <div id="drop-hint">Drop to send the file to the host<br /><span style="font-size:0.8rem;color:var(--fg-dim)">the host user must accept it in the control panel</span></div>
     </div>
   </body>
 </html>

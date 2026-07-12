@@ -29,6 +29,7 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     pub newly_paired: bool,
 }
 
@@ -110,11 +111,13 @@ impl ServerHandshake {
         Codec::Jpeg
     }
 
-    fn auth_ok(&self, input_allowed: bool) -> ControlMsg {
+    fn auth_ok(&self, input_allowed: bool, clipboard_allowed: bool) -> ControlMsg {
         ControlMsg::AuthOk {
             codec: self.select_codec(),
             mode: *self.state.mode.lock().unwrap(),
             input_allowed,
+            clipboard_allowed,
+            audio_available: self.state.cfg.file.audio && cfg!(feature = "audio"),
         }
     }
 
@@ -311,7 +314,7 @@ impl ServerHandshake {
                             Some(pake) => shared.session_key_pake(pake, salt.as_ref(), &self.nonce),
                             None => shared.session_key(salt.as_ref(), &self.nonce),
                         };
-                        let auth_ok = self.auth_ok(false);
+                        let auth_ok = self.auth_ok(false, false);
                         let codec = self.select_codec();
                         self.phase = Phase::Done;
                         Step {
@@ -328,6 +331,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -385,7 +389,8 @@ impl ServerHandshake {
                         let client = self.client.clone().expect("hello precedes proof");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let input_allowed = dev.input_allowed;
-                        let auth_ok = self.auth_ok(input_allowed);
+                        let clipboard_allowed = dev.clipboard_allowed;
+                        let auth_ok = self.auth_ok(input_allowed, clipboard_allowed);
                         let codec = self.select_codec();
                         info!(device = %device_id, "token reconnect ok");
                         self.phase = Phase::Done;
@@ -396,6 +401,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,

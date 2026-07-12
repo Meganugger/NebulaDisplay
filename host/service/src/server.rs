@@ -39,6 +39,12 @@ pub async fn serve_on(
     state.set_serving_port(local.port());
     let input_sink: Arc<dyn crate::input::InputSink> = Arc::from(create_sink(state.clone()));
 
+    // Feature side-loops: host-clipboard watcher (publishes local copies to
+    // granted sessions) and the audio pipeline supervisor (idle until a
+    // session opts in — returns immediately when audio is off in config).
+    tokio::spawn(crate::clipboard::watch_loop(state.clone()));
+    tokio::spawn(crate::audio::run_audio_pipeline(state.clone()));
+
     let mut app = Router::new()
         .route(ndsp_protocol::WS_PATH, any(ws_handler))
         .route("/healthz", get(|| async { "ok" }));

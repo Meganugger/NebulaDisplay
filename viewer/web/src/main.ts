@@ -1,11 +1,13 @@
 // Viewer application: connect card → streaming canvas with toolbar/stats.
 
 import "./style.css";
+import { AudioPlayer } from "./audioplay";
 import { capabilityReport, caps, fullscreen, storage } from "./caps";
 import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
+import { FileDropSender } from "./filedrop";
 import { contentBox, InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
 import { Session } from "./session";
@@ -43,6 +45,18 @@ let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
 let cursorHot = { x: 0, y: 0 };
 let cursorPos: { x: number; y: number; visible: boolean } | null = null;
+/** Host audio playback (channel 3). */
+let audio: AudioPlayer | null = null;
+let audioWanted = false;
+const audioBtn = $<HTMLButtonElement>("audio-btn");
+const volumeSlider = $<HTMLInputElement>("volume");
+/** File-drop sender for the current session. */
+let fileDrop: FileDropSender | null = null;
+const dropHint = $("drop-hint");
+/** Clipboard sync state (suppress echo loops). */
+let clipboardAllowed = false;
+let lastClipboardSent = "";
+let lastClipboardReceived = "";
 
 function defaultHost(): string {
   // When served by nebulad itself, the page origin *is* the host.
@@ -124,10 +138,13 @@ async function openSession(host: string, pin: string | null): Promise<void> {
         if (lat !== null && lat >= 0) netMsAvg = netMsAvg === 0 ? lat : netMsAvg * 0.9 + lat * 0.1;
         void renderer?.push(frame);
       },
+      onAudio: (frame) => audio?.push(frame),
       onControl: onControl,
       onClose: (reason) => onSessionClosed(host, reason),
     });
     session = s;
+    fileDrop = new FileDropSender(s);
+    clipboardAllowed = s.info.clipboardAllowed;
     renderer.requestKeyframe = () => void s.send({ type: "request_keyframe" });
     renderer.onError = (e) => {
       console.error("render error", e);
@@ -182,6 +199,35 @@ function onSessionClosed(host: string, reason: string): void {
 
 function onControl(msg: ControlMsg): void {
   switch (msg.type) {
+    case "clipboard_data":
+      void applyHostClipboard(msg);
+      break;
+    case "clipboard_grant": {
+      clipboardAllowed = Boolean(msg.allowed);
+      showToast(
+        clipboardAllowed ? "Host enabled clipboard sync" : "Host disabled clipboard sync",
+      );
+      break;
+    }
+    case "audio_start":
+      showToast("Host audio on 🔊");
+      break;
+    case "audio_stop":
+      if (audioWanted) showToast("Host audio stopped");
+      break;
+    case "file_accept":
+      fileDrop?.onAccept(Number(msg.transfer_id));
+      break;
+    case "file_reject":
+      fileDrop?.onReject(Number(msg.transfer_id), String(msg.reason ?? "rejected"));
+      break;
+    case "file_done":
+      fileDrop?.onDone(
+        Number(msg.transfer_id),
+        Boolean(msg.ok),
+        msg.error ? String(msg.error) : undefined,
+      );
+      break;
     case "pong":
       clock.onPong(Number(msg.t0_us), Number(msg.t1_us));
       break;
@@ -224,9 +270,69 @@ function onControl(msg: ControlMsg): void {
       endSession(`Host ended the session: ${String(msg.reason)}`);
       break;
     case "error":
+      if (msg.code === "audio_disabled") {
+        showToast("Audio is disabled in the host's config (audio = false)");
+        setAudioEnabled(false);
+      }
       console.warn("host error", msg);
       break;
   }
+}
+
+/** Host clipboard arrived — write it locally (needs focus in most browsers). */
+async function applyHostClipboard(msg: ControlMsg): Promise<void> {
+  if (String(msg.format) !== "text" || !navigator.clipboard) return;
+  try {
+    const bytes = Uint8Array.from(atob(String(msg.data)), (c) => c.charCodeAt(0));
+    const text = new TextDecoder().decode(bytes);
+    lastClipboardReceived = text;
+    await navigator.clipboard.writeText(text);
+    showToast("📋 Clipboard received from host");
+  } catch (e) {
+    // Usually a focus/permission constraint; the text will land on the next
+    // successful write attempt after the user focuses the page.
+    console.warn("clipboard write failed", e);
+  }
+}
+
+/**
+ * Push the local clipboard to the host when it changed. Called on focus and
+ * shortly after copy/cut (the event fires before the clipboard is updated).
+ */
+async function maybeSendClipboard(): Promise<void> {
+  if (!session || !clipboardAllowed || !navigator.clipboard?.readText) return;
+  let text: string;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    return; // permission denied / not focused
+  }
+  if (!text || text === lastClipboardSent || text === lastClipboardReceived) return;
+  if (new TextEncoder().encode(text).length > 256 * 1024) return; // host cap
+  lastClipboardSent = text;
+  void session.send({ type: "clipboard_data", format: "text", data: b64text(text) });
+}
+
+function b64text(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function setAudioEnabled(on: boolean): void {
+  audioWanted = on;
+  audioBtn.textContent = on ? "🔊" : "🔇";
+  volumeSlider.style.display = on ? "" : "none";
+  if (on) {
+    audio?.stop();
+    audio = new AudioPlayer();
+    audio.start(48000, 2, Number(volumeSlider.value) / 100);
+  } else {
+    audio?.stop();
+    audio = null;
+  }
+  void session?.send({ type: "set_audio", enabled: on });
 }
 
 /**
@@ -272,6 +378,69 @@ function enterViewer(s: Session): void {
   );
   input.attach();
   refreshInputBadge();
+
+  // Host audio: only offer the toggle when the host has audio enabled and
+  // this browser can decode Opus (WebCodecs — secure contexts).
+  const audioSupported = AudioPlayer.supported() && s.info.audioAvailable;
+  audioBtn.style.display = audioSupported ? "" : "none";
+  audioBtn.textContent = "🔇";
+  volumeSlider.style.display = "none";
+
+  // Clipboard sync: push local changes on focus / copy / cut.
+  const clipHandler = () => setTimeout(() => void maybeSendClipboard(), 120);
+  window.addEventListener("focus", clipHandler);
+  document.addEventListener("copy", clipHandler);
+  document.addEventListener("cut", clipHandler);
+  sessionDisposers.push(() => {
+    window.removeEventListener("focus", clipHandler);
+    document.removeEventListener("copy", clipHandler);
+    document.removeEventListener("cut", clipHandler);
+  });
+
+  // File drop: drag a file anywhere over the viewer.
+  const onDragOver = (ev: DragEvent) => {
+    if (!ev.dataTransfer?.types.includes("Files")) return;
+    ev.preventDefault();
+    dropHint.classList.add("visible");
+  };
+  const onDragLeave = () => dropHint.classList.remove("visible");
+  const onDrop = (ev: DragEvent) => {
+    ev.preventDefault();
+    dropHint.classList.remove("visible");
+    const files = ev.dataTransfer?.files;
+    if (!files?.length || !fileDrop) return;
+    for (const file of files) {
+      void fileDrop.offer(file, (p) => {
+        switch (p.state) {
+          case "hashing":
+            showToast(`Preparing ${p.name}…`);
+            break;
+          case "waiting":
+            showToast(`Waiting for the host to accept ${p.name} — check the host panel`, 8000);
+            break;
+          case "sending": {
+            const pct = p.size ? Math.round((p.sent / p.size) * 100) : 0;
+            showToast(`Sending ${p.name}… ${pct}%`, 1500);
+            break;
+          }
+          case "done":
+            showToast(`✓ ${p.name} delivered`);
+            break;
+          case "failed":
+            showToast(`✗ ${p.name}: ${p.error ?? "failed"}`, 8000);
+            break;
+        }
+      });
+    }
+  };
+  viewerScreen.addEventListener("dragover", onDragOver);
+  viewerScreen.addEventListener("dragleave", onDragLeave);
+  viewerScreen.addEventListener("drop", onDrop);
+  sessionDisposers.push(() => {
+    viewerScreen.removeEventListener("dragover", onDragOver);
+    viewerScreen.removeEventListener("dragleave", onDragLeave);
+    viewerScreen.removeEventListener("drop", onDrop);
+  });
 
   // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
   // measurable cost.
@@ -319,6 +488,8 @@ function enterViewer(s: Session): void {
   }, 1000);
 }
 
+let sessionDisposers: (() => void)[] = [];
+
 function endSession(reason: string): void {
   if (!session) return;
   window.clearInterval(statsTimer);
@@ -328,6 +499,18 @@ function endSession(reason: string): void {
   renderer?.destroy();
   renderer = null;
   session = null;
+  for (const d of sessionDisposers) d();
+  sessionDisposers = [];
+  audio?.stop();
+  audio = null;
+  audioWanted = false;
+  audioBtn.style.display = "none";
+  volumeSlider.style.display = "none";
+  fileDrop = null;
+  clipboardAllowed = false;
+  lastClipboardSent = "";
+  lastClipboardReceived = "";
+  dropHint.classList.remove("visible");
   hostStats = null;
   cursorPos = null;
   remoteCursor.style.display = "none";
@@ -343,6 +526,8 @@ function round1(n: number): number {
 }
 
 // --- toolbar wiring -------------------------------------------------------
+audioBtn.onclick = () => setAudioEnabled(!audioWanted);
+volumeSlider.oninput = () => audio?.setVolume(Number(volumeSlider.value) / 100);
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
 if (fullscreen.supported) {
   $("fullscreen-btn").onclick = () => {

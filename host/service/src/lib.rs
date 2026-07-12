@@ -2,10 +2,13 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
+pub mod filedrop;
 pub mod input;
 pub mod pairing;
 pub mod panel;

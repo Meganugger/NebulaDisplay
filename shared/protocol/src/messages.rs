@@ -283,6 +283,13 @@ pub enum ControlMsg {
         mode: DisplayMode,
         /// Whether this device is currently allowed to inject input.
         input_allowed: bool,
+        /// Whether this device is currently allowed to sync the clipboard.
+        #[serde(default)]
+        clipboard_allowed: bool,
+        /// Whether the host has audio streaming enabled in its config
+        /// (sessions still opt in with `SetAudio`).
+        #[serde(default)]
+        audio_available: bool,
     },
     AuthErr {
         error: String,

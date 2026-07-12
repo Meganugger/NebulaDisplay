@@ -55,7 +55,15 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
-    Kick { reason: String },
+    SetClipboardGrant(bool),
+    /// Panel decision on a pending file-drop offer from this session.
+    FileDecision {
+        transfer_id: u32,
+        accept: bool,
+    },
+    Kick {
+        reason: String,
+    },
 }
 
 /// Panel-visible live client entry.
@@ -66,10 +74,26 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
+    /// Session currently receives host audio (panel indicator).
+    pub audio_on: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
     pub commands: mpsc::Sender<SessionCommand>,
+}
+
+/// A file-drop offer waiting for the host user's decision in the panel.
+#[derive(Debug, Clone)]
+pub struct PendingFileOffer {
+    /// Session-local transfer id (scoped by `client_id`).
+    pub transfer_id: u32,
+    pub client_id: u64,
+    pub device_id: String,
+    pub device_name: String,
+    pub file_name: String,
+    pub size: u64,
+    pub offered_unix: u64,
 }
 
 pub struct AppState {
@@ -89,6 +113,20 @@ pub struct AppState {
     /// when the platform exposes one — used for multi-monitor input mapping.
     pub capture_rect: Mutex<Option<(i32, i32, i32, i32)>>,
     pub clients: Mutex<HashMap<u64, Arc<ClientHandle>>>,
+    /// Host clipboard backend (real on Windows, in-memory elsewhere).
+    pub clipboard: Arc<dyn crate::clipboard::ClipboardBackend>,
+    /// Latest clipboard item to sync; sessions `watch` this.
+    pub clipboard_tx: watch::Sender<Option<Arc<crate::clipboard::ClipboardItem>>>,
+    /// Backend seq of the last clipboard write *we* performed (remote →
+    /// host), so the watcher doesn't re-broadcast it as a host change.
+    pub clipboard_own_seq: AtomicU64,
+    /// File-drop offers awaiting the host user's panel decision.
+    pub pending_files: Mutex<Vec<PendingFileOffer>>,
+    /// Encoded host-audio packets (Opus); sessions with audio on `watch`
+    /// this. `None` until the audio pipeline publishes its first packet.
+    pub audio_tx: watch::Sender<Option<Arc<crate::audio::AudioPacket>>>,
+    /// Number of sessions currently requesting audio (drives the pipeline).
+    pub audio_listeners: AtomicU64,
     next_client_id: AtomicU64,
     serving_port: AtomicU64,
     shutdown: AtomicBool,
@@ -106,6 +144,8 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (clipboard_tx, _) = watch::channel(None);
+        let (audio_tx, _) = watch::channel(None);
         Ok(Self {
             cfg,
             fingerprint,
@@ -121,6 +161,12 @@ impl AppState {
             }),
             capture_rect: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
+            clipboard: crate::clipboard::create_backend(),
+            clipboard_tx,
+            clipboard_own_seq: AtomicU64::new(0),
+            pending_files: Mutex::new(Vec::new()),
+            audio_tx,
+            audio_listeners: AtomicU64::new(0),
             next_client_id: AtomicU64::new(1),
             serving_port: AtomicU64::new(ndsp_protocol::DEFAULT_PORT as u64),
             shutdown: AtomicBool::new(false),
@@ -206,6 +252,67 @@ impl AppState {
             }
         }
         Ok(found)
+    }
+
+    /// Same as [`Self::set_input_grant`] for the clipboard grant.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Publish a clipboard item to all sessions (grant checked per session).
+    pub fn publish_clipboard(&self, item: crate::clipboard::ClipboardItem) {
+        let _ = self.clipboard_tx.send(Some(Arc::new(item)));
+    }
+
+    /// Record a pending file-drop offer for the panel.
+    pub fn add_pending_file(&self, offer: PendingFileOffer) {
+        let mut pending = self.pending_files.lock().unwrap();
+        // A session re-offering the same id replaces the stale entry.
+        pending.retain(|p| !(p.client_id == offer.client_id && p.transfer_id == offer.transfer_id));
+        pending.push(offer);
+    }
+
+    pub fn remove_pending_file(&self, client_id: u64, transfer_id: u32) {
+        self.pending_files
+            .lock()
+            .unwrap()
+            .retain(|p| !(p.client_id == client_id && p.transfer_id == transfer_id));
+    }
+
+    /// Panel decision on a pending file offer → forward to the session.
+    pub fn decide_file(&self, client_id: u64, transfer_id: u32, accept: bool) -> bool {
+        let exists = self
+            .pending_files
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.client_id == client_id && p.transfer_id == transfer_id);
+        if !exists {
+            return false;
+        }
+        self.remove_pending_file(client_id, transfer_id);
+        if let Some(client) = self.clients.lock().unwrap().get(&client_id) {
+            let _ = client.commands.try_send(SessionCommand::FileDecision {
+                transfer_id,
+                accept,
+            });
+            true
+        } else {
+            false
+        }
     }
 
     /// Revoke trust and kick any live session for that device.

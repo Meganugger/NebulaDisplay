@@ -101,6 +101,12 @@ code, .mono { font-family: var(--mono); }
   box-shadow: 0 6px 24px rgba(0,0,0,0.4); font-size: 0.88rem;
   display: none;
 }
+#drop-hint {
+  position: absolute; inset: 1rem; display: none; place-items: center;
+  text-align: center; font-size: 1.1rem; border: 2px dashed var(--accent, #7c5cff);
+  border-radius: 14px; background: rgba(16, 20, 24, 0.82); pointer-events: none;
+}
+#drop-hint.visible { display: grid; }
 
 /* ---- panel ---- */
 .panel-wrap { max-width: 64rem; margin: 0 auto; padding: 2rem 1.2rem 4rem; }

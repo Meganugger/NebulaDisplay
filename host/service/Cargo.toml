@@ -7,10 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["h264"]
+default = ["h264", "audio"]
 # OpenH264 software encoder (built from source; BSD-2-Clause). Disable to fall
 # back to JPEG-only streaming: `cargo build --no-default-features`.
 h264 = ["dep:openh264", "dep:openh264-sys2"]
+# Opus audio streaming (libopus built from source). Disable for a lean,
+# pure-Rust build: `cargo build --no-default-features --features h264`.
+audio = ["dep:opus"]
 
 [dependencies]
 ndsp-protocol = { workspace = true }
@@ -34,6 +37,7 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+opus = { version = "0.3", optional = true }
 openh264 = { version = "0.9", optional = true }
 # Raw bindings for runtime SetOption (bitrate/fps without encoder re-init).
 openh264-sys2 = { version = "0.9", optional = true }
@@ -62,6 +66,9 @@ windows = { version = "0.62", features = [
     "UI_Input_Preview_Injection",
     "Gaming_Input",
     "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com_StructuredStorage",
 ] }
 
 [dev-dependencies]

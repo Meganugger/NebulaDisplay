@@ -61,6 +61,9 @@ pub struct Session {
     pub codec: Codec,
     pub mode: DisplayMode,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
+    /// Host has audio streaming enabled (opt in with `SetAudio`).
+    pub audio_available: bool,
     /// Set when this connection performed a fresh pairing.
     pub new_credentials: Option<Credentials>,
     pub server_fingerprint: String,
@@ -246,15 +249,24 @@ pub async fn connect_opts(
         }
     }
 
-    let (codec, mode, input_allowed) = match recv_json(&mut ws).await? {
-        ControlMsg::AuthOk {
-            codec,
-            mode,
-            input_allowed,
-        } => (codec, mode, input_allowed),
-        ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
-        other => bail!("expected auth_ok, got {other:?}"),
-    };
+    let (codec, mode, input_allowed, clipboard_allowed, audio_available) =
+        match recv_json(&mut ws).await? {
+            ControlMsg::AuthOk {
+                codec,
+                mode,
+                input_allowed,
+                clipboard_allowed,
+                audio_available,
+            } => (
+                codec,
+                mode,
+                input_allowed,
+                clipboard_allowed,
+                audio_available,
+            ),
+            ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
+            other => bail!("expected auth_ok, got {other:?}"),
+        };
 
     Ok(Session {
         ws,
@@ -263,6 +275,8 @@ pub async fn connect_opts(
         codec,
         mode,
         input_allowed,
+        clipboard_allowed,
+        audio_available,
         new_credentials,
         server_fingerprint,
     })

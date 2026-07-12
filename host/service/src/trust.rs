@@ -23,6 +23,10 @@ pub struct TrustedDevice {
     pub last_seen_unix: u64,
     /// Whether this device may inject input. **Deny by default.**
     pub input_allowed: bool,
+    /// Whether this device may read/write the host clipboard. **Deny by
+    /// default.** (`serde(default)` keeps pre-clipboard stores loading.)
+    #[serde(default)]
+    pub clipboard_allowed: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -92,6 +96,7 @@ impl TrustStore {
             created_unix: now_unix(),
             last_seen_unix: now_unix(),
             input_allowed: false, // never grant input implicitly
+            clipboard_allowed: false,
         });
         self.save()?;
         info!(device_id, name, "device enrolled (input DENIED by default)");
@@ -142,6 +147,20 @@ impl TrustStore {
         dev.input_allowed = allowed;
         self.save()?;
         info!(device_id, allowed, "input grant updated");
+        Ok(true)
+    }
+
+    pub fn set_clipboard_allowed(
+        &mut self,
+        device_id: &str,
+        allowed: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.clipboard_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "clipboard grant updated");
         Ok(true)
     }
 

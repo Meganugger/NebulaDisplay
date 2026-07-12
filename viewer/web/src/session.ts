@@ -21,24 +21,30 @@ import {
 } from "./crypto";
 import { pakeStart } from "./pake";
 import {
+  AudioFrameMsg,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
+  CHANNEL_FILE,
   CHANNEL_VIDEO,
   ControlMsg,
   DIR_CLIENT_TO_SERVER,
   DIR_SERVER_TO_CLIENT,
   DisplayMode,
+  encodeFileChunkHeader,
   Opener,
+  parseAudioFrame,
+  parseVideoFrame,
   PROTOCOL_VERSION,
   Sealer,
-  VideoFrame,
-  WS_PATH,
-  parseVideoFrame,
   td,
   te,
+  VideoFrame,
+  WS_PATH,
 } from "./protocol";
 
 export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
+  onAudio(frame: AudioFrameMsg): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
 }
@@ -47,6 +53,8 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
+  audioAvailable: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
@@ -95,9 +103,11 @@ export class Session {
         name: clientName,
         platform: "web",
         app_version: "0.2.0",
-        // This viewer renders the host cursor from the dedicated cursor
+        // "cursor": renders the host cursor from the dedicated cursor
         // channel (CursorShape/CursorPos) — never baked into video frames.
-        features: ["cursor"],
+        // "clipboard"/"file_drop"/"audio": this build understands those
+        // messages/channels; actual use is still permission-gated host-side.
+        features: viewerFeatures(),
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
       codecs: await supportedCodecs(),
@@ -194,6 +204,8 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
+      audioAvailable: Boolean(authOk.audio_available),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,
@@ -212,6 +224,8 @@ export class Session {
             events.onVideo(parseVideoFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio(parseAudioFrame(plaintext));
           }
         } catch (e) {
           console.error("envelope error", e);
@@ -240,6 +254,23 @@ export class Session {
     return this.sendChain;
   }
 
+  /**
+   * Stream one file-drop chunk on channel 4 (only after the host accepted
+   * the offer). Shares the send chain so envelope counters stay ordered.
+   */
+  sendFileChunk(transferId: number, offset: number, data: Uint8Array): Promise<void> {
+    this.sendChain = this.sendChain.then(async () => {
+      if (this.ws.readyState !== WebSocket.OPEN) return;
+      const header = encodeFileChunkHeader(transferId, offset);
+      const plaintext = new Uint8Array(header.length + data.length);
+      plaintext.set(header, 0);
+      plaintext.set(data, header.length);
+      const env = await this.sealer.seal(CHANNEL_FILE, plaintext);
+      this.ws.send(env);
+    });
+    return this.sendChain;
+  }
+
   /** Bytes currently queued on the socket (backpressure indicator). */
   get buffered(): number {
     return this.ws.bufferedAmount;
@@ -259,6 +290,13 @@ async function supportedCodecs(): Promise<string[]> {
   const codecs = ["jpeg"];
   if ((await probeH264Decode()) || caps.mseH264) codecs.unshift("h264");
   return codecs;
+}
+
+function viewerFeatures(): string[] {
+  const features = ["cursor", "file_drop"];
+  if (typeof navigator !== "undefined" && navigator.clipboard) features.push("clipboard");
+  if (typeof AudioDecoder === "function") features.push("audio");
+  return features;
 }
 
 function protoErr(expected: string, got: ControlMsg): Error {
