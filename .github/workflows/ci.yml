@@ -30,6 +30,11 @@ jobs:
   rust-windows:
     name: Rust (Windows) — cfg(windows) paths compile + tests
     runs-on: windows-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -73,6 +78,13 @@ jobs:
           } > diag.txt || true
           printf 'Windows CI diagnosis (%s):\n```\n%s\n```\n' "${GITHUB_SHA::8}" "$(tail -c 60000 diag.txt)" > body.md
           gh api "repos/${GITHUB_REPOSITORY}/issues/12/comments" -F body=@body.md || true
+          # Fallback channel: commit statuses (visible via the PR status API)
+          # carrying the first error lines, 130 chars per status.
+          grep -E "^(error|warning: unused|.*error\[)" diag.txt | head -8 | nl -ba | while read -r n line; do
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              -f state=failure -f context="diag-$n" \
+              -f description="$(echo "$line" | cut -c1-130)" || true
+          done
 
   driver-syntax:
     name: IddCx driver — syntax/type check (both header models)
