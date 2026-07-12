@@ -336,6 +336,153 @@ async fn token_reconnect_and_input_grant_flow() {
     host.shutdown().await;
 }
 
+/// Clipboard sync: denied by default in both directions, live-granted via
+/// the panel path, size-capped, and revocable.
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_is_permission_gated_and_size_capped() {
+    use ndsp_protocol::messages::MAX_CLIPBOARD_BYTES;
+    let host = start_host("clipboard").await;
+    let pin = host.state.pins.current_pin();
+    let info = client_info("Clip tablet");
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+
+    // The session announces the (denied) clipboard grant up front.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("initial clipboard grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed }) => {
+                assert!(!allowed, "clipboard must be denied by default");
+                break;
+            }
+            Incoming::Closed => panic!("closed early"),
+            _ => {}
+        }
+    }
+
+    // Viewer → host while denied: dropped, host clipboard untouched.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "stolen?".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(host.state.clipboard.last_applied(), None);
+
+    // Host → viewer while denied: nothing arrives.
+    host.state.clipboard.publish_from_host("host secret".into());
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::Clipboard { .. }))) => {
+                panic!("clipboard leaked without grant")
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // Grant clipboard (panel action) → client is notified live.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed: true }) => break,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    // Viewer → host now lands.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "from viewer ✓".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while host.state.clipboard.last_applied().as_deref() != Some("from viewer ✓") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "clipboard never applied on host"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Host → viewer flows too.
+    host.state.clipboard.publish_from_host("from host ✓".into());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("host clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { mime, data }) => {
+                assert_eq!(mime, "text/plain");
+                assert_eq!(data, "from host ✓");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    // Oversize events are refused with a structured error, not applied.
+    session
+        .send(&ControlMsg::Clipboard {
+            mime: "text/plain".into(),
+            data: "x".repeat(MAX_CLIPBOARD_BYTES + 1),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("size-cap error timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Error { code, .. }) => {
+                assert_eq!(code, "clipboard_too_large");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        host.state.clipboard.last_applied().as_deref(),
+        Some("from viewer ✓"),
+        "oversize clipboard must not be applied"
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fingerprint_mismatch_blocks_token_send() {
     let host = start_host("fp").await;

@@ -286,7 +286,10 @@ export class InputCapture {
     // Keep browser shortcuts like F11/F12 & Escape local.
     if (["F11", "F12", "Escape"].includes(ev.code)) return;
     ev.preventDefault();
-    this.push({ kind: "key", code: ev.code, pressed }, true);
+    // Send the layout-aware character alongside the physical code so the
+    // host can inject the exact glyph when its layout differs (P2.13).
+    const key = ev.key.length === 1 ? ev.key : undefined;
+    this.push(key ? { kind: "key", code: ev.code, key, pressed } : { kind: "key", code: ev.code, pressed }, true);
   }
 
   /**

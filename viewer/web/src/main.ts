@@ -29,6 +29,7 @@ const statsOverlay = $("stats-overlay");
 const inputDenied = $("input-denied");
 const toast = $("toast");
 const remoteCursor = $<HTMLImageElement>("remote-cursor");
+const clipboardBtn = $<HTMLButtonElement>("clipboard-btn");
 
 let session: Session | null = null;
 let renderer: Renderer | null = null;
@@ -38,6 +39,11 @@ let pingTimer: number | undefined;
 const clock = new ClockSync();
 let hostStats: HostStats | null = null;
 let inputAllowed = false;
+let clipboardAllowed = false;
+let clipboardKnown = false; // first grant notice is state, not a change
+/** Host clipboard text we couldn't write automatically (needs a gesture). */
+let pendingRemoteClipboard: string | null = null;
+const MAX_CLIPBOARD_BYTES = 256 * 1024;
 /** EMA of capture→arrival (host pipeline + network) per video envelope, ms. */
 let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
@@ -194,6 +200,34 @@ function onControl(msg: ControlMsg): void {
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
       break;
     }
+    case "clipboard_grant": {
+      const was = clipboardAllowed;
+      clipboardAllowed = Boolean(msg.allowed);
+      refreshClipboardBtn();
+      if (clipboardKnown && was !== clipboardAllowed) {
+        showToast(
+          clipboardAllowed ? "Host granted clipboard sync" : "Host revoked clipboard sync",
+        );
+      }
+      clipboardKnown = true;
+      break;
+    }
+    case "clipboard": {
+      const text = String(msg.data ?? "");
+      void (async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          showToast("📋 Host clipboard synced");
+        } catch {
+          // No async clipboard write here (insecure context / no permission):
+          // stash it and let the button's user gesture copy it.
+          pendingRemoteClipboard = text;
+          refreshClipboardBtn();
+          showToast("📋 Host clipboard received — press the clipboard button to copy", 6000);
+        }
+      })();
+      break;
+    }
     case "cursor_shape": {
       // RGBA8 → canvas → data URL for the overlay <img>.
       const w = Number(msg.width);
@@ -223,9 +257,13 @@ function onControl(msg: ControlMsg): void {
     case "bye":
       endSession(`Host ended the session: ${String(msg.reason)}`);
       break;
-    case "error":
+    case "error": {
       console.warn("host error", msg);
+      const code = String(msg.code ?? "");
+      if (code === "clipboard_too_large") showToast("Clipboard too large to sync (256 KiB cap)");
+      if (code === "clipboard_denied") showToast("Host has not granted clipboard access");
       break;
+    }
   }
 }
 
@@ -252,6 +290,73 @@ function placeRemoteCursor(): void {
   remoteCursor.style.transform = `translate(${x}px, ${y}px) scale(${box.scale})`;
 }
 
+function refreshClipboardBtn(): void {
+  clipboardBtn.disabled = !clipboardAllowed;
+  clipboardBtn.title = clipboardAllowed
+    ? pendingRemoteClipboard !== null
+      ? "Copy the received host clipboard"
+      : "Send this device's clipboard to the host"
+    : "Clipboard sync not granted by host (enable it in the host panel)";
+  clipboardBtn.textContent = pendingRemoteClipboard !== null ? "📋 Copy" : "📋 Send";
+}
+
+/** Copy text using the legacy execCommand path (works in insecure contexts
+ *  as long as it runs inside a user gesture). */
+function copyViaTextarea(text: string): boolean {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+async function onClipboardClick(): Promise<void> {
+  if (!session) return;
+  // A received host clipboard is waiting for this gesture.
+  if (pendingRemoteClipboard !== null) {
+    const text = pendingRemoteClipboard;
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      ok = copyViaTextarea(text);
+    }
+    if (ok) {
+      pendingRemoteClipboard = null;
+      showToast("📋 Copied host clipboard");
+    } else {
+      showToast("Could not access the local clipboard");
+    }
+    refreshClipboardBtn();
+    return;
+  }
+  // Send this device's clipboard to the host.
+  let text: string | null = null;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    // Insecure context or permission denied — fall back to an explicit paste.
+    text = prompt("Paste the text to send to the host clipboard:");
+  }
+  if (!text) return;
+  if (new TextEncoder().encode(text).length > MAX_CLIPBOARD_BYTES) {
+    showToast("Clipboard too large to sync (256 KiB cap)");
+    return;
+  }
+  void session.send({ type: "clipboard", mime: "text/plain", data: text });
+  showToast("📋 Sent to host clipboard");
+}
+
 function refreshInputBadge(): void {
   const wantsInput = (input?.mode ?? "view_only") !== "view_only";
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
@@ -262,6 +367,11 @@ function enterViewer(s: Session): void {
   viewerScreen.classList.add("active");
   $("server-name").textContent = `${s.info.serverName} · ${s.info.codec.toUpperCase()}`;
   if (s.info.newlyPaired) showToast("Paired ✓ — this device is now trusted by the host");
+
+  clipboardAllowed = false;
+  clipboardKnown = false;
+  pendingRemoteClipboard = null;
+  refreshClipboardBtn();
 
   input = new InputCapture(
     canvas,
@@ -353,6 +463,7 @@ if (fullscreen.supported) {
   // iPhone Safari has no element fullscreen at all — hide the control.
   $("fullscreen-btn").style.display = "none";
 }
+clipboardBtn.onclick = () => void onClipboardClick();
 $("disconnect-btn").onclick = () => {
   userDisconnected = true;
   session?.close();

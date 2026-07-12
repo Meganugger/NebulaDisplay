@@ -30,6 +30,7 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     pub newly_paired: bool,
 }
 
@@ -323,6 +324,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -385,6 +387,7 @@ impl ServerHandshake {
                         let client = self.client.clone().expect("hello precedes proof");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let input_allowed = dev.input_allowed;
+                        let clipboard_allowed = dev.clipboard_allowed;
                         let auth_ok = self.auth_ok(input_allowed);
                         let codec = self.select_codec();
                         info!(device = %device_id, "token reconnect ok");
@@ -396,6 +399,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,

@@ -3,6 +3,7 @@
 
 pub mod adapt;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;

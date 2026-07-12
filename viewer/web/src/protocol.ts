@@ -51,7 +51,7 @@ export type InputEvent =
   | { kind: "mouse_move"; x: number; y: number }
   | { kind: "mouse_button"; button: number; pressed: boolean }
   | { kind: "wheel"; dx: number; dy: number }
-  | { kind: "key"; code: string; pressed: boolean }
+  | { kind: "key"; code: string; key?: string; pressed: boolean }
   | { kind: "touch"; id: number; phase: TouchPhase; x: number; y: number; pressure: number }
   | { kind: "pen"; phase: TouchPhase; x: number; y: number; pressure: number; tilt_x: number; tilt_y: number }
   | { kind: "text"; text: string };

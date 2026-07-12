@@ -82,6 +82,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
 
+    // Host clipboard watcher (Windows) — publishes host copies to granted
+    // viewers. Grant checks happen per session; nothing leaves the machine
+    // for devices without the clipboard permission.
+    nebulad::clipboard::spawn_watcher(state.clone());
+
     // UDP discovery responder.
     if args.discovery_port != 0 {
         tokio::spawn(discovery::run(state.clone(), args.discovery_port));

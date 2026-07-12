@@ -50,6 +50,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,6 +63,9 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    /// Audio is currently streaming to this viewer (visible indicator).
+    audio_active: bool,
     stats: ndsp_protocol::messages::ViewerStats,
 }
 
@@ -94,6 +98,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            audio_active: c.audio_active.load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,6 +121,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
@@ -142,10 +151,24 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// "input" (default, backward compatible) or "clipboard".
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.kind.as_deref() {
+        None | Some("input") => state.set_input_grant(&req.device_id, req.allowed),
+        Some("clipboard") => state.set_clipboard_grant(&req.device_id, req.allowed),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown grant kind {other:?}"),
+            )
+                .into_response()
+        }
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
