@@ -9,12 +9,12 @@
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC,
+    MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY, VK_LSHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -28,13 +28,32 @@ pub struct WindowsInputSink {
     state: Arc<AppState>,
     /// Touch state so single-finger touch maps to press-drag-release.
     touch_down: Mutex<bool>,
+    /// Viewer shift state (tracked from ShiftLeft/ShiftRight key events) —
+    /// needed to compensate shift when translating layout-mismatched keys.
+    shift_down: Mutex<bool>,
+    /// Windows Ink pen injection (pressure/tilt) when the platform supports
+    /// `InjectSyntheticPointerInput`; `None` → pen falls back to mouse.
+    pen: Option<Mutex<super::windows_pen::PenInjector>>,
+    /// Gamepad injection via `Windows.UI.Input.Preview.Injection`; lazily
+    /// initialized on the first gamepad event, `None` after a failed init.
+    gamepad: Mutex<Option<Option<super::windows_gamepad::GamepadInjector>>>,
 }
 
 impl WindowsInputSink {
     pub fn new(state: Arc<AppState>) -> Self {
+        let pen = super::windows_pen::PenInjector::new()
+            .map(Mutex::new)
+            .map_err(|e| {
+                tracing::info!("pen injection unavailable ({e:#}); pen maps to mouse");
+                e
+            })
+            .ok();
         Self {
             state,
             touch_down: Mutex::new(false),
+            shift_down: Mutex::new(false),
+            pen,
+            gamepad: Mutex::new(None),
         }
     }
 
@@ -82,6 +101,79 @@ impl WindowsInputSink {
             (y * 65535.0).round() as i32,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
         )
+    }
+
+    /// Layout-aware key dispatch (roadmap "send both `code` and `key`; host
+    /// picks"). Policy, in order:
+    ///
+    /// 1. Named / non-printable keys (Enter, arrows, modifiers, F-keys, and
+    ///    anything without a `key` char) → **scancode** injection: exact
+    ///    physical semantics, works for shortcuts and games.
+    /// 2. Printable keys whose scancode already produces the same base
+    ///    character on the host layout → scancode injection (fast path when
+    ///    the layouts agree).
+    /// 3. Layout mismatch (AZERTY/Dvorak/…): translate the character through
+    ///    `VkKeyScanW` on the *host* layout and inject that VK, temporarily
+    ///    compensating Shift when the two layouts disagree about needing it.
+    ///    AltGr-reachable characters skip to (4) — synthesizing Ctrl+Alt is
+    ///    more likely to trigger app shortcuts than to help.
+    /// 4. Characters not on the host layout at all → `KEYEVENTF_UNICODE`
+    ///    text injection on key-down (no release event exists for unicode
+    ///    injection pairs; auto-repeat is handled viewer-side).
+    fn push_key(&self, batch: &mut Vec<INPUT>, code: &str, key: Option<&str>, pressed: bool) {
+        let printable = printable_char(key);
+        if let Some(sc) = code_to_scancode(code) {
+            let Some(ch) = printable else {
+                batch.push(scancode_input(sc, pressed));
+                return;
+            };
+            let vk_from_sc = unsafe { MapVirtualKeyW((sc & 0xFF) as u32, MAPVK_VSC_TO_VK) } as u16;
+            if host_base_char(vk_from_sc) == Some(ch.to_ascii_uppercase()) {
+                batch.push(scancode_input(sc, pressed));
+                return;
+            }
+            // Layout mismatch — translate through the host layout.
+            let scan = unsafe { VkKeyScanW(ch as u16) };
+            if scan != -1 {
+                let vk = (scan & 0xFF) as u16;
+                let shift_state = ((scan >> 8) & 0xFF) as u8;
+                if shift_state & 0b110 == 0 {
+                    let needs_shift = shift_state & 1 != 0;
+                    let shift_held = *self.shift_down.lock().unwrap();
+                    if pressed && needs_shift != shift_held {
+                        // Compensate: flip shift around the translated key.
+                        batch.push(vk_key_input(VK_LSHIFT.0, needs_shift));
+                        batch.push(vk_key_input(vk, true));
+                        batch.push(vk_key_input(vk, false));
+                        batch.push(vk_key_input(VK_LSHIFT.0, !needs_shift));
+                        return; // release already synthesized
+                    }
+                    batch.push(vk_key_input(vk, pressed));
+                    return;
+                }
+                // AltGr combination → fall through to unicode.
+            }
+            if pressed {
+                let mut buf = [0u16; 2];
+                for &unit in ch.encode_utf16(&mut buf).iter() {
+                    batch.push(unicode_input(unit, true));
+                    batch.push(unicode_input(unit, false));
+                }
+            }
+            return;
+        }
+        // Unknown physical code — inject the character if we have one.
+        if let Some(ch) = printable {
+            if pressed {
+                let mut buf = [0u16; 2];
+                for &unit in ch.encode_utf16(&mut buf).iter() {
+                    batch.push(unicode_input(unit, true));
+                    batch.push(unicode_input(unit, false));
+                }
+            }
+        } else {
+            tracing::debug!(code, "unmapped key code ignored");
+        }
     }
 
     fn send(&self, inputs: &[INPUT]) {
@@ -229,8 +321,7 @@ fn code_to_scancode(code: &str) -> Option<u16> {
     Some(sc)
 }
 
-fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
-    let sc = code_to_scancode(code)?;
+fn scancode_input(sc: u16, pressed: bool) -> INPUT {
     let extended = sc & 0xE000 == 0xE000;
     let scan = sc & 0xFF;
     let mut flags = KEYEVENTF_SCANCODE;
@@ -242,7 +333,7 @@ fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
     }
     // Also resolve the VK for apps that ignore scancodes.
     let vk = unsafe { MapVirtualKeyW(scan as u32, MAPVK_VSC_TO_VK) } as u16;
-    Some(INPUT {
+    INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
@@ -253,7 +344,73 @@ fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
                 dwExtraInfo: 0,
             },
         },
-    })
+    }
+}
+
+/// VK-based injection (no `KEYEVENTF_SCANCODE`) — the system resolves it
+/// through the *host's* active layout, which is exactly what a translated
+/// key needs.
+fn vk_key_input(vk: u16, pressed: bool) -> INPUT {
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+    let flags = if pressed {
+        Default::default()
+    } else {
+        KEYEVENTF_KEYUP
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn unicode_input(unit: u16, pressed: bool) -> INPUT {
+    let mut flags = KEYEVENTF_UNICODE;
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// The layout-resolved `KeyboardEvent.key` as a single printable character.
+/// Named keys ("Enter", "Shift", "ArrowLeft", …) are multi-char and return
+/// `None`, as do control characters.
+fn printable_char(key: Option<&str>) -> Option<char> {
+    let k = key?;
+    let mut chars = k.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() || c.is_control() {
+        return None;
+    }
+    Some(c)
+}
+
+/// Base (unshifted) character the host layout produces for a VK, uppercased
+/// for caseless comparison. `None` for dead keys and non-character VKs.
+fn host_base_char(vk: u16) -> Option<char> {
+    let r = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_CHAR) };
+    if r == 0 || r & 0x8000_0000 != 0 {
+        return None; // no char / dead key
+    }
+    char::from_u32(r & 0xFFFF).map(|c| c.to_ascii_uppercase())
 }
 
 impl InputSink for WindowsInputSink {
@@ -292,38 +449,57 @@ impl InputSink for WindowsInputSink {
                         batch.push(mouse_input(0, 0, (dx * 120.0) as i32, MOUSEEVENTF_HWHEEL));
                     }
                 }
-                InputEvent::Key { code, pressed } => {
-                    if let Some(i) = key_input(code, *pressed) {
-                        batch.push(i);
-                    } else {
-                        tracing::debug!(code, "unmapped key code ignored");
+                InputEvent::Key { code, pressed, key } => {
+                    if code == "ShiftLeft" || code == "ShiftRight" {
+                        *self.shift_down.lock().unwrap() = *pressed;
                     }
+                    self.push_key(&mut batch, code, key.as_deref(), *pressed);
                 }
                 InputEvent::Text { text } => {
                     for u in text.encode_utf16() {
-                        for &up in &[false, true] {
-                            let mut flags = KEYEVENTF_UNICODE;
-                            if up {
-                                flags |= KEYEVENTF_KEYUP;
+                        batch.push(unicode_input(u, true));
+                        batch.push(unicode_input(u, false));
+                    }
+                }
+                InputEvent::Pen {
+                    phase,
+                    x,
+                    y,
+                    pressure,
+                    tilt_x,
+                    tilt_y,
+                } if self.pen.is_some() => {
+                    // Real Windows Ink injection with pressure/tilt. Flush
+                    // any queued SendInput events first so ordering between
+                    // the two APIs is preserved.
+                    self.send(&batch);
+                    batch.clear();
+                    let rect = *self.state.capture_rect.lock().unwrap();
+                    if let Some(pen) = &self.pen {
+                        pen.lock()
+                            .unwrap()
+                            .inject(*phase, *x, *y, *pressure, *tilt_x, *tilt_y, rect);
+                    }
+                }
+                InputEvent::Gamepad { .. } => {
+                    // Lazy init: most sessions never send gamepad events.
+                    let mut slot = self.gamepad.lock().unwrap();
+                    let injector = slot.get_or_insert_with(|| {
+                        match super::windows_gamepad::GamepadInjector::new() {
+                            Ok(g) => Some(g),
+                            Err(e) => {
+                                tracing::info!("gamepad injection unavailable: {e:#}");
+                                None
                             }
-                            batch.push(INPUT {
-                                r#type: INPUT_KEYBOARD,
-                                Anonymous: INPUT_0 {
-                                    ki: KEYBDINPUT {
-                                        wVk: VIRTUAL_KEY(0),
-                                        wScan: u,
-                                        dwFlags: flags,
-                                        time: 0,
-                                        dwExtraInfo: 0,
-                                    },
-                                },
-                            });
                         }
+                    });
+                    if let Some(g) = injector {
+                        g.inject(e);
                     }
                 }
                 InputEvent::Touch { phase, x, y, .. } | InputEvent::Pen { phase, x, y, .. } => {
-                    // Single-pointer mapping to mouse until InjectTouchInput
-                    // integration (see docs/ROADMAP.md).
+                    // Single-pointer mapping to mouse (pen lands here only
+                    // when synthetic pointer devices are unavailable).
                     let (ax, ay, flags) = self.map_coords(*x, *y);
                     batch.push(mouse_input(ax, ay, 0, flags));
                     let mut down = self.touch_down.lock().unwrap();

@@ -85,6 +85,9 @@ export class InputCapture {
   private flushTimer: number | undefined;
   private lastFlushAt = 0;
   private disposers: (() => void)[] = [];
+  private gamepadTimer: number | undefined;
+  private lastPadSig = "";
+  private padActive = false;
 
   constructor(
     private surface: HTMLElement,
@@ -128,6 +131,47 @@ export class InputCapture {
     });
     on(window, "keydown", (ev: KeyboardEvent) => this.key(ev, true));
     on(window, "keyup", (ev: KeyboardEvent) => this.key(ev, false));
+
+    // Gamepad forwarding: poll at ~60 Hz (the Gamepad API is poll-only) and
+    // send snapshots only when the state actually changes.
+    if (typeof navigator !== "undefined" && typeof navigator.getGamepads === "function") {
+      this.gamepadTimer = window.setInterval(() => this.pollGamepad(), 16);
+    }
+  }
+
+  private pollGamepad(): void {
+    if (this.mode === "view_only") return;
+    const pads = navigator.getGamepads();
+    const pad = pads.find((p) => p && p.mapping === "standard") ?? pads.find((p) => p) ?? null;
+    if (!pad) {
+      if (this.padActive) {
+        this.padActive = false;
+        // Neutral snapshot so the host releases everything on disconnect.
+        this.push(neutralGamepad(), true);
+      }
+      return;
+    }
+    let buttons = 0;
+    for (let i = 0; i < Math.min(pad.buttons.length, 17); i++) {
+      if (i === 6 || i === 7) continue; // triggers travel as analog values
+      if (pad.buttons[i]?.pressed) buttons |= 1 << i;
+    }
+    const r = (v: number | undefined) => Math.round(((v ?? 0) + Number.EPSILON) * 100) / 100;
+    const ev: NdspInput = {
+      kind: "gamepad",
+      buttons,
+      left_x: r(pad.axes[0]),
+      left_y: r(pad.axes[1]),
+      right_x: r(pad.axes[2]),
+      right_y: r(pad.axes[3]),
+      left_trigger: r(pad.buttons[6]?.value),
+      right_trigger: r(pad.buttons[7]?.value),
+    };
+    const sig = JSON.stringify(ev);
+    if (sig === this.lastPadSig) return;
+    this.lastPadSig = sig;
+    this.padActive = true;
+    this.push(ev, true);
   }
 
   private attachPointer(
@@ -186,6 +230,10 @@ export class InputCapture {
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
+    }
+    if (this.gamepadTimer !== undefined) {
+      clearInterval(this.gamepadTimer);
+      this.gamepadTimer = undefined;
     }
     this.batch = [];
   }
@@ -286,7 +334,10 @@ export class InputCapture {
     // Keep browser shortcuts like F11/F12 & Escape local.
     if (["F11", "F12", "Escape"].includes(ev.code)) return;
     ev.preventDefault();
-    this.push({ kind: "key", code: ev.code, pressed }, true);
+    // Send the layout-resolved character too (single-char `key` values):
+    // the host injects it when its layout maps the scancode differently.
+    const key = ev.key.length === 1 ? ev.key : undefined;
+    this.push({ kind: "key", code: ev.code, pressed, ...(key ? { key } : {}) }, true);
   }
 
   /**
@@ -328,4 +379,17 @@ export class InputCapture {
 function mapButton(domButton: number): number {
   // DOM: 0=left 1=middle 2=right 3=back 4=forward → NDSP uses the same order.
   return domButton;
+}
+
+function neutralGamepad(): NdspInput {
+  return {
+    kind: "gamepad",
+    buttons: 0,
+    left_x: 0,
+    left_y: 0,
+    right_x: 0,
+    right_y: 0,
+    left_trigger: 0,
+    right_trigger: 0,
+  };
 }
