@@ -90,6 +90,26 @@ impl ActiveTransfer {
     }
 }
 
+/// One in-flight host→viewer file send (panel initiated, ROADMAP P2.15).
+struct OutboundTransfer {
+    id: String,
+    /// Spooled copy in the outbox — deleted when the transfer ends.
+    path: PathBuf,
+    name: String,
+    /// Chunk-sender task, present once the viewer accepted.
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OutboundTransfer {
+    /// Stop sending (if started) and delete the spooled file.
+    fn discard(self) {
+        if let Some(task) = self.task {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 struct Shared {
     input_allowed: Arc<AtomicBool>,
     clipboard_allowed: Arc<AtomicBool>,
@@ -98,6 +118,10 @@ struct Shared {
     audio: Mutex<AudioCtl>,
     /// The panel-accepted transfer currently receiving chunks (max one).
     transfer: Mutex<Option<ActiveTransfer>>,
+    /// The host→viewer send currently in flight (max one).
+    outbound: Mutex<Option<OutboundTransfer>>,
+    /// Mirror of the handle's `sending_file` flag (panel busy indicator).
+    sending_file: Arc<AtomicBool>,
     /// An offer is pending a panel decision (rate-limits offer spam).
     offer_pending: AtomicBool,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
@@ -199,6 +223,7 @@ pub async fn run(
     let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
     let audio_allowed_flag = Arc::new(AtomicBool::new(auth.audio_allowed));
     let audio_active = Arc::new(AtomicBool::new(false));
+    let sending_file = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
         clipboard_allowed: clipboard_allowed.clone(),
@@ -210,6 +235,8 @@ pub async fn run(
             counted: false,
         }),
         transfer: Mutex::new(None),
+        outbound: Mutex::new(None),
+        sending_file: sending_file.clone(),
         offer_pending: AtomicBool::new(false),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
@@ -241,6 +268,7 @@ pub async fn run(
         audio_allowed: audio_allowed_flag.clone(),
         audio_active: audio_active.clone(),
         supports_cursor,
+        sending_file: sending_file.clone(),
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
     });
@@ -344,6 +372,21 @@ pub async fn run(
                     };
                     if ctl_tx.send(msg).await.is_err() { break; }
                 }
+                SessionCommand::SendFile { id, path, name, size_bytes, sha256_hex } => {
+                    {
+                        let mut slot = shared.outbound.lock().unwrap();
+                        if let Some(prev) = slot.take() {
+                            // Panel raced a second send — supersede cleanly.
+                            warn!(id = %prev.id, "replacing in-flight outbound transfer");
+                            prev.discard();
+                        }
+                        *slot = Some(OutboundTransfer { id: id.clone(), path, name: name.clone(), task: None });
+                    }
+                    shared.sending_file.store(true, Ordering::Relaxed);
+                    info!(%id, %name, size_bytes, "offering file to viewer");
+                    let msg = ControlMsg::FileOffer { id, name, size_bytes, sha256: sha256_hex };
+                    if ctl_tx.send(msg).await.is_err() { break; }
+                }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
                     // Give the writer a moment to flush the Bye.
@@ -437,6 +480,10 @@ pub async fn run(
     state.transfers.drop_for_device(&auth.client.device_id);
     if let Some(t) = shared.transfer.lock().unwrap().take() {
         warn!(id = %t.id, "session ended mid-transfer; discarding partial file");
+        t.discard();
+    }
+    if let Some(t) = shared.outbound.lock().unwrap().take() {
+        warn!(id = %t.id, "session ended mid-send; discarding spooled file");
         t.discard();
     }
     {
@@ -872,6 +919,53 @@ async fn incoming_pump(
                                 Err(e) => warn!("clipboard task join error: {e}"),
                             }
                         }
+                        // Viewer's decision on a host→viewer send offer.
+                        ControlMsg::FileAnswer { id, accept, .. } => {
+                            let accepted: Option<(PathBuf, String)> = {
+                                let mut slot = shared.outbound.lock().unwrap();
+                                match slot.as_ref() {
+                                    Some(t) if t.id == id && accept => {
+                                        Some((t.path.clone(), t.id.clone()))
+                                    }
+                                    Some(t) if t.id == id => {
+                                        info!(%id, name = %t.name, "viewer declined file send");
+                                        if let Some(t) = slot.take() {
+                                            t.discard();
+                                        }
+                                        shared.sending_file.store(false, Ordering::Relaxed);
+                                        None
+                                    }
+                                    _ => {
+                                        debug!(%id, "answer for unknown outbound transfer");
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some((path, id)) = accepted {
+                                info!(%id, "viewer accepted file send; streaming");
+                                let task = tokio::spawn(send_file_chunks(
+                                    id,
+                                    path,
+                                    ctl_tx.clone(),
+                                    shared.clone(),
+                                ));
+                                if let Some(t) = shared.outbound.lock().unwrap().as_mut() {
+                                    t.task = Some(task);
+                                }
+                            }
+                        }
+                        // Viewer verified a completed host→viewer send.
+                        ControlMsg::FileDone { id } => {
+                            let mut slot = shared.outbound.lock().unwrap();
+                            if slot.as_ref().is_some_and(|t| t.id == id) {
+                                let t = slot.take().unwrap();
+                                info!(%id, name = %t.name, "file send complete (viewer verified)");
+                                t.discard();
+                                shared.sending_file.store(false, Ordering::Relaxed);
+                            } else {
+                                debug!(%id, "done for unknown outbound transfer");
+                            }
+                        }
                         ControlMsg::FileOffer {
                             id,
                             name,
@@ -984,6 +1078,16 @@ async fn incoming_pump(
                                     t.discard();
                                 }
                             }
+                            drop(guard);
+                            // Or it was our outbound send the viewer aborted.
+                            let mut slot = shared.outbound.lock().unwrap();
+                            if slot.as_ref().is_some_and(|t| t.id == id) {
+                                warn!(%id, %reason, "viewer aborted file send");
+                                if let Some(t) = slot.take() {
+                                    t.discard();
+                                }
+                                shared.sending_file.store(false, Ordering::Relaxed);
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");
@@ -1007,6 +1111,76 @@ async fn incoming_pump(
             _ => {}
         }
     }
+}
+
+/// Stream a spooled host file to the viewer as `FileChunk`s (host→viewer
+/// send, after the viewer accepted the offer). Runs as its own task; a
+/// short inter-chunk gap keeps the control lane from starving video (the
+/// writer gives control messages priority).
+async fn send_file_chunks(
+    id: String,
+    path: PathBuf,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    shared: Arc<Shared>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let fail = |reason: String| {
+        warn!(id = %id, %reason, "file send failed");
+        if let Some(t) = shared.outbound.lock().unwrap().take() {
+            // Note: aborting `t.task` here would abort *this* task; we are
+            // already on the exit path, so just drop the handle.
+            let _ = std::fs::remove_file(&t.path);
+        }
+        shared.sending_file.store(false, Ordering::Relaxed);
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = ctl_tx
+                .send(ControlMsg::FileAbort {
+                    id: id.clone(),
+                    reason: "host storage error".into(),
+                })
+                .await;
+            fail(format!("open failed: {e}"));
+            return;
+        }
+    };
+    let mut seq = 0u32;
+    let mut buf = vec![0u8; FILE_CHUNK_BYTES];
+    loop {
+        let n = match file.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = ctl_tx
+                    .send(ControlMsg::FileAbort {
+                        id: id.clone(),
+                        reason: "host read error".into(),
+                    })
+                    .await;
+                fail(format!("read failed: {e}"));
+                return;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+        let msg = ControlMsg::FileChunk {
+            id: id.clone(),
+            seq,
+            data,
+        };
+        if ctl_tx.send(msg).await.is_err() {
+            return; // session is going away; teardown discards the spool
+        }
+        seq = seq.wrapping_add(1);
+        // Let queued video/cursor messages interleave between chunks.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let _ = ctl_tx.send(ControlMsg::FileEnd { id }).await;
+    // The slot (and spool file) is cleared when the viewer confirms with
+    // FileDone / FileAbort, or at session teardown.
 }
 
 /// Validate + append one chunk to an active transfer. `Err(reason)` aborts.

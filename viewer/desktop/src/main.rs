@@ -10,6 +10,7 @@
 
 mod decode;
 mod net;
+mod receive;
 mod store;
 
 use clap::Parser;
@@ -43,6 +44,10 @@ struct Args {
     /// Quality profile: office | video | drawing | gaming
     #[arg(long, default_value = "office")]
     profile: String,
+    /// Accept files the host sends, saving them into this directory
+    /// (host→viewer file send is declined when unset).
+    #[arg(long)]
+    receive_dir: Option<std::path::PathBuf>,
 }
 
 /// One decoded RGBA frame ready for presentation.
@@ -88,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             host: args.host.clone(),
             pin: args.pin.clone(),
             name: args.name.clone(),
+            receive_dir: args.receive_dir.clone(),
             profile: args.profile.clone(),
         };
         std::thread::spawn(move || net::run(args_net, shared, proxy, input_rx));

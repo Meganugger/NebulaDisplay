@@ -15,6 +15,7 @@ interface ClientView {
   audio_allowed: boolean;
   audio_active: boolean;
   stats: ViewerStats;
+  sending_file: boolean;
 }
 
 interface TrustedView {
@@ -27,6 +28,33 @@ interface TrustedView {
   clipboard_allowed: boolean;
   audio_allowed: boolean;
   online: boolean;
+}
+
+let sendFileBusy = false;
+
+/** Per-client "send file" flow: pick a file, stream it to the host, which
+ *  offers it to the viewer (the viewer must accept before chunks flow). */
+function sendFileTo(deviceId: string, deviceName: string): void {
+  if (sendFileBusy) return;
+  const input = $("send-file-input") as HTMLInputElement;
+  input.value = "";
+  input.onchange = () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    sendFileBusy = true;
+    void (async () => {
+      try {
+        const q = `device_id=${encodeURIComponent(deviceId)}&name=${encodeURIComponent(file.name)}`;
+        await api(`/api/send_file?${q}`, { method: "POST", body: file });
+        alert(`Offered "${file.name}" to ${deviceName} — they must accept it on their side.`);
+      } catch (e) {
+        alert(`Send failed: ${(e as Error).message}`);
+      } finally {
+        sendFileBusy = false;
+      }
+    })();
+  };
+  input.click();
 }
 
 interface PendingTransfer {
@@ -125,9 +153,13 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
         <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td><button data-sendfile="${esc(c.device_id)}" data-name="${esc(c.name)}" ${c.sending_file ? "disabled" : ""}>${c.sending_file ? "sending…" : "Send file"}</button></td>
       </tr>`,
     )
     .join("");
+  ctbody.querySelectorAll<HTMLButtonElement>("button[data-sendfile]").forEach((el) => {
+    el.onclick = () => sendFileTo(el.dataset.sendfile!, el.dataset.name ?? "viewer");
+  });
   $("no-clients").style.display = st.clients.length ? "none" : "";
 
   // Trusted devices.

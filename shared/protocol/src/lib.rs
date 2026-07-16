@@ -22,6 +22,7 @@
 pub mod crypto;
 pub mod discovery;
 pub mod envelope;
+pub mod files;
 pub mod media;
 pub mod messages;
 pub mod spake2;
