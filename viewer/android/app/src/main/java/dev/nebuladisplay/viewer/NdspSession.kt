@@ -1,5 +1,6 @@
-// NDSP session for Android: WebSocket transport (OkHttp), pairing/token auth,
-// encrypted control + video channels. Mirrors shared/client/src/lib.rs.
+// NDSP session for Android: WebSocket transport (OkHttp), SPAKE2 pairing /
+// token auth, encrypted control + video channels. Mirrors
+// shared/client/src/lib.rs.
 package dev.nebuladisplay.viewer
 
 import android.util.Base64
@@ -110,7 +111,7 @@ class NdspSession private constructor(
                 })
                 put("auth", JSONObject().apply {
                     if (creds != null) { put("method", "token"); put("device_id", deviceId) }
-                    else put("method", "pair")
+                    else put("method", "pair_spake2")
                 })
                 put("codecs", JSONArray(listOf("h264", "jpeg")))
             })
@@ -124,30 +125,41 @@ class NdspSession private constructor(
                 throw Exception("Host identity changed since pairing — possible impostor. Re-pair with a PIN after verifying the host.")
             }
 
-            // 2. ephemeral ECDH
-            val hs = NdspCrypto.Handshake()
-            send(JSONObject().put("type", "pair_start").put("client_pubkey", b64(hs.publicRaw)))
-            val challenge = recv()
-            require(challenge.getString("type") == "pair_challenge") { "expected pair_challenge" }
-            val serverPub = unb64(challenge.getString("server_pubkey"))
-            val salt = unb64(challenge.getString("salt"))
-            val shared = hs.agree(serverPub)
-            val sessionKey = NdspCrypto.sessionKey(shared, salt, nonce)
-
-            // 3. prove PIN or token
+            // 2 + 3. authenticate: SPAKE2 pairing (first contact) or
+            // ECDH-bound token proof (returning device).
             var newToken: ByteArray? = null
+            val sessionKey: ByteArray
             if (creds != null) {
+                // Ephemeral ECDH; the token proof is bound to its transcript.
+                val hs = NdspCrypto.Handshake()
+                send(JSONObject().put("type", "pair_start").put("client_pubkey", b64(hs.publicRaw)))
+                val challenge = recv()
+                require(challenge.getString("type") == "pair_challenge") { "expected pair_challenge" }
+                val serverPub = unb64(challenge.getString("server_pubkey"))
+                val salt = unb64(challenge.getString("salt"))
+                val shared = hs.agree(serverPub)
+                sessionKey = NdspCrypto.sessionKey(shared, salt, nonce)
                 val proof = NdspCrypto.tokenProof(creds.token, nonce, hs.publicRaw, serverPub)
                 send(JSONObject().put("type", "token_proof").put("proof", b64(proof)))
             } else {
-                val pairKey = NdspCrypto.pairingKey(shared, salt, pin!!, nonce)
-                val confirm = NdspCrypto.CONFIRM_CONTEXT.toByteArray() + nonce
-                send(JSONObject().put("type", "pair_confirm")
-                    .put("sealed", b64(NdspCrypto.seal(pairKey, confirm, ByteArray(0)))))
+                // SPAKE2 (PAKE): a recorded transcript cannot be ground
+                // offline against the PIN, and authentication is mutual.
+                val pake = Spake2.Client(pin!!, nonce)
+                send(JSONObject().put("type", "spake2_start").put("share", b64(pake.share)))
+                val challenge = recv()
+                require(challenge.getString("type") == "spake2_challenge") { "expected spake2_challenge" }
+                val keys = pake.finish(unb64(challenge.getString("share")))
+                send(JSONObject().put("type", "spake2_confirm").put("mac", b64(keys.confirmClient)))
                 val result = recv()
-                if (result.getString("type") != "pair_result" || !result.optBoolean("ok"))
+                if (result.getString("type") != "spake2_result" || !result.optBoolean("ok"))
                     throw Exception("pairing failed: ${result.optString("error", "wrong PIN?")}")
-                newToken = NdspCrypto.open(pairKey, unb64(result.getString("sealed_token")), "token".toByteArray())
+                // Mutual authentication: the server must prove it knew the
+                // PIN too before we accept anything from it.
+                val serverMac = unb64(result.getString("mac"))
+                if (!Spake2.macEqual(serverMac, keys.confirmServer))
+                    throw Exception("server failed SPAKE2 confirmation — possible MITM; aborting")
+                newToken = NdspCrypto.open(keys.tokenKey, unb64(result.getString("sealed_token")), "token".toByteArray())
+                sessionKey = keys.sessionKey
             }
 
             // 4. auth_ok → encrypted phase
