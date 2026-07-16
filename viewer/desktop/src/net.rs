@@ -8,7 +8,9 @@ use tracing::{info, warn};
 use winit::event_loop::EventLoopProxy;
 
 use ndsp_client::{connect, Auth, Incoming, Session};
-use ndsp_protocol::messages::{ClientInfo, Codec, ControlMsg, InputEvent, InputMode, Profile};
+use ndsp_protocol::messages::{
+    AudioWireCodec, ClientInfo, Codec, ControlMsg, InputEvent, InputMode, Profile,
+};
 
 use crate::decode::Decoder;
 use crate::receive::{FileReceiver, Handled};
@@ -27,6 +29,8 @@ pub struct NetArgs {
 pub enum Outgoing {
     Input(InputEvent),
     SetInputMode(InputMode),
+    /// Toggle listening to the host's audio (F9).
+    SetAudio(bool),
 }
 
 fn parse_profile(s: &str) -> Profile {
@@ -124,6 +128,7 @@ async fn session_loop(
 
     let mut decoder = Decoder::new();
     let mut receiver = FileReceiver::new(args.receive_dir.clone());
+    let mut audio: Option<crate::audio::AudioPlayer> = None;
     let mut last_ping = std::time::Instant::now() - Duration::from_secs(10);
     let mut input_mode = InputMode::ViewOnly;
 
@@ -142,6 +147,35 @@ async fn session_loop(
                     input_mode = mode;
                     session.send(&ControlMsg::SetInputMode { mode }).await?;
                 }
+                Outgoing::SetAudio(true) => {
+                    if audio.is_none() {
+                        match crate::audio::AudioPlayer::new() {
+                            Ok(p) => audio = Some(p),
+                            Err(e) => {
+                                warn!("audio unavailable: {e:#}");
+                                set_status(shared, proxy, format!("audio unavailable: {e}"));
+                                continue;
+                            }
+                        }
+                    }
+                    session
+                        .send(&ControlMsg::SetAudio {
+                            enabled: true,
+                            codec: Some(AudioWireCodec::Opus),
+                        })
+                        .await?;
+                    set_status(shared, proxy, "audio on (F9 to mute)");
+                }
+                Outgoing::SetAudio(false) => {
+                    audio = None; // closes the output device
+                    session
+                        .send(&ControlMsg::SetAudio {
+                            enabled: false,
+                            codec: None,
+                        })
+                        .await?;
+                    set_status(shared, proxy, "audio off");
+                }
             }
         }
 
@@ -159,9 +193,11 @@ async fn session_loop(
             Err(_) => continue, // poll input again
             Ok(Err(e)) => return Ok(format!("connection error: {e:#}")),
             Ok(Ok(Incoming::Closed)) => return Ok("host closed the connection".into()),
-            // The desktop viewer never enables audio (no SetAudio sent), so
-            // nothing should arrive here; tolerate it anyway.
-            Ok(Ok(Incoming::Audio(_))) => {}
+            Ok(Ok(Incoming::Audio(af))) => {
+                if let Some(player) = audio.as_mut() {
+                    player.push(&af);
+                }
+            }
             Ok(Ok(Incoming::Video(frame))) => match decoder.decode(&frame) {
                 Ok(Some(rgba)) => {
                     *shared.latest.lock().unwrap() = Some(rgba);

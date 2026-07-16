@@ -2,12 +2,14 @@
 //!
 //! Portable, admin-free, single binary. Connects to a host, decodes
 //! H.264/JPEG on a worker thread, presents via softbuffer, forwards
-//! mouse/keyboard when an input mode is enabled (I key cycles modes).
+//! mouse/keyboard when an input mode is enabled (I toggles control,
+//! F9 toggles listening to the host's audio).
 //!
 //! Usage:
 //!   nebula-viewer --host 192.168.1.20:41800 --pin 123456    # first pairing
 //!   nebula-viewer --host 192.168.1.20:41800                 # trusted reconnect
 
+mod audio;
 mod decode;
 mod net;
 mod receive;
@@ -105,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         surface: None,
         input_tx,
         mode: InputMode::ViewOnly,
+        audio_on: false,
         mouse_pos: (0.0, 0.0),
         stream_size: (1280, 720),
     };
@@ -118,6 +121,7 @@ struct App {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     input_tx: std::sync::mpsc::Sender<net::Outgoing>,
     mode: InputMode,
+    audio_on: bool,
     mouse_pos: (f32, f32),
     stream_size: (u32, u32),
 }
@@ -261,6 +265,15 @@ impl ApplicationHandler<UiWake> for App {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                // F9 toggles audio locally (never forwarded).
+                if code == winit::keyboard::KeyCode::F9
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    self.audio_on = !self.audio_on;
+                    let _ = self.input_tx.send(net::Outgoing::SetAudio(self.audio_on));
+                    return;
+                }
                 // I toggles input mode locally (never forwarded).
                 if code == winit::keyboard::KeyCode::KeyI
                     && event.state == ElementState::Pressed
