@@ -46,6 +46,31 @@ pub fn pen_tilt_deg(tilt: f32) -> i32 {
     (tilt.clamp(-1.0, 1.0) * 90.0).round() as i32
 }
 
+/// W3C *standard mapping* gamepad button bitmask → `Windows.Gaming.Input`
+/// `GamepadButtons` flags. Triggers (W3C 6/7) are analog on Windows and the
+/// guide button (16) is not exposed — neither maps to a flag.
+pub fn gamepad_buttons_to_windows(w3c_mask: u32) -> u32 {
+    const MAP: [(u32, u32); 14] = [
+        (0, 4),     // A
+        (1, 8),     // B
+        (2, 16),    // X
+        (3, 32),    // Y
+        (4, 1024),  // LeftShoulder
+        (5, 2048),  // RightShoulder
+        (8, 2),     // View (back/select)
+        (9, 1),     // Menu (start)
+        (10, 4096), // LeftThumbstick
+        (11, 8192), // RightThumbstick
+        (12, 64),   // DPadUp
+        (13, 128),  // DPadDown
+        (14, 256),  // DPadLeft
+        (15, 512),  // DPadRight
+    ];
+    MAP.iter()
+        .filter(|(w3c, _)| w3c_mask & (1 << w3c) != 0)
+        .fold(0, |acc, (_, win)| acc | win)
+}
+
 pub fn create_sink(state: Arc<AppState>) -> Box<dyn InputSink> {
     #[cfg(windows)]
     {
@@ -86,6 +111,24 @@ mod tests {
         assert_eq!(pen_pressure_1024(1.0, true), 1024);
         assert_eq!(pen_pressure_1024(7.5, true), 1024, "clamped");
         assert_eq!(pen_pressure_1024(-1.0, true), 1, "clamped");
+    }
+
+    #[test]
+    fn gamepad_button_mapping_matches_windows_flags() {
+        assert_eq!(gamepad_buttons_to_windows(0), 0);
+        assert_eq!(gamepad_buttons_to_windows(1), 4, "A");
+        assert_eq!(gamepad_buttons_to_windows(1 << 9), 1, "start = Menu");
+        assert_eq!(gamepad_buttons_to_windows(1 << 8), 2, "back = View");
+        assert_eq!(
+            gamepad_buttons_to_windows((1 << 12) | (1 << 15)),
+            64 | 512,
+            "dpad up+right"
+        );
+        // Analog triggers and the guide button have no digital flag.
+        assert_eq!(
+            gamepad_buttons_to_windows((1 << 6) | (1 << 7) | (1 << 16)),
+            0
+        );
     }
 
     #[test]

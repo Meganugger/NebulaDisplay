@@ -155,6 +155,21 @@ pub enum InputEvent {
     Text {
         text: String,
     },
+    /// Full gamepad state snapshot (W3C *standard mapping*), sent on
+    /// change. `buttons` is a bitmask over standard button indices
+    /// (bit 0 = A/cross … bit 15 = dpad-right, bit 16 = guide); triggers
+    /// carry their analog 0..1 values; sticks are -1..1 (Y down-positive,
+    /// as the Gamepad API reports).
+    Gamepad {
+        id: u32,
+        buttons: u32,
+        left_trigger: f32,
+        right_trigger: f32,
+        lx: f32,
+        ly: f32,
+        rx: f32,
+        ry: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -464,6 +479,16 @@ mod tests {
                     x: 0.1,
                     y: 0.9,
                     pressure: 0.7,
+                },
+                InputEvent::Gamepad {
+                    id: 0,
+                    buttons: 0b1001,
+                    left_trigger: 0.25,
+                    right_trigger: 0.0,
+                    lx: -0.5,
+                    ly: 0.5,
+                    rx: 0.0,
+                    ry: 1.0,
                 },
             ],
         };

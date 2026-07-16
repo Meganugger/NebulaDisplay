@@ -104,6 +104,17 @@ export class InputCapture {
       this.disposers.push(() => target.removeEventListener(type as string, fn as EventListener));
     };
 
+    // Gamepad forwarding (P2.12): poll while a pad is connected and an
+    // input mode is active. `gamepadconnected` requires a prior user
+    // gesture on the pad, which is exactly the opt-in we want.
+    if (typeof navigator.getGamepads === "function") {
+      on(window, "gamepadconnected", () => this.startGamepadPolling());
+      on(window, "gamepaddisconnected", () => this.pollGamepads());
+      // Pads connected before this session started still show up in the
+      // snapshot — probe once.
+      this.startGamepadPolling();
+    }
+
     if (caps.pointerEvents) {
       this.attachPointer(on);
     } else {
@@ -183,11 +194,86 @@ export class InputCapture {
   detach(): void {
     for (const d of this.disposers) d();
     this.disposers = [];
+    if (this.gamepadTimer !== undefined) {
+      clearInterval(this.gamepadTimer);
+      this.gamepadTimer = undefined;
+    }
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
     this.batch = [];
+  }
+
+  private gamepadTimer: number | undefined;
+  private gamepadStates = new Map<number, string>();
+
+  private startGamepadPolling(): void {
+    if (this.gamepadTimer !== undefined) return;
+    // 125 Hz poll: pads report at 125–250 Hz; states are only sent on change.
+    this.gamepadTimer = window.setInterval(() => this.pollGamepads(), 8);
+  }
+
+  private pollGamepads(): void {
+    const pads = navigator.getGamepads?.() ?? [];
+    let anyConnected = false;
+    const seen = new Set<number>();
+    for (const pad of pads) {
+      if (!pad || !pad.connected) continue;
+      anyConnected = true;
+      // Only the W3C "standard" layout maps predictably; others vary per
+      // vendor and would scramble buttons on the host.
+      if (pad.mapping !== "standard") continue;
+      seen.add(pad.index);
+      if (this.mode === "view_only") continue;
+      let buttons = 0;
+      for (let i = 0; i < Math.min(pad.buttons.length, 17); i++) {
+        if (pad.buttons[i]!.pressed) buttons |= 1 << i;
+      }
+      const q = (v: number) => Math.round((v ?? 0) * 127) / 127; // change-detect granularity
+      const ev: NdspInput = {
+        kind: "gamepad",
+        id: pad.index >>> 0,
+        buttons,
+        left_trigger: q(pad.buttons[6]?.value ?? 0),
+        right_trigger: q(pad.buttons[7]?.value ?? 0),
+        lx: q(pad.axes[0] ?? 0),
+        ly: q(pad.axes[1] ?? 0),
+        rx: q(pad.axes[2] ?? 0),
+        ry: q(pad.axes[3] ?? 0),
+      };
+      const fingerprint = JSON.stringify(ev);
+      if (this.gamepadStates.get(pad.index) !== fingerprint) {
+        this.gamepadStates.set(pad.index, fingerprint);
+        this.push(ev, true);
+      }
+    }
+    // A pad that vanished mid-press must not leave buttons stuck remotely.
+    for (const idx of [...this.gamepadStates.keys()]) {
+      if (!seen.has(idx)) {
+        this.gamepadStates.delete(idx);
+        if (this.mode !== "view_only") {
+          this.push(
+            {
+              kind: "gamepad",
+              id: idx >>> 0,
+              buttons: 0,
+              left_trigger: 0,
+              right_trigger: 0,
+              lx: 0,
+              ly: 0,
+              rx: 0,
+              ry: 0,
+            },
+            true,
+          );
+        }
+      }
+    }
+    if (!anyConnected && this.gamepadTimer !== undefined) {
+      clearInterval(this.gamepadTimer);
+      this.gamepadTimer = undefined;
+    }
   }
 
   private norm(clientX: number, clientY: number): { x: number; y: number } {

@@ -54,7 +54,18 @@ export type InputEvent =
   | { kind: "key"; code: string; pressed: boolean }
   | { kind: "touch"; id: number; phase: TouchPhase; x: number; y: number; pressure: number }
   | { kind: "pen"; phase: TouchPhase; x: number; y: number; pressure: number; tilt_x: number; tilt_y: number }
-  | { kind: "text"; text: string };
+  | { kind: "text"; text: string }
+  | {
+      kind: "gamepad";
+      id: number;
+      buttons: number;
+      left_trigger: number;
+      right_trigger: number;
+      lx: number;
+      ly: number;
+      rx: number;
+      ry: number;
+    };
 
 // Control messages — a permissive structural type keyed on `type`.
 export type ControlMsg = { type: string } & Record<string, unknown>;
