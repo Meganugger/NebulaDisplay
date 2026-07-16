@@ -29,4 +29,6 @@ android {
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // SPAKE2 pairing needs P-256 group arithmetic (not exposed by JCA).
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 }

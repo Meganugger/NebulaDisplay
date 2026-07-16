@@ -60,17 +60,17 @@ object NdspCrypto {
         return out
     }
 
-    // ---- HKDF-SHA256 (RFC 5869) ---------------------------------------------
-    private fun hmac(key: ByteArray, data: ByteArray): ByteArray =
+    // ---- HMAC / HKDF-SHA256 (RFC 5869) ----------------------------------------
+    fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray =
         Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }.doFinal(data)
 
     fun hkdf(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int = 32): ByteArray {
-        val prk = hmac(salt, ikm)
+        val prk = hmacSha256(salt, ikm)
         var t = ByteArray(0)
         val out = ByteBuffer.allocate(length)
         var counter = 1
         while (out.position() < length) {
-            t = hmac(prk, t + info + byteArrayOf(counter.toByte()))
+            t = hmacSha256(prk, t + info + byteArrayOf(counter.toByte()))
             out.put(t, 0, minOf(t.size, length - out.position()))
             counter++
         }
