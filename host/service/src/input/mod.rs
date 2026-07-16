@@ -4,10 +4,13 @@
 //! input grant is on (deny by default, toggled in the panel); this module is
 //! the last line and re-checks nothing — callers enforce grants.
 //!
-//! * Windows: `SendInput` for mouse/keyboard; touch is mapped to mouse until
-//!   the InjectTouchInput path lands (roadmap).
+//! * Windows: `SendInput` for mouse/keyboard; **synthetic pointer devices**
+//!   (Windows Ink, Win10 1809+) for pen (pressure/tilt) and multi-touch
+//!   (up to 10 contacts, pinch/rotate reach apps as real gestures), each
+//!   falling back to the mouse mapping where the API is unavailable.
 //! * Non-Windows hosts: structured log sink (useful for tests/CI).
 
+pub mod touch_frame;
 #[cfg(windows)]
 mod windows_inject;
 
@@ -18,6 +21,12 @@ use crate::state::AppState;
 
 pub trait InputSink: Send + Sync {
     fn apply(&self, events: &[InputEvent]);
+
+    /// Release anything still "held" (touch contacts, dragged mouse button,
+    /// modifier keys). Called when a session's input stream ends so an
+    /// abrupt viewer disconnect mid-gesture never leaves the host stuck in
+    /// a drag or a half-finished pinch.
+    fn release(&self) {}
 }
 
 /// NDSP pen pressure (0..1) → Windows Ink pressure (0..1024). While the pen
