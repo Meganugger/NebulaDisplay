@@ -141,6 +141,8 @@ pub enum InputEvent {
         pressure: f32,
     },
     /// Stylus with pressure/tilt where the viewer platform exposes them.
+    /// `pressure` is 0..1; `tilt_x`/`tilt_y` are normalized -1..1
+    /// (±1 = ±90°). Hosts with Windows Ink inject these as true pen input.
     Pen {
         phase: TouchPhase,
         x: f32,

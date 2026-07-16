@@ -20,6 +20,23 @@ pub trait InputSink: Send + Sync {
     fn apply(&self, events: &[InputEvent]);
 }
 
+/// NDSP pen pressure (0..1) → Windows Ink pressure (0..1024). While the pen
+/// is in contact a zero would be interpreted as "no contact" by some apps,
+/// so contact pressure has a floor of 1.
+pub fn pen_pressure_1024(pressure: f32, in_contact: bool) -> u32 {
+    let p = (pressure.clamp(0.0, 1.0) * 1024.0).round() as u32;
+    if in_contact {
+        p.clamp(1, 1024)
+    } else {
+        p.min(1024)
+    }
+}
+
+/// NDSP tilt (normalized -1..1, where ±1 = ±90°) → Windows Ink degrees.
+pub fn pen_tilt_deg(tilt: f32) -> i32 {
+    (tilt.clamp(-1.0, 1.0) * 90.0).round() as i32
+}
+
 pub fn create_sink(state: Arc<AppState>) -> Box<dyn InputSink> {
     #[cfg(windows)]
     {
@@ -41,5 +58,34 @@ impl InputSink for LogSink {
         for e in events {
             tracing::info!(event = ?e, "input event (no injection backend on this OS)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pen_pressure_scaling() {
+        assert_eq!(pen_pressure_1024(0.0, false), 0, "hover may report zero");
+        assert_eq!(
+            pen_pressure_1024(0.0, true),
+            1,
+            "contact pressure has a floor"
+        );
+        assert_eq!(pen_pressure_1024(0.5, true), 512);
+        assert_eq!(pen_pressure_1024(1.0, true), 1024);
+        assert_eq!(pen_pressure_1024(7.5, true), 1024, "clamped");
+        assert_eq!(pen_pressure_1024(-1.0, true), 1, "clamped");
+    }
+
+    #[test]
+    fn pen_tilt_normalized_to_degrees() {
+        assert_eq!(pen_tilt_deg(0.0), 0);
+        assert_eq!(pen_tilt_deg(0.5), 45);
+        assert_eq!(pen_tilt_deg(1.0), 90);
+        assert_eq!(pen_tilt_deg(-1.0), -90);
+        assert_eq!(pen_tilt_deg(3.0), 90, "clamped");
+        assert_eq!(pen_tilt_deg(-3.0), -90, "clamped");
     }
 }
