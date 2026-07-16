@@ -23,6 +23,20 @@ pub struct TrustedDevice {
     pub last_seen_unix: u64,
     /// Whether this device may inject input. **Deny by default.**
     pub input_allowed: bool,
+    /// Whether this device may read/write the host clipboard. **Deny by
+    /// default** (added in v0.5; absent in older stores = denied).
+    #[serde(default)]
+    pub clipboard_allowed: bool,
+    /// Whether this device may receive host audio. Allowed by default —
+    /// audio is the same sensitivity class as the screen the device already
+    /// sees; the panel can mute a device live. (Absent in older stores =
+    /// allowed.)
+    #[serde(default = "default_true")]
+    pub audio_allowed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -45,11 +59,14 @@ fn now_unix() -> u64 {
 impl TrustStore {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let devices = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str::<StoreFile>(&raw)
+            let raw = std::fs::read(&path)?;
+            // v0.5+: DPAPI-wrapped on Windows; legacy plaintext still reads
+            // (and is upgraded to the wrapped format on the next save).
+            crate::keystore::unprotect(&raw)
+                .and_then(|plain| serde_json::from_slice::<StoreFile>(&plain).map_err(Into::into))
                 .map(|f| f.devices)
                 .unwrap_or_else(|e| {
-                    warn!("trust store corrupt ({e}); starting empty (old file kept as .bak)");
+                    warn!("trust store unreadable ({e}); starting empty (old file kept as .bak)");
                     let _ = std::fs::copy(&path, path.with_extension("json.bak"));
                     Vec::new()
                 })
@@ -64,7 +81,7 @@ impl TrustStore {
         let raw = serde_json::to_string_pretty(&StoreFile {
             devices: self.devices.clone(),
         })?;
-        std::fs::write(&tmp, raw)?;
+        std::fs::write(&tmp, crate::keystore::protect(raw.as_bytes()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -92,6 +109,8 @@ impl TrustStore {
             created_unix: now_unix(),
             last_seen_unix: now_unix(),
             input_allowed: false, // never grant input implicitly
+            clipboard_allowed: false,
+            audio_allowed: true,
         });
         self.save()?;
         info!(device_id, name, "device enrolled (input DENIED by default)");
@@ -145,6 +164,30 @@ impl TrustStore {
         Ok(true)
     }
 
+    pub fn set_clipboard_allowed(
+        &mut self,
+        device_id: &str,
+        allowed: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.clipboard_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "clipboard grant updated");
+        Ok(true)
+    }
+
+    pub fn set_audio_allowed(&mut self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.audio_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "audio grant updated");
+        Ok(true)
+    }
+
     pub fn revoke(&mut self, device_id: &str) -> anyhow::Result<bool> {
         let before = self.devices.len();
         self.devices.retain(|d| d.device_id != device_id);
@@ -165,6 +208,28 @@ impl TrustStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stores written before v0.5 lack the clipboard/audio fields and are
+    /// plaintext JSON — they must load with safe defaults and be upgraded
+    /// (keystore-wrapped on Windows) on the next save.
+    #[test]
+    fn pre_v05_store_loads_with_safe_defaults() {
+        let dir = std::env::temp_dir().join(format!("ndsp-test-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.json");
+        std::fs::write(
+            &path,
+            r#"{"devices":[{"device_id":"old-1","name":"Old Tablet","platform":"android",
+                "token_hex":"aa","created_unix":1,"last_seen_unix":2,"input_allowed":true}]}"#,
+        )
+        .unwrap();
+        let store = TrustStore::load(path.clone()).unwrap();
+        let d = store.get("old-1").expect("legacy device loads");
+        assert!(d.input_allowed, "existing grants preserved");
+        assert!(!d.clipboard_allowed, "clipboard must default to DENIED");
+        assert!(d.audio_allowed, "audio defaults to allowed (panel-mutable)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn enroll_verify_revoke() {

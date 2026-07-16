@@ -13,6 +13,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys, SharedSecret},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, ServerInfo},
+    spake2::{mac_equal, Spake2Server},
     PROTOCOL_VERSION,
 };
 use std::net::IpAddr;
@@ -28,6 +29,8 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
+    pub audio_allowed: bool,
     pub newly_paired: bool,
 }
 
@@ -39,6 +42,9 @@ enum Phase {
         salt: [u8; 16],
         client_pub: Vec<u8>,
         server_pub: Vec<u8>,
+    },
+    AwaitSpake2Confirm {
+        server: Box<Spake2Server>,
     },
     Done,
 }
@@ -133,7 +139,17 @@ impl ServerHandshake {
                     );
                 }
                 info!(device = %client.device_id, name = %client.name, platform = %client.platform, "hello");
-                let pairing = matches!(auth, AuthMethod::Pair);
+                if matches!(auth, AuthMethod::Pair) && !self.state.cfg.file.allow_legacy_pairing {
+                    return Step::reject(
+                        ControlMsg::AuthErr {
+                            error: "this host requires SPAKE2 pairing (legacy PIN pairing is \
+                                    disabled) — update your viewer app"
+                                .into(),
+                        },
+                        "legacy pairing disabled",
+                    );
+                }
+                let pairing = matches!(auth, AuthMethod::Pair | AuthMethod::PairSpake2);
                 self.client = Some(client);
                 self.auth = Some(auth);
                 self.client_codecs = codecs;
@@ -148,6 +164,128 @@ impl ServerHandshake {
                     pairing_required: pairing,
                     connection_nonce: B64.encode(self.nonce),
                 })
+            }
+
+            (Phase::AwaitPairStart, ControlMsg::Spake2Start { share })
+                if matches!(self.auth, Some(AuthMethod::PairSpake2)) =>
+            {
+                // Rate-limit before any curve arithmetic.
+                if let PinGate::LockedOut { retry_after } = self.state.pins.gate(self.peer_ip) {
+                    return Step::reject(
+                        ControlMsg::AuthErr {
+                            error: format!(
+                                "too many failed attempts; retry in {}s",
+                                retry_after.as_secs()
+                            ),
+                        },
+                        "pairing lockout",
+                    );
+                }
+                let Ok(client_share) = B64.decode(&share) else {
+                    return Step::reject(
+                        ControlMsg::AuthErr {
+                            error: "bad share encoding".into(),
+                        },
+                        "bad spake2 share b64",
+                    );
+                };
+                let pin = self.state.pins.current_pin();
+                let server = match Spake2Server::respond(&pin, &self.nonce, &client_share) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // Malformed share = active protocol abuse, not a PIN
+                        // guess — still counts against the attempt budget.
+                        self.state.pins.record_failure(self.peer_ip);
+                        return Step::reject(
+                            ControlMsg::AuthErr {
+                                error: "invalid SPAKE2 share".into(),
+                            },
+                            "bad spake2 share",
+                        );
+                    }
+                };
+                let reply = ControlMsg::Spake2Challenge {
+                    share: B64.encode(server.share()),
+                };
+                self.phase = Phase::AwaitSpake2Confirm {
+                    server: Box::new(server),
+                };
+                Step::reply(reply)
+            }
+
+            (Phase::AwaitSpake2Confirm { server }, ControlMsg::Spake2Confirm { mac }) => {
+                let Ok(mac) = B64.decode(&mac) else {
+                    return Step::reject(
+                        ControlMsg::Spake2Result {
+                            ok: false,
+                            mac: None,
+                            sealed_token: None,
+                            error: Some("bad encoding".into()),
+                        },
+                        "bad spake2 mac b64",
+                    );
+                };
+                if !mac_equal(&mac, &server.keys().confirm_client) {
+                    self.state.pins.record_failure(self.peer_ip);
+                    return Step::reject(
+                        ControlMsg::Spake2Result {
+                            ok: false,
+                            mac: None,
+                            sealed_token: None,
+                            error: Some("wrong PIN".into()),
+                        },
+                        "wrong PIN (spake2)",
+                    );
+                }
+                let client = self.client.clone().expect("hello precedes confirm");
+                self.state.pins.consume(self.peer_ip);
+                let token = match self.state.trust.lock().unwrap().enroll(
+                    &client.device_id,
+                    &client.name,
+                    &client.platform,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("trust store write failed: {e:#}");
+                        return Step::reject(
+                            ControlMsg::Spake2Result {
+                                ok: false,
+                                mac: None,
+                                sealed_token: None,
+                                error: Some("host storage error".into()),
+                            },
+                            "trust store error",
+                        );
+                    }
+                };
+                let keys = match std::mem::replace(&mut self.phase, Phase::Done) {
+                    Phase::AwaitSpake2Confirm { server } => server.into_keys(),
+                    _ => unreachable!("phase checked by match arm"),
+                };
+                let sealed_token = crypto::seal(&keys.token_key, &token, b"token");
+                let auth_ok = self.auth_ok(false);
+                let codec = self.select_codec();
+                Step {
+                    replies: vec![
+                        ControlMsg::Spake2Result {
+                            ok: true,
+                            mac: Some(B64.encode(keys.confirm_server)),
+                            sealed_token: Some(B64.encode(sealed_token)),
+                            error: None,
+                        },
+                        auth_ok,
+                    ],
+                    complete: Some(AuthComplete {
+                        client,
+                        session_key: keys.session_key,
+                        codec,
+                        input_allowed: false,
+                        clipboard_allowed: false,
+                        audio_allowed: true,
+                        newly_paired: true,
+                    }),
+                    reject: None,
+                }
             }
 
             (Phase::AwaitPairStart, ControlMsg::PairStart { client_pubkey }) => {
@@ -258,6 +396,8 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
+                                audio_allowed: true,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -325,6 +465,8 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed: dev.clipboard_allowed,
+                                audio_allowed: dev.audio_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,
@@ -363,6 +505,10 @@ fn variant_name(msg: &ControlMsg) -> &'static str {
         ControlMsg::PairChallenge { .. } => "pair_challenge",
         ControlMsg::PairConfirm { .. } => "pair_confirm",
         ControlMsg::PairResult { .. } => "pair_result",
+        ControlMsg::Spake2Start { .. } => "spake2_start",
+        ControlMsg::Spake2Challenge { .. } => "spake2_challenge",
+        ControlMsg::Spake2Confirm { .. } => "spake2_confirm",
+        ControlMsg::Spake2Result { .. } => "spake2_result",
         ControlMsg::TokenProof { .. } => "token_proof",
         ControlMsg::AuthOk { .. } => "auth_ok",
         ControlMsg::AuthErr { .. } => "auth_err",

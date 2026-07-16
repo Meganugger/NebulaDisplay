@@ -50,11 +50,16 @@
           <option value="drawing_tablet">Drawing tablet</option>
         </select>
         <span id="input-denied">input not granted by host</span>
+        <button id="audio-btn" title="Host audio (off by default)">🔇</button>
+        <input id="volume" type="range" min="0" max="100" value="80" title="Volume" />
+        <button id="clip-btn" title="Send this device's clipboard to the PC (host permission required)">📋</button>
         <button id="stats-btn" title="Toggle stats overlay">Stats</button>
         <button id="fullscreen-btn" title="Fullscreen">⛶</button>
         <button id="disconnect-btn" class="danger">Disconnect</button>
       </div>
       <div id="stats-overlay"></div>
+      <div id="drop-overlay">Drop the file to send it to the PC<br /><span>the host confirms every transfer</span></div>
+      <div id="transfer-status"></div>
       <div id="toast"></div>
     </div>
   </body>

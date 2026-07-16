@@ -5,12 +5,15 @@ use ndsp_protocol::messages::{DisplayMode, HostStats, ViewerStats};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::audio::AudioBlock;
+use crate::clipboard::{ClipboardSync, HostClipboard};
 use crate::config::Config;
 use crate::pin::PinManager;
+use crate::transfers::TransferManager;
 use crate::trust::TrustStore;
 
 /// Host cursor image (RGBA8, tightly packed) + hotspot.
@@ -55,7 +58,21 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
-    Kick { reason: String },
+    SetClipboardGrant(bool),
+    SetAudioGrant(bool),
+    /// Panel decision for a pending file offer (routed by the transfer
+    /// manager; carries the validated metadata so the session doesn't have
+    /// to keep its own pending map).
+    AnswerFileOffer {
+        id: String,
+        accept: bool,
+        name: String,
+        size_bytes: u64,
+        sha256_hex: String,
+    },
+    Kick {
+        reason: String,
+    },
 }
 
 /// Panel-visible live client entry.
@@ -66,6 +83,13 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    /// Whether this device may sync clipboards (deny by default).
+    pub clipboard_allowed: Arc<AtomicBool>,
+    /// Whether the panel permits audio for this device.
+    pub audio_allowed: Arc<AtomicBool>,
+    /// The viewer currently has audio enabled *and* permitted — the panel's
+    /// "this device is listening" indicator.
+    pub audio_active: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
     pub stats: Mutex<ViewerStats>,
@@ -82,12 +106,29 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Encoded audio blocks from the global audio loop; sessions subscribe.
+    pub audio_tx: broadcast::Sender<Arc<AudioBlock>>,
+    /// Sessions currently receiving audio (enabled + permitted). The audio
+    /// loop releases the capture device at zero.
+    audio_listeners: AtomicUsize,
+    /// Host clipboard backend (system or in-memory).
+    pub clipboard: Arc<dyn HostClipboard>,
+    /// Echo suppression shared between watcher and apply path.
+    pub clipboard_sync: Arc<ClipboardSync>,
+    /// Latest host clipboard text (seq, text); sessions `watch` this and
+    /// forward to granted clients.
+    pub clipboard_tx: watch::Sender<(u64, Arc<String>)>,
+    /// Pending viewer→host file offers awaiting a panel decision.
+    pub transfers: TransferManager,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
     /// Desktop-space rect (left, top, right, bottom) of the captured surface,
     /// when the platform exposes one — used for multi-monitor input mapping.
     pub capture_rect: Mutex<Option<(i32, i32, i32, i32)>>,
+    /// SHA-256 fingerprint of the TLS certificate when `--https` is active
+    /// (panel display; users compare against the browser's cert warning).
+    pub tls_fingerprint: Mutex<Option<String>>,
     pub clients: Mutex<HashMap<u64, Arc<ClientHandle>>>,
     next_client_id: AtomicU64,
     serving_port: AtomicU64,
@@ -96,6 +137,16 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(cfg: Config) -> anyhow::Result<Self> {
+        let clipboard = crate::clipboard::create_clipboard();
+        Self::new_with_clipboard(cfg, clipboard).await
+    }
+
+    /// Test/embedding constructor with an explicit clipboard backend (keeps
+    /// the e2e suite off the developer's real clipboard).
+    pub async fn new_with_clipboard(
+        cfg: Config,
+        clipboard: Arc<dyn HostClipboard>,
+    ) -> anyhow::Result<Self> {
         let fingerprint = load_or_create_identity(&cfg)?;
         let pins = PinManager::new(
             cfg.file.pin_digits,
@@ -106,6 +157,8 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (audio_tx, _) = broadcast::channel(64);
+        let (clipboard_tx, _) = watch::channel((0, Arc::new(String::new())));
         Ok(Self {
             cfg,
             fingerprint,
@@ -113,6 +166,13 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            audio_tx,
+            audio_listeners: AtomicUsize::new(0),
+            clipboard,
+            clipboard_sync: Arc::new(ClipboardSync::default()),
+            clipboard_tx,
+            transfers: TransferManager::default(),
+            tls_fingerprint: Mutex::new(None),
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -142,6 +202,15 @@ impl AppState {
 
     pub fn serving_port(&self) -> u16 {
         self.serving_port.load(Ordering::Relaxed) as u16
+    }
+
+    /// URL scheme of the viewer endpoint ("http" or "https").
+    pub fn viewer_scheme(&self) -> &'static str {
+        if self.tls_fingerprint.lock().unwrap().is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     pub fn register_client(&self, handle: Arc<ClientHandle>) -> u64 {
@@ -208,6 +277,54 @@ impl AppState {
         Ok(found)
     }
 
+    /// Push a clipboard-grant change to the store and any live session.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Push an audio-permission change to the store and any live session.
+    pub fn set_audio_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_audio_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.audio_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetAudioGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Audio listener bookkeeping (sessions call these on state changes).
+    pub fn audio_listener_add(&self) {
+        self.audio_listeners.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn audio_listener_remove(&self) {
+        let prev = self.audio_listeners.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "audio listener count underflow");
+    }
+    pub fn audio_listener_count(&self) -> usize {
+        self.audio_listeners.load(Ordering::Relaxed)
+    }
+
     /// Revoke trust and kick any live session for that device.
     pub fn revoke_device(&self, device_id: &str) -> anyhow::Result<bool> {
         let removed = self.trust.lock().unwrap().revoke(device_id)?;
@@ -229,11 +346,12 @@ fn load_or_create_identity(cfg: &Config) -> anyhow::Result<String> {
     let path = cfg.data_dir.join("identity.key");
     let key: Vec<u8> = if path.exists() {
         let raw = std::fs::read(&path)?;
+        let raw = crate::keystore::unprotect(&raw)?;
         anyhow::ensure!(raw.len() == 32, "identity.key corrupt (expected 32 bytes)");
         raw
     } else {
         let key: [u8; 32] = ndsp_protocol::crypto::random_bytes();
-        std::fs::write(&path, key)?;
+        std::fs::write(&path, crate::keystore::protect(&key))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -197,6 +197,89 @@ if (!cur1 || cur1.display === "none" || !cur1.src) await fail("remote cursor ove
 if (cur1.t === cur2.t) await fail("remote cursor is not moving (cursor channel stalled)");
 console.log("cursor channel verified (shape delivered, position updating)");
 
+// ---- audio: opt in via the toolbar, verify decode + host indicator ----------
+// localhost is a secure context → WebCodecs AudioDecoder (Opus) path.
+if (!(await page.isVisible("#audio-btn"))) await fail("audio button missing");
+await page.click("#audio-btn");
+await sleep(2000);
+const audioFrames1 = await page.evaluate(() => globalThis.__ndspDebug.audioFramesPlayed());
+await sleep(1000);
+const audioFrames2 = await page.evaluate(() => globalThis.__ndspDebug.audioFramesPlayed());
+if (audioFrames2 <= 0) await fail("no audio blocks decoded/scheduled after enabling");
+if (audioFrames2 <= audioFrames1) await fail("audio stalled after start");
+// Host-side truth: the panel must show this device as actively listening.
+const listening = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+const me = listening.clients.find((c) => c.name === "Chromium E2E");
+if (!me || !me.audio_active) await fail("panel does not show the audio-active indicator");
+// Off-switch: indicator clears.
+await page.click("#audio-btn");
+await sleep(800);
+const after = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+if (after.clients.find((c) => c.name === "Chromium E2E")?.audio_active)
+  await fail("audio indicator did not clear after disable");
+console.log(`audio verified (${audioFrames2} Opus blocks decoded, panel indicator on/off)`);
+
+// ---- clipboard: deny-by-default, then grant and sync viewer → host ---------
+await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+  origin: `http://127.0.0.1:${port}`,
+});
+await page.evaluate(() => navigator.clipboard.writeText("e2e clipboard payload"));
+await page.click("#clip-btn");
+await sleep(700);
+if (/applied viewer clipboard/.test(hostLog))
+  await fail("clipboard must be deny-by-default (host applied it without a grant)");
+const clipGrant = await fetch(`http://127.0.0.1:${panelPort}/api/grant`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ device_id: deviceId, allowed: true, kind: "clipboard" }),
+});
+if (!clipGrant.ok) await fail(`clipboard grant API failed: ${clipGrant.status}`);
+await sleep(400);
+await page.click("#clip-btn");
+await sleep(900);
+if (!/applied viewer clipboard/.test(hostLog))
+  await fail("granted clipboard payload never reached the host");
+console.log("clipboard verified (deny-by-default, grant, viewer → host sync)");
+
+// ---- file drop: offer → panel accept → verified delivery -------------------
+const fileContent = "NebulaDisplay file-drop E2E ".repeat(4000); // ~112 KB
+await page.evaluate(async (content) => {
+  const dt = new DataTransfer();
+  dt.items.add(new File([content], "e2e-drop.txt", { type: "text/plain" }));
+  const target = document.getElementById("viewer-screen");
+  target.dispatchEvent(new DragEvent("dragenter", { bubbles: true, dataTransfer: dt }));
+  target.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: dt }));
+}, fileContent);
+// The offer must show up in the panel…
+let offer = null;
+for (let i = 0; i < 60 && !offer; i++) {
+  const t = await (await fetch(`http://127.0.0.1:${panelPort}/api/transfers`)).json();
+  offer = t.pending.find((o) => o.name === "e2e-drop.txt") ?? null;
+  if (!offer) await sleep(250);
+}
+if (!offer) await fail("file offer never appeared in the panel");
+if (offer.size_bytes !== fileContent.length) await fail(`offer size mismatch ${offer.size_bytes}`);
+// …nothing may exist on disk yet…
+const savedPath = join(dataDir, "received", "e2e-drop.txt");
+if (existsSync(savedPath)) await fail("file written before the user accepted!");
+// …accept → verified delivery.
+const acc = await fetch(`http://127.0.0.1:${panelPort}/api/transfers/answer`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ id: offer.id, accept: true }),
+});
+if (!acc.ok) await fail(`transfer answer API failed: ${acc.status}`);
+let delivered = false;
+for (let i = 0; i < 80 && !delivered; i++) {
+  await sleep(250);
+  delivered = existsSync(savedPath);
+}
+if (!delivered) await fail("accepted file never landed on disk");
+const got = await import("node:fs").then((fs) => fs.readFileSync(savedPath, "utf8"));
+if (got !== fileContent) await fail("delivered file content mismatch");
+await page.screenshot({ path: join(shotDir, "4-features.png") });
+console.log(`file drop verified (${fileContent.length} bytes, panel-gated, sha256-checked)`);
+
 await browser.close();
 host.kill();
 rmSync(dataDir, { recursive: true, force: true });

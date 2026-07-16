@@ -1,11 +1,13 @@
 // Viewer application: connect card → streaming canvas with toolbar/stats.
 
 import "./style.css";
+import { AudioPlayer, audioPreference } from "./audio";
 import { capabilityReport, caps, fullscreen, storage } from "./caps";
 import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
+import { FileSender } from "./filedrop";
 import { contentBox, InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
 import { Session } from "./session";
@@ -33,6 +35,9 @@ const remoteCursor = $<HTMLImageElement>("remote-cursor");
 let session: Session | null = null;
 let renderer: Renderer | null = null;
 let input: InputCapture | null = null;
+let audioPlayer: AudioPlayer | null = null;
+let audioWanted = false;
+let fileSender: FileSender | null = null;
 let statsTimer: number | undefined;
 let pingTimer: number | undefined;
 const clock = new ClockSync();
@@ -124,6 +129,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
         if (lat !== null && lat >= 0) netMsAvg = netMsAvg === 0 ? lat : netMsAvg * 0.9 + lat * 0.1;
         void renderer?.push(frame);
       },
+      onAudio: (frame) => audioPlayer?.push(frame),
       onControl: onControl,
       onClose: (reason) => onSessionClosed(host, reason),
     });
@@ -181,6 +187,8 @@ function onSessionClosed(host: string, reason: string): void {
 }
 
 function onControl(msg: ControlMsg): void {
+  // Transfer messages are consumed by the active file sender.
+  if (fileSender?.handleControl(msg)) return;
   switch (msg.type) {
     case "pong":
       clock.onPong(Number(msg.t0_us), Number(msg.t1_us));
@@ -192,6 +200,25 @@ function onControl(msg: ControlMsg): void {
       inputAllowed = Boolean(msg.allowed);
       refreshInputBadge();
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
+      break;
+    }
+    case "audio_grant": {
+      if (!msg.allowed && audioWanted) {
+        showToast("Host muted audio for this device");
+        stopAudio(false);
+      }
+      break;
+    }
+    case "clipboard": {
+      onRemoteClipboard(String(msg.text));
+      break;
+    }
+    case "clipboard_grant": {
+      showToast(
+        msg.allowed
+          ? "Host enabled clipboard sync for this device"
+          : "Host disabled clipboard sync for this device",
+      );
       break;
     }
     case "cursor_shape": {
@@ -262,6 +289,15 @@ function enterViewer(s: Session): void {
   viewerScreen.classList.add("active");
   $("server-name").textContent = `${s.info.serverName} · ${s.info.codec.toUpperCase()}`;
   if (s.info.newlyPaired) showToast("Paired ✓ — this device is now trusted by the host");
+  fileSender = new FileSender(s);
+  const audioBtn = $<HTMLButtonElement>("audio-btn");
+  if (audioPreference() === null) {
+    audioBtn.style.display = "none"; // nothing here can play audio
+  } else {
+    audioBtn.style.display = "";
+    audioBtn.textContent = "🔇";
+    audioBtn.classList.remove("on");
+  }
 
   input = new InputCapture(
     canvas,
@@ -325,6 +361,9 @@ function endSession(reason: string): void {
   window.clearInterval(pingTimer);
   input?.detach();
   input = null;
+  stopAudio(false);
+  fileSender = null;
+  transferStatus.style.display = "none";
   renderer?.destroy();
   renderer = null;
   session = null;
@@ -341,6 +380,171 @@ function endSession(reason: string): void {
 function round1(n: number): number {
   return Math.round(n * 10) / 10;
 }
+
+// --- audio ------------------------------------------------------------------
+
+const volumeSlider = $<HTMLInputElement>("volume");
+
+async function startAudio(): Promise<void> {
+  const pref = audioPreference();
+  if (!session || !pref) return;
+  try {
+    audioPlayer = new AudioPlayer(pref.codec);
+    audioPlayer.onError = () => {
+      showToast("Audio decoder failed — audio stopped", 6000);
+      stopAudio(true);
+    };
+    audioPlayer.setVolume(Number(volumeSlider.value) / 100);
+    await audioPlayer.resume(); // inside the click gesture (autoplay policy)
+    audioWanted = true;
+    void session.send({ type: "set_audio", enabled: true, codec: pref.codec });
+    $("audio-btn").textContent = "🔊";
+    $("audio-btn").classList.add("on");
+    volumeSlider.style.display = "";
+  } catch (e) {
+    showToast(`Audio unavailable: ${(e as Error).message}`, 6000);
+    audioPlayer?.destroy();
+    audioPlayer = null;
+  }
+}
+
+function stopAudio(tellHost: boolean): void {
+  if (tellHost || audioWanted) {
+    void session?.send({ type: "set_audio", enabled: false });
+  }
+  audioWanted = false;
+  audioPlayer?.destroy();
+  audioPlayer = null;
+  const btn = document.getElementById("audio-btn");
+  if (btn) {
+    btn.textContent = "🔇";
+    btn.classList.remove("on");
+  }
+  volumeSlider.style.display = "none";
+}
+
+$("audio-btn").onclick = () => {
+  if (audioWanted) stopAudio(true);
+  else void startAudio();
+};
+volumeSlider.oninput = () => audioPlayer?.setVolume(Number(volumeSlider.value) / 100);
+
+// --- clipboard ---------------------------------------------------------------
+
+/** Best-effort local clipboard read: async API on secure origins, manual
+ *  paste prompt everywhere else (insecure LAN origins have no readText). */
+async function readLocalClipboard(): Promise<string | null> {
+  if (navigator.clipboard?.readText) {
+    try {
+      return await navigator.clipboard.readText();
+    } catch {
+      /* permission denied — fall through to the prompt */
+    }
+  }
+  return window.prompt("Paste the text to send to the PC's clipboard:");
+}
+
+$("clip-btn").onclick = () => {
+  void (async () => {
+    if (!session) return;
+    const text = await readLocalClipboard();
+    if (!text) return;
+    if (text.length > 256 * 1024) {
+      showToast("Clipboard too large (256 KiB max)", 5000);
+      return;
+    }
+    void session.send({ type: "clipboard", text });
+    showToast("Clipboard sent to the PC (host permission required)");
+  })();
+};
+
+function onRemoteClipboard(text: string): void {
+  // Try the silent path first; browsers may require a gesture — then we
+  // show a toast with an explicit copy button (execCommand works there).
+  const fallback = () => {
+    toast.textContent = "PC clipboard received ";
+    const btn = document.createElement("button");
+    btn.textContent = "Copy here";
+    btn.onclick = () => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        showToast("Copied ✓");
+      } finally {
+        ta.remove();
+      }
+    };
+    toast.appendChild(btn);
+    toast.style.display = "block";
+    window.setTimeout(() => (toast.style.display = "none"), 8000);
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => showToast("PC clipboard synced to this device 📋"),
+      fallback,
+    );
+  } else {
+    fallback();
+  }
+}
+
+// --- file drop -----------------------------------------------------------------
+
+const dropOverlay = $("drop-overlay");
+const transferStatus = $("transfer-status");
+
+function xferUi() {
+  return {
+    onStatus(text: string) {
+      transferStatus.textContent = text;
+      transferStatus.style.display = "block";
+    },
+    onProgress(sent: number, total: number) {
+      const pct = total ? Math.floor((sent / total) * 100) : 0;
+      transferStatus.textContent = `Sending… ${pct}% (${(sent / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB)`;
+      transferStatus.style.display = "block";
+    },
+    onDone(name: string) {
+      transferStatus.style.display = "none";
+      showToast(`${name} delivered to the PC ✓`, 6000);
+    },
+    onFail(reason: string) {
+      transferStatus.style.display = "none";
+      showToast(`File not sent: ${reason}`, 7000);
+    },
+  };
+}
+
+let dragDepth = 0;
+viewerScreen.addEventListener("dragenter", (ev) => {
+  ev.preventDefault();
+  dragDepth++;
+  dropOverlay.classList.add("visible");
+});
+viewerScreen.addEventListener("dragover", (ev) => ev.preventDefault());
+viewerScreen.addEventListener("dragleave", () => {
+  if (--dragDepth <= 0) {
+    dragDepth = 0;
+    dropOverlay.classList.remove("visible");
+  }
+});
+viewerScreen.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  dragDepth = 0;
+  dropOverlay.classList.remove("visible");
+  const file = ev.dataTransfer?.files?.[0];
+  if (!file || !fileSender) return;
+  if (fileSender.busy) {
+    showToast("A transfer is already running — wait for it to finish", 5000);
+    return;
+  }
+  void fileSender.sendFile(file, xferUi());
+});
 
 // --- toolbar wiring -------------------------------------------------------
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
@@ -388,6 +592,12 @@ if (!usingNativeCrypto || !caps.persistentStorage) {
     el.style.display = "";
   }
 }
+
+// Test hook (E2E asserts audio actually decodes/schedules — not just that
+// packets arrive). Carries no capability beyond what the UI already does.
+(globalThis as Record<string, unknown>)["__ndspDebug"] = {
+  audioFramesPlayed: () => audioPlayer?.framesPlayed ?? 0,
+};
 
 prefill();
 // QR deep link: auto-connect when both host and pin arrived via URL.

@@ -37,8 +37,14 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// First contact: run the PIN-bound pairing handshake.
+    /// First contact, legacy scheme: PIN-bound HKDF pairing. Kept for
+    /// viewers that cannot do curve arithmetic outside their platform
+    /// crypto APIs (mobile apps); can be disabled host-side
+    /// (`allow_legacy_pairing = false`).
     Pair,
+    /// First contact, current scheme: SPAKE2 (PAKE) pairing — the recorded
+    /// transcript cannot be ground offline against the PIN.
+    PairSpake2,
     /// Returning device: prove possession of a previously issued trust token.
     /// The token itself is never sent; see `TokenProof`.
     Token { device_id: String },
@@ -68,6 +74,23 @@ pub enum Codec {
     Hevc,
     Av1,
 }
+
+/// Audio payload formats a viewer can play (JSON mirror of
+/// [`crate::media::AudioCodec`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioWireCodec {
+    #[default]
+    Opus,
+    /// Uncompressed s16le — for viewers without an Opus decoder
+    /// (web viewers on insecure origins have no WebCodecs).
+    Pcm,
+}
+
+/// Hard cap on a single clipboard payload (either direction).
+pub const CLIPBOARD_MAX_BYTES: usize = 256 * 1024;
+/// Raw bytes per file-transfer chunk (base64 on the wire).
+pub const FILE_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Input capabilities / modes a viewer may request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -99,10 +122,16 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// a *physical* key position. `key` is the layout-resolved
+    /// `KeyboardEvent.key` value ("a", "é", "Enter", …) when the viewer has
+    /// one; hosts prefer it for printable characters so a French viewer
+    /// typing on a US-layout host still produces the right glyphs.
     Key {
         code: String,
         pressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Touch {
         id: u32,
@@ -228,6 +257,34 @@ pub enum ControlMsg {
         sealed_token: Option<String>,
         error: Option<String>,
     },
+    /// SPAKE2 pairing, message 1 (client → server): the client's masked
+    /// share `pA` (base64, uncompressed SEC1). See `crypto::spake2`.
+    Spake2Start {
+        share: String,
+    },
+    /// SPAKE2 pairing, message 2 (server → client): the server's masked
+    /// share `pB` (base64, uncompressed SEC1).
+    Spake2Challenge {
+        share: String,
+    },
+    /// SPAKE2 pairing, message 3 (client → server): the client's
+    /// transcript confirmation MAC (base64). Proves the client knew the PIN.
+    Spake2Confirm {
+        mac: String,
+    },
+    /// SPAKE2 pairing, message 4 (server → client). On success `mac` is the
+    /// server's confirmation (mutual authentication — verify before trusting
+    /// anything!) and `sealed_token` carries the device trust token sealed
+    /// under the SPAKE2 token key.
+    Spake2Result {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mac: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealed_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Proof of trust-token possession, bound to this handshake's transcript:
     /// base64(SHA-256(token || connection_nonce || client_pubkey || server_pubkey)).
     /// Requires a preceding PairStart/PairChallenge ephemeral exchange (which
@@ -306,6 +363,65 @@ pub enum ControlMsg {
         y: f32,
         visible: bool,
     },
+    /// Viewer enables/disables the audio stream for itself (off by default;
+    /// the host only streams when the device's audio permission also allows
+    /// it). `codec` picks the payload format the viewer can play.
+    SetAudio {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec: Option<AudioWireCodec>,
+    },
+    /// Server informs the viewer its audio permission changed (panel toggle).
+    AudioGrant {
+        allowed: bool,
+    },
+    /// Clipboard text, either direction. Only honored when the device's
+    /// clipboard permission is granted (deny by default) and the payload is
+    /// within [`CLIPBOARD_MAX_BYTES`].
+    Clipboard {
+        text: String,
+    },
+    /// Server informs the viewer its clipboard permission changed.
+    ClipboardGrant {
+        allowed: bool,
+    },
+    /// Viewer offers a file to the host. The host queues it for an explicit
+    /// per-transfer accept in the control panel — nothing is written before
+    /// the user says yes. `sha256` is hex of the file content.
+    FileOffer {
+        id: String,
+        name: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    /// Host's answer to a `FileOffer` (after the panel decision).
+    FileAnswer {
+        id: String,
+        accept: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// One file chunk (base64), ≤ [`FILE_CHUNK_BYTES`] raw bytes, sent in
+    /// order after an accepting `FileAnswer`.
+    FileChunk {
+        id: String,
+        seq: u32,
+        data: String,
+    },
+    /// Sender finished; receiver verifies size + sha256 and answers with
+    /// `FileDone` (ok) or `FileAbort`.
+    FileEnd {
+        id: String,
+    },
+    /// Receiver confirms a completed, verified transfer.
+    FileDone {
+        id: String,
+    },
+    /// Either side cancels a transfer.
+    FileAbort {
+        id: String,
+        reason: String,
+    },
     /// Graceful shutdown/teardown with reason.
     Bye {
         reason: String,
@@ -338,6 +454,7 @@ mod tests {
                 InputEvent::Key {
                     code: "KeyA".into(),
                     pressed: true,
+                    key: Some("a".into()),
                 },
                 InputEvent::Touch {
                     id: 1,
@@ -356,6 +473,90 @@ mod tests {
     fn tagged_format_is_stable() {
         let json = ControlMsg::Ping { t0_us: 42 }.to_json().unwrap();
         assert_eq!(json, r#"{"type":"ping","t0_us":42}"#);
+    }
+
+    #[test]
+    fn key_event_without_layout_key_still_parses() {
+        // v0.2 viewers send Key without the `key` field — must keep working.
+        let msg = ControlMsg::from_json(
+            r#"{"type":"input","events":[{"kind":"key","code":"KeyQ","pressed":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::Input {
+                events: vec![InputEvent::Key {
+                    code: "KeyQ".into(),
+                    pressed: true,
+                    key: None,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn spake2_and_feature_messages_roundtrip() {
+        for msg in [
+            ControlMsg::Spake2Start {
+                share: "c0ffee".into(),
+            },
+            ControlMsg::Spake2Challenge {
+                share: "beef".into(),
+            },
+            ControlMsg::Spake2Confirm { mac: "abcd".into() },
+            ControlMsg::Spake2Result {
+                ok: true,
+                mac: Some("m".into()),
+                sealed_token: Some("t".into()),
+                error: None,
+            },
+            ControlMsg::SetAudio {
+                enabled: true,
+                codec: Some(AudioWireCodec::Pcm),
+            },
+            ControlMsg::AudioGrant { allowed: false },
+            ControlMsg::Clipboard {
+                text: "hello".into(),
+            },
+            ControlMsg::ClipboardGrant { allowed: true },
+            ControlMsg::FileOffer {
+                id: "x1".into(),
+                name: "report.pdf".into(),
+                size_bytes: 1024,
+                sha256: "00".repeat(32),
+            },
+            ControlMsg::FileAnswer {
+                id: "x1".into(),
+                accept: false,
+                reason: Some("declined".into()),
+            },
+            ControlMsg::FileChunk {
+                id: "x1".into(),
+                seq: 3,
+                data: "QUJD".into(),
+            },
+            ControlMsg::FileEnd { id: "x1".into() },
+            ControlMsg::FileDone { id: "x1".into() },
+            ControlMsg::FileAbort {
+                id: "x1".into(),
+                reason: "cancelled".into(),
+            },
+        ] {
+            let json = msg.to_json().unwrap();
+            assert_eq!(ControlMsg::from_json(&json).unwrap(), msg, "{json}");
+        }
+    }
+
+    #[test]
+    fn auth_method_wire_tags_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::PairSpake2).unwrap(),
+            r#"{"method":"pair_spake2"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthMethod::Pair).unwrap(),
+            r#"{"method":"pair"}"#
+        );
     }
 
     #[test]

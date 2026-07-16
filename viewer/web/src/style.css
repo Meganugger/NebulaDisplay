@@ -101,6 +101,29 @@ code, .mono { font-family: var(--mono); }
   box-shadow: 0 6px 24px rgba(0,0,0,0.4); font-size: 0.88rem;
   display: none;
 }
+#toast button { margin-left: 0.6rem; padding: 0.2rem 0.6rem; font-size: 0.8rem; }
+#volume { width: 70px; accent-color: var(--accent, #7c5cff); display: none; }
+#audio-btn.on { background: color-mix(in srgb, var(--ok) 25%, transparent); }
+#drop-overlay {
+  position: absolute; inset: 0; display: none; place-items: center;
+  background: rgba(20, 24, 32, 0.82); backdrop-filter: blur(4px);
+  font-size: 1.3rem; text-align: center; pointer-events: none; z-index: 30;
+}
+#drop-overlay.visible { display: grid; }
+#drop-overlay span { font-size: 0.85rem; color: var(--fg-dim); }
+#transfer-status {
+  position: absolute; top: 3.2rem; left: 50%; transform: translateX(-50%);
+  background: var(--bg-elev); padding: 0.5rem 0.9rem; border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.4); font-size: 0.82rem; display: none;
+  max-width: min(90vw, 30rem);
+}
+#pending-transfers .xfer {
+  display: flex; align-items: center; gap: 0.7rem; padding: 0.5rem 0;
+  border-bottom: 1px solid var(--bg-elev2); font-size: 0.86rem;
+}
+#pending-transfers .xfer .meta { flex: 1; min-width: 0; }
+#pending-transfers .xfer .meta b { word-break: break-all; }
+#pending-transfers .xfer .meta small { color: var(--fg-dim); display: block; }
 
 /* ---- panel ---- */
 .panel-wrap { max-width: 64rem; margin: 0 auto; padding: 2rem 1.2rem 4rem; }

@@ -61,6 +61,7 @@ export type ControlMsg = { type: string } & Record<string, unknown>;
 
 export const CHANNEL_CONTROL = 1;
 export const CHANNEL_VIDEO = 2;
+export const CHANNEL_AUDIO = 3;
 
 export const DIR_SERVER_TO_CLIENT = 0;
 export const DIR_CLIENT_TO_SERVER = 1;
@@ -76,6 +77,35 @@ export interface VideoFrame {
 }
 
 const CODEC_IDS: Codec[] = ["jpeg", "h264", "hevc", "av1"];
+
+export type AudioCodec = "opus" | "pcm_s16le";
+const AUDIO_CODEC_IDS: AudioCodec[] = ["opus", "pcm_s16le"];
+
+export interface AudioFrame {
+  codec: AudioCodec;
+  channels: number;
+  seq: number;
+  timestampUs: bigint;
+  sampleRate: number;
+  payload: Uint8Array;
+}
+
+/** Audio framing (channel 3):
+ *  [codec u8][channels u8][seq u32 BE][ts_us u64 BE][sample_rate u32 BE][payload…] */
+export function parseAudioFrame(buf: Uint8Array): AudioFrame {
+  if (buf.length < 18) throw new Error("audio frame header truncated");
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const codec = AUDIO_CODEC_IDS[buf[0]!];
+  if (!codec) throw new Error(`unknown audio codec id ${buf[0]}`);
+  return {
+    codec,
+    channels: buf[1]!,
+    seq: dv.getUint32(2),
+    timestampUs: readU64BE(dv, 6),
+    sampleRate: dv.getUint32(14),
+    payload: buf.subarray(18),
+  };
+}
 
 export function parseVideoFrame(buf: Uint8Array): VideoFrame {
   if (buf.length < 18) throw new Error("video frame header truncated");

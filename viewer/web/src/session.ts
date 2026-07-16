@@ -4,7 +4,6 @@ import { caps, probeH264Decode } from "./caps";
 import {
   b64decode,
   b64encode,
-  CONFIRM_CONTEXT,
   agree,
   clearCredentials,
   deviceId,
@@ -12,13 +11,14 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
   saveCredentials,
-  seal,
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { macEqual, Spake2Client } from "./spake2";
 import {
+  AudioFrame,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
   ControlMsg,
@@ -30,6 +30,7 @@ import {
   Sealer,
   VideoFrame,
   WS_PATH,
+  parseAudioFrame,
   parseVideoFrame,
   td,
   te,
@@ -37,6 +38,7 @@ import {
 
 export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
+  onAudio(frame: AudioFrame): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
 }
@@ -92,12 +94,14 @@ export class Session {
         device_id: deviceId(),
         name: clientName,
         platform: "web",
-        app_version: "0.2.0",
+        app_version: "0.5.0",
         // This viewer renders the host cursor from the dedicated cursor
         // channel (CursorShape/CursorPos) — never baked into video frames.
         features: ["cursor"],
       },
-      auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
+      auth: useToken
+        ? { method: "token", device_id: stored.deviceId }
+        : { method: "pair_spake2" },
       codecs: await supportedCodecs(),
     });
 
@@ -113,34 +117,41 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
-    const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
-    const challenge = await nextText();
-    if (challenge.type === "auth_err") throw new Error(String(challenge.error));
-    if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
-    const serverPub = b64decode(challenge.server_pubkey as string);
-    const salt = b64decode(challenge.salt as string);
-    const shared = await agree(keys, serverPub);
-    const sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
-
     let newlyPaired = false;
+    let sessionKeyRaw: Uint8Array;
     if (useToken && stored) {
+      // ---- token reconnect: ephemeral ECDH + transcript-bound proof ------
+      const keys = await generateHandshakeKeys();
+      send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
+      const serverPub = b64decode(challenge.server_pubkey as string);
+      const salt = b64decode(challenge.salt as string);
+      const shared = await agree(keys, serverPub);
+      sessionKeyRaw = await sessionKeyBytes(shared, salt, nonce);
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
-      const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
-      confirm.set(CONFIRM_CONTEXT, 0);
-      confirm.set(nonce, CONFIRM_CONTEXT.length);
-      const sealed = await seal(pairKey, confirm, new Uint8Array(0));
-      send({ type: "pair_confirm", sealed: b64encode(sealed) });
+      // ---- first contact: SPAKE2 (PAKE) pairing — a recorded transcript
+      // cannot be brute-forced against the PIN offline ---------------------
+      const pake = new Spake2Client(pin!, nonce);
+      send({ type: "spake2_start", share: b64encode(pake.share) });
+      const challenge = await nextText();
+      if (challenge.type === "auth_err") throw new Error(String(challenge.error));
+      if (challenge.type !== "spake2_challenge") throw protoErr("spake2_challenge", challenge);
+      const keys = pake.finish(b64decode(challenge.share as string));
+      send({ type: "spake2_confirm", mac: b64encode(keys.confirmClient) });
       const result = await nextText();
-      if (result.type !== "pair_result" || !result.ok) {
+      if (result.type !== "spake2_result" || !result.ok) {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
+      // Mutual authentication: the host must prove it knew the PIN too.
+      if (!macEqual(b64decode(result.mac as string), keys.confirmServer)) {
+        throw new Error("Host failed SPAKE2 confirmation (possible impostor) — aborting.");
+      }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        keys.tokenKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -149,6 +160,7 @@ export class Session {
         tokenB64: b64encode(token),
         hostFingerprint: server.fingerprint,
       });
+      sessionKeyRaw = keys.sessionKey;
       newlyPaired = true;
     }
 
@@ -187,6 +199,8 @@ export class Session {
           const { chan, plaintext } = await opener.open(data);
           if (chan === CHANNEL_VIDEO) {
             events.onVideo(parseVideoFrame(plaintext));
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio(parseAudioFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
           }

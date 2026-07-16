@@ -29,6 +29,18 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Accept the legacy PIN-bound-HKDF pairing (pre-SPAKE2 viewers:
+    /// current Android/iOS apps). Disable to require the PAKE handshake.
+    pub allow_legacy_pairing: bool,
+    /// Offer audio streaming (viewers still opt in per session, and the
+    /// panel can mute individual devices). `false` removes the capability
+    /// entirely — the capture loop never starts.
+    pub audio_enabled: bool,
+    /// Where accepted file transfers are stored. Default:
+    /// `<data_dir>/received`.
+    pub file_transfer_dir: Option<PathBuf>,
+    /// Hard cap on a single incoming file transfer, in MiB.
+    pub max_file_mb: u64,
 }
 
 impl Default for FileConfig {
@@ -40,6 +52,10 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            allow_legacy_pairing: true,
+            audio_enabled: true,
+            file_transfer_dir: None,
+            max_file_mb: 2048,
         }
     }
 }
@@ -87,6 +103,14 @@ impl Config {
             web_dir,
             file,
         })
+    }
+
+    /// Directory accepted file transfers are written to.
+    pub fn file_transfer_dir(&self) -> PathBuf {
+        self.file
+            .file_transfer_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("received"))
     }
 }
 

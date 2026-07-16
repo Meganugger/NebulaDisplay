@@ -22,12 +22,17 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 ## Cryptography (implemented, tested)
 
-* Handshake: ephemeral **ECDH P-256** per connection → **HKDF-SHA256** →
-  **AES-256-GCM** session key. Forward secrecy: recording traffic and later
-  stealing the trust store does not decrypt past sessions.
-* Pairing: the session is bound to a **single-use, TTL-limited PIN** via
-  `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`. The PIN never
-  crosses the wire; an active MITM without it cannot complete pairing.
+* Pairing (current): **SPAKE2 over P-256** (RFC-9382-style; see
+  `shared/protocol/src/spake2.rs`) bound to a **single-use, TTL-limited
+  PIN**. The PIN never crosses the wire, the recorded transcript is **not
+  offline-grindable**, and authentication is **mutual** (the host proves PIN
+  knowledge back to the client before any token is trusted). Fresh
+  ephemerals per connection → forward secrecy.
+* Pairing (legacy, mobile apps): PIN-bound HKDF over ephemeral ECDH.
+  Disableable host-side (`allow_legacy_pairing = false`); see limitation 1.
+* Reconnect handshake: ephemeral **ECDH P-256** per connection →
+  **HKDF-SHA256** → **AES-256-GCM** session key. Forward secrecy: recording
+  traffic and later stealing the trust store does not decrypt past sessions.
 * Reconnect: 256-bit per-device token; proof = SHA-256 over token + nonce +
   both ephemeral keys (transcript binding defeats key-substitution MITM).
   Clients pin the host fingerprint and refuse proofs to a changed host.
@@ -36,19 +41,30 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 ### Known cryptographic limitations (honest)
 
-1. **Offline PIN grinding**: a passive attacker who records a *pairing*
-   exchange can brute-force the 6-digit PIN offline against `pair_confirm`.
-   Mitigations today: PINs are single-use, expire in 5 min, rotate on every
-   failure, and pairing is rare. Fix planned: **PAKE (SPAKE2/CPace)** so the
-   transcript is un-grindable (ROADMAP P1).
-2. **No TLS layer**: HTTP serving the web viewer JS is plaintext on the LAN —
-   an active LAN attacker could tamper the *viewer code* before crypto starts
-   (native viewers are immune). Documented trade-off; mitigations: QR/manual
-   fingerprint display, native clients, planned self-signed-cert + fingerprint
-   pinning option.
-3. Trust tokens are stored **raw** at rest (0600) on host and clients: proofs
-   are keyed hashes, so the verifier needs the key. Host compromise already
-   means screen compromise; still, an OS-keystore upgrade is planned.
+1. **Offline PIN grinding — fixed for SPAKE2 clients (v0.5)**: the web and
+   desktop viewers now pair with SPAKE2, whose transcript a passive recorder
+   cannot grind. The *legacy* scheme (still spoken by the current Android/
+   iOS apps) keeps the old caveat: a recorded legacy pairing exchange can be
+   brute-forced offline against the 6-digit PIN. Mitigations: PINs are
+   single-use, expire in 5 min, rotate on every failure, pairing is rare —
+   and hosts can refuse the legacy scheme entirely
+   (`allow_legacy_pairing = false`). Remaining work: SPAKE2 in the mobile
+   apps, then flip the default off.
+2. **TLS is opt-in, not default**: plain-HTTP serving of the web viewer JS
+   is tamperable by an active LAN attacker before crypto starts (native
+   viewers are immune). v0.5 adds `--https`: a **persistent self-signed
+   certificate** (fingerprint in the panel/banner — compare once, pinned
+   thereafter) which also unlocks secure-context browser features
+   (WebCodecs, clipboard API) on LAN addresses. Plain HTTP stays the default
+   because self-signed warnings hurt first-run UX; hostile-LAN users should
+   turn `--https` on.
+3. Trust tokens at rest: on **Windows they are DPAPI-wrapped (v0.5)** —
+   another local account or an exfiltrated copy of the files cannot read
+   them (`host/service/src/keystore.rs`; also covers the identity key and
+   the TLS private key). On Unix they remain 0600 plaintext (no
+   universally-present keystore daemon). Proofs are keyed hashes, so the
+   verifier needs the key material; host compromise already means screen
+   compromise.
 
 ## Controls by threat
 
@@ -59,6 +75,9 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 | Stolen trust token file (client) | Token useless without matching device_id? No — token is the credential: **revoke from the panel**; tokens are per-device so revocation is surgical |
 | Rogue host at same IP | Client-side fingerprint pinning (tested) |
 | Input abuse | Input **denied by default** per device; grants are live-revocable; sessions enforce grant server-side on every event batch |
+| Clipboard theft/poisoning | Clipboard sync **denied by default** per device; 256 KiB cap both ways; host→viewer flow only polls the OS clipboard while a granted device is connected, and never ships pre-session clipboard content |
+| Covert listening | Audio is **per-viewer opt-in** (never streams unrequested); the panel shows a live "🔊 listening" indicator per device and can mute any device instantly; capture stops (device released) at zero listeners |
+| Malicious file drop | Every transfer needs an **explicit per-file accept in the panel**; filenames sanitized to one path component; size caps; sha256 verified; partial/failed transfers deleted; offers expire in 120 s |
 | Replay/reorder injection | Envelope counters + GCM |
 | Panel exposure | Panel binds 127.0.0.1 only; contains PIN/grants; never reachable from LAN |
 | Driver attack surface | Driver has no network code; validates geometry; ring is `Local\` namespace |
@@ -78,10 +97,14 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 * No telemetry, no crash uploads, no update phone-home. Nothing leaves the LAN
   unless the user configures it.
-* Audio capture is **off** and unimplemented until the WASAPI feature lands —
-  it will be opt-in per device with a visible indicator (ROADMAP).
-* Clipboard/file transfer: designed permission-gated, not yet implemented —
-  the protocol reserves message space; nothing is shared implicitly.
+* Audio capture (v0.5) is **off by default**: it starts only when a viewer
+  explicitly enables it *and* the panel permits that device, shows a live
+  per-device listening indicator, and the capture device is released the
+  moment the last listener stops.
+* Clipboard sync (v0.5) is **deny-by-default per device**, size-capped, and
+  never ships clipboard content that predates the session.
+* File drop (v0.5) writes nothing without an explicit per-transfer accept in
+  the panel. Nothing is shared implicitly.
 
 ## Reporting
 

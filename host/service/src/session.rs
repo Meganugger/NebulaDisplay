@@ -26,14 +26,18 @@
 //!   so a slow socket drops stale frames instead of queueing them.
 
 use axum::extract::ws::{Message, WebSocket};
+use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
-    messages::{ControlMsg, InputMode, Profile},
+    media::{AudioCodec, AudioFrame, VideoFrame},
+    messages::{AudioWireCodec, ControlMsg, InputMode, Profile, FILE_CHUNK_BYTES},
 };
+use sha2::Digest as _;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,8 +58,48 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// State shared between the session's tasks (atomics only — the single
 /// mutex-guarded item, the adaptive controller, is touched briefly and
 /// never across an await point).
+/// Per-session audio switchboard: the *viewer* opts in (`enabled`), the
+/// *panel* permits (`allowed`); packets flow only when both hold, and the
+/// global capture loop's listener count tracks that conjunction exactly.
+struct AudioCtl {
+    enabled: bool,
+    allowed: bool,
+    codec: AudioWireCodec,
+    /// Whether this session currently counts toward `state.audio_listeners`.
+    counted: bool,
+}
+
+/// One in-flight viewer→host file transfer (panel-accepted).
+struct ActiveTransfer {
+    id: String,
+    file: std::fs::File,
+    part_path: PathBuf,
+    final_name: String,
+    expected_size: u64,
+    expected_sha256: String,
+    hasher: sha2::Sha256,
+    received: u64,
+    next_seq: u32,
+}
+
+impl ActiveTransfer {
+    /// Abort cleanup: close + delete the partial file.
+    fn discard(self) {
+        drop(self.file);
+        let _ = std::fs::remove_file(&self.part_path);
+    }
+}
+
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
+    /// Panel indicator: this session is actively receiving audio.
+    audio_active: Arc<AtomicBool>,
+    audio: Mutex<AudioCtl>,
+    /// The panel-accepted transfer currently receiving chunks (max one).
+    transfer: Mutex<Option<ActiveTransfer>>,
+    /// An offer is pending a panel decision (rate-limits offer spam).
+    offer_pending: AtomicBool,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -101,6 +145,25 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// Recompute the audio conjunction and keep the global listener count +
+    /// panel indicator in sync. Returns the new active state.
+    fn sync_audio(&self, state: &AppState) -> bool {
+        let mut a = self.audio.lock().unwrap();
+        let active = a.enabled && a.allowed;
+        if active != a.counted {
+            if active {
+                state.audio_listener_add();
+            } else {
+                state.audio_listener_remove();
+            }
+            a.counted = active;
+            self.audio_active.store(active, Ordering::Relaxed);
+        }
+        active
+    }
+}
+
 fn mode_to_u8(m: InputMode) -> u32 {
     match m {
         InputMode::ViewOnly => 0,
@@ -133,8 +196,21 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
+    let audio_allowed_flag = Arc::new(AtomicBool::new(auth.audio_allowed));
+    let audio_active = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_active: audio_active.clone(),
+        audio: Mutex::new(AudioCtl {
+            enabled: false,
+            allowed: auth.audio_allowed,
+            codec: AudioWireCodec::Opus,
+            counted: false,
+        }),
+        transfer: Mutex::new(None),
+        offer_pending: AtomicBool::new(false),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -161,6 +237,9 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_allowed: audio_allowed_flag.clone(),
+        audio_active: audio_active.clone(),
         supports_cursor,
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
@@ -175,16 +254,22 @@ pub async fn run(
     // queued. (seq, frame) — seq lets the video task detect unconsumed slots.
     let (vid_tx, vid_rx) = watch::channel::<Option<(u64, Arc<VideoFrame>)>>(None);
     let consumed_seq = Arc::new(AtomicU64::new(0));
+    // Audio lane: short bounded queue. Audio must stay continuous (unlike
+    // video, stale packets are not overwritten) but a wedged socket drops
+    // rather than queues — the web jitter buffer conceals isolated gaps.
+    let (aud_tx, aud_rx) = mpsc::channel::<AudioFrame>(16);
 
     let writer = tokio::spawn(writer_task(
         ws_tx,
         sealer,
         ctl_rx,
+        aud_rx,
         vid_rx,
         shared.clone(),
         consumed_seq.clone(),
     ));
     let pump = tokio::spawn(incoming_pump(
+        state.clone(),
         ws_rx,
         opener,
         shared.clone(),
@@ -192,6 +277,7 @@ pub async fn run(
         input_sink,
         handle.clone(),
     ));
+    let audio = tokio::spawn(audio_task(state.clone(), shared.clone(), aud_tx));
     let video = tokio::spawn(video_task(
         state.clone(),
         encoder,
@@ -200,6 +286,9 @@ pub async fn run(
         vid_tx,
         consumed_seq,
     ));
+    // Host clipboard changes → granted clients (control channel).
+    let mut clipboard_rx = state.clipboard_tx.subscribe();
+    clipboard_rx.mark_unchanged();
 
     // ---- supervisor ----
     let mut host_stats_timer = tokio::time::interval(HOST_STATS_INTERVAL);
@@ -221,6 +310,40 @@ pub async fn run(
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
                 }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetAudioGrant(allowed) => {
+                    audio_allowed_flag.store(allowed, Ordering::Relaxed);
+                    shared.audio.lock().unwrap().allowed = allowed;
+                    shared.sync_audio(&state);
+                    if ctl_tx.send(ControlMsg::AudioGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::AnswerFileOffer { id, accept, name, size_bytes, sha256_hex } => {
+                    shared.offer_pending.store(false, Ordering::Relaxed);
+                    let msg = if accept {
+                        match open_transfer(&state, &id, &name, size_bytes, &sha256_hex) {
+                            Ok(t) => {
+                                *shared.transfer.lock().unwrap() = Some(t);
+                                info!(%id, %name, size_bytes, "file transfer accepted; receiving");
+                                ControlMsg::FileAnswer { id, accept: true, reason: None }
+                            }
+                            Err(e) => {
+                                warn!(%id, "cannot open transfer destination: {e:#}");
+                                ControlMsg::FileAnswer {
+                                    id,
+                                    accept: false,
+                                    reason: Some("host storage error".into()),
+                                }
+                            }
+                        }
+                    } else {
+                        info!(%id, "file transfer declined");
+                        ControlMsg::FileAnswer { id, accept: false, reason: Some("declined on the host".into()) }
+                    };
+                    if ctl_tx.send(msg).await.is_err() { break; }
+                }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
                     // Give the writer a moment to flush the Bye.
@@ -230,6 +353,17 @@ pub async fn run(
             },
 
             _ = &mut pump => break, // client went away / protocol violation
+
+            changed = clipboard_rx.changed() => {
+                if changed.is_err() { continue; }
+                if !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                let (seq, text) = {
+                    let borrowed = clipboard_rx.borrow_and_update();
+                    (borrowed.0, borrowed.1.clone())
+                };
+                if seq == 0 { continue; }
+                if ctl_tx.send(ControlMsg::Clipboard { text: (*text).clone() }).await.is_err() { break; }
+            }
 
             changed = cursor_rx.changed(), if supports_cursor => {
                 if changed.is_err() { continue; }
@@ -298,18 +432,35 @@ pub async fn run(
     }
 
     state.unregister_client(client_id);
+    state.transfers.drop_for_device(&auth.client.device_id);
+    if let Some(t) = shared.transfer.lock().unwrap().take() {
+        warn!(id = %t.id, "session ended mid-transfer; discarding partial file");
+        t.discard();
+    }
+    {
+        // Release our audio listener slot if we held one.
+        let mut a = shared.audio.lock().unwrap();
+        a.enabled = false;
+        if a.counted {
+            state.audio_listener_remove();
+            a.counted = false;
+        }
+    }
     pump.abort();
     video.abort();
+    audio.abort();
     drop(ctl_tx); // writer exits once both inputs are gone
     writer.abort();
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts video; video is latest-only.
+/// Owns the socket sink. Control preempts audio preempts video; video is
+/// latest-only, audio is a short FIFO (continuity matters), control is rare.
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
+    mut aud_rx: mpsc::Receiver<AudioFrame>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
@@ -322,6 +473,13 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+            }
+
+            frame = aud_rx.recv() => {
+                let Some(af) = frame else { break };
+                let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &af.payload]);
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
 
@@ -528,12 +686,86 @@ async fn video_task(
     }
 }
 
+/// Forwards global audio blocks to this client while its audio is active,
+/// in the payload format the client asked for.
+async fn audio_task(state: Arc<AppState>, shared: Arc<Shared>, aud_tx: mpsc::Sender<AudioFrame>) {
+    let mut rx = state.audio_tx.subscribe();
+    loop {
+        let block = match rx.recv().await {
+            Ok(b) => b,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                debug!(missed = n, "audio subscriber lagged; skipping");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let codec = {
+            let a = shared.audio.lock().unwrap();
+            if !(a.enabled && a.allowed) {
+                continue;
+            }
+            a.codec
+        };
+        let (codec, payload) = match codec {
+            AudioWireCodec::Opus => (AudioCodec::Opus, block.opus.clone()),
+            AudioWireCodec::Pcm => {
+                let mut bytes = Vec::with_capacity(block.pcm.len() * 2);
+                for s in &block.pcm {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                (AudioCodec::PcmS16le, bytes)
+            }
+        };
+        let af = AudioFrame {
+            codec,
+            channels: crate::audio::CHANNELS,
+            seq: block.seq,
+            timestamp_us: block.timestamp_us,
+            sample_rate: crate::audio::SAMPLE_RATE,
+            payload,
+        };
+        // Full lane = wedged socket; drop (the jitter buffer conceals it).
+        if let Err(mpsc::error::TrySendError::Closed(_)) = aud_tx.try_send(af) {
+            return;
+        }
+    }
+}
+
+/// Create the `.part` file for a panel-accepted transfer.
+fn open_transfer(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    size_bytes: u64,
+    sha256_hex: &str,
+) -> anyhow::Result<ActiveTransfer> {
+    let dir = state.cfg.file_transfer_dir();
+    std::fs::create_dir_all(&dir)?;
+    let part_path = dir.join(format!(".{}.part", id));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part_path)?;
+    Ok(ActiveTransfer {
+        id: id.to_string(),
+        file,
+        part_path,
+        final_name: name.to_string(),
+        expected_size: size_bytes,
+        expected_sha256: sha256_hex.to_ascii_lowercase(),
+        hasher: sha2::Sha256::new(),
+        received: 0,
+        next_seq: 0,
+    })
+}
+
 /// Reads, decrypts and reacts to incoming envelopes.
 ///
 /// Latency-critical handling happens *right here* — input events go straight
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
 async fn incoming_pump(
+    state: Arc<AppState>,
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
     shared: Arc<Shared>,
@@ -591,6 +823,166 @@ async fn incoming_pump(
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
                         }
+                        ControlMsg::SetAudio { enabled, codec } => {
+                            let allowed = {
+                                let mut a = shared.audio.lock().unwrap();
+                                a.enabled = enabled && state.cfg.file.audio_enabled;
+                                if let Some(c) = codec {
+                                    a.codec = c;
+                                }
+                                a.allowed
+                            };
+                            let active = shared.sync_audio(&state);
+                            debug!(enabled, ?codec, active, "viewer audio toggle");
+                            if enabled && !allowed {
+                                let _ = ctl_tx.try_send(ControlMsg::AudioGrant { allowed: false });
+                            }
+                            if enabled && !state.cfg.file.audio_enabled {
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "audio_disabled".into(),
+                                    message: "audio is disabled on this host".into(),
+                                });
+                            }
+                        }
+                        ControlMsg::Clipboard { text } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard payload (no grant)");
+                                continue;
+                            }
+                            let clipboard = state.clipboard.clone();
+                            let sync = state.clipboard_sync.clone();
+                            // arboard may block briefly (X11 owners etc.).
+                            let applied = tokio::task::spawn_blocking(move || {
+                                sync.apply_from_viewer(clipboard.as_ref(), &text)
+                            })
+                            .await;
+                            match applied {
+                                // Metadata only — clipboard *content* never
+                                // hits the logs.
+                                Ok(Ok(true)) => debug!("applied viewer clipboard"),
+                                Ok(Ok(false)) => {
+                                    let _ = ctl_tx.try_send(ControlMsg::Error {
+                                        code: "clipboard_too_large".into(),
+                                        message: "clipboard payload exceeds the size cap".into(),
+                                    });
+                                }
+                                Ok(Err(e)) => warn!("host clipboard write failed: {e:#}"),
+                                Err(e) => warn!("clipboard task join error: {e}"),
+                            }
+                        }
+                        ControlMsg::FileOffer {
+                            id,
+                            name,
+                            size_bytes,
+                            sha256,
+                        } => {
+                            let deny = |reason: &str| ControlMsg::FileAnswer {
+                                id: id.clone(),
+                                accept: false,
+                                reason: Some(reason.into()),
+                            };
+                            let max = state.cfg.file.max_file_mb.saturating_mul(1024 * 1024);
+                            let sane_id = !id.is_empty()
+                                && id.len() <= 64
+                                && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+                            let sane_hash =
+                                sha256.len() == 64 && sha256.chars().all(|c| c.is_ascii_hexdigit());
+                            let msg = if !sane_id || !sane_hash {
+                                Some(deny("malformed offer"))
+                            } else if size_bytes == 0 || size_bytes > max {
+                                Some(deny("file exceeds the host's size limit"))
+                            } else if shared.transfer.lock().unwrap().is_some()
+                                || shared.offer_pending.load(Ordering::Relaxed)
+                            {
+                                Some(deny("another transfer is already in progress"))
+                            } else {
+                                let clean = crate::transfers::sanitize_filename(&name);
+                                let registered =
+                                    state.transfers.register(crate::transfers::PendingOffer {
+                                        id: id.clone(),
+                                        device_id: handle.device_id.clone(),
+                                        device_name: handle.name.clone(),
+                                        name: clean,
+                                        size_bytes,
+                                        sha256_hex: sha256.to_ascii_lowercase(),
+                                        offered_at: Instant::now(),
+                                        offered_unix: crate::transfers::now_unix(),
+                                        session: handle.commands.clone(),
+                                    });
+                                if registered {
+                                    shared.offer_pending.store(true, Ordering::Relaxed);
+                                    None // wait for the panel decision
+                                } else {
+                                    Some(deny("duplicate offer id"))
+                                }
+                            };
+                            if let Some(msg) = msg {
+                                if ctl_tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        ControlMsg::FileChunk { id, seq, data } => {
+                            // Scope the lock tightly: the guard must be gone
+                            // before any await (Send-ness of the future).
+                            let abort: Option<String> = {
+                                let mut guard = shared.transfer.lock().unwrap();
+                                let abort = match guard.as_mut() {
+                                    Some(t) if t.id == id => apply_chunk(t, seq, &data).err(),
+                                    _ => Some("no such transfer".to_string()),
+                                };
+                                if abort.is_some() {
+                                    if let Some(t) = guard.take() {
+                                        t.discard();
+                                    }
+                                }
+                                abort
+                            };
+                            if let Some(reason) = abort {
+                                warn!(%id, %reason, "file transfer aborted");
+                                let _ = ctl_tx.send(ControlMsg::FileAbort { id, reason }).await;
+                            }
+                        }
+                        ControlMsg::FileEnd { id } => {
+                            let taken = {
+                                let mut guard = shared.transfer.lock().unwrap();
+                                match guard.as_ref() {
+                                    Some(t) if t.id == id => guard.take(),
+                                    _ => None,
+                                }
+                            };
+                            let Some(t) = taken else {
+                                let _ = ctl_tx
+                                    .send(ControlMsg::FileAbort {
+                                        id,
+                                        reason: "no such transfer".into(),
+                                    })
+                                    .await;
+                                continue;
+                            };
+                            let msg = match finalize_transfer(&state, t) {
+                                Ok(path) => {
+                                    info!(%id, path = %path.display(), "file transfer complete");
+                                    ControlMsg::FileDone { id }
+                                }
+                                Err(reason) => {
+                                    warn!(%id, %reason, "file transfer failed verification");
+                                    ControlMsg::FileAbort { id, reason }
+                                }
+                            };
+                            if ctl_tx.send(msg).await.is_err() {
+                                return;
+                            }
+                        }
+                        ControlMsg::FileAbort { id, reason } => {
+                            let mut guard = shared.transfer.lock().unwrap();
+                            if guard.as_ref().is_some_and(|t| t.id == id) {
+                                info!(%id, %reason, "viewer cancelled file transfer");
+                                if let Some(t) = guard.take() {
+                                    t.discard();
+                                }
+                            }
+                        }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");
                             return;
@@ -611,6 +1003,63 @@ async fn incoming_pump(
                 return;
             }
             _ => {}
+        }
+    }
+}
+
+/// Validate + append one chunk to an active transfer. `Err(reason)` aborts.
+fn apply_chunk(t: &mut ActiveTransfer, seq: u32, data_b64: &str) -> Result<(), String> {
+    if seq != t.next_seq {
+        return Err(format!(
+            "out-of-order chunk (expected {}, got {seq})",
+            t.next_seq
+        ));
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|_| "bad chunk encoding".to_string())?;
+    if data.is_empty() || data.len() > FILE_CHUNK_BYTES {
+        return Err("chunk size out of bounds".to_string());
+    }
+    if t.received + data.len() as u64 > t.expected_size {
+        return Err("more data than offered".to_string());
+    }
+    t.file
+        .write_all(&data)
+        .map_err(|e| format!("write failed: {e}"))?;
+    t.hasher.update(&data);
+    t.received += data.len() as u64;
+    t.next_seq += 1;
+    Ok(())
+}
+
+/// Verify a finished transfer and move it to its final destination.
+fn finalize_transfer(state: &AppState, mut t: ActiveTransfer) -> Result<PathBuf, String> {
+    if t.received != t.expected_size {
+        let r = format!(
+            "size mismatch ({} of {} bytes)",
+            t.received, t.expected_size
+        );
+        t.discard();
+        return Err(r);
+    }
+    let digest = hex::encode(std::mem::take(&mut t.hasher).finalize());
+    if digest != t.expected_sha256 {
+        t.discard();
+        return Err("sha256 mismatch — file corrupted in transit".to_string());
+    }
+    if let Err(e) = t.file.flush().and_then(|_| t.file.sync_all()) {
+        let r = format!("flush failed: {e}");
+        t.discard();
+        return Err(r);
+    }
+    let dest = crate::transfers::unique_destination(&state.cfg.file_transfer_dir(), &t.final_name);
+    drop(t.file);
+    match std::fs::rename(&t.part_path, &dest) {
+        Ok(()) => Ok(dest),
+        Err(e) => {
+            let _ = std::fs::remove_file(&t.part_path);
+            Err(format!("rename failed: {e}"))
         }
     }
 }

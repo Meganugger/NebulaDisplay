@@ -2,17 +2,22 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
 pub mod input;
+pub mod keystore;
 pub mod pairing;
 pub mod panel;
 pub mod pin;
 pub mod server;
 pub mod session;
 pub mod state;
+pub mod tls;
+pub mod transfers;
 pub mod trust;
 pub mod util;
 
@@ -28,6 +33,8 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Extra file-config overrides (legacy-pairing switch, transfer caps…).
+    pub file: FileConfig,
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,16 +55,22 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
-                ..Default::default()
+                ..opts.file
             },
         };
-        let state = Arc::new(AppState::new(cfg).await?);
+        let state = Arc::new(
+            AppState::new_with_clipboard(cfg, Arc::new(clipboard::InMemoryClipboard::new()))
+                .await?,
+        );
 
         let source = capture::create_source(true, opts.capture.0, opts.capture.1, 0);
         let cap_state = state.clone();
         let cap = tokio::spawn(async move {
             capture::run_capture_loop(cap_state, source).await;
         });
+        // Audio (test tone) + clipboard watcher — same wiring as the binary.
+        let audio = tokio::spawn(audio::run_audio_loop(state.clone(), true));
+        let clip = tokio::spawn(clipboard::run_clipboard_watcher(state.clone()));
 
         // Bind explicitly so we know the ephemeral port before returning.
         let listener =
@@ -75,7 +88,7 @@ impl EmbeddedHost {
         Ok(Self {
             state,
             port,
-            tasks: vec![cap, srv],
+            tasks: vec![cap, srv, audio, clip],
         })
     }
 

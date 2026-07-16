@@ -13,7 +13,7 @@ import { p256 } from "@noble/curves/nist.js";
 import { hkdf as nobleHkdf } from "@noble/hashes/hkdf.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
-import { caps, randomBytes } from "./caps";
+import { caps } from "./caps";
 
 /** True when the native WebCrypto backend is in use. */
 export const usingNativeCrypto: boolean = caps.subtle;
@@ -90,6 +90,13 @@ export async function hkdfSha256(
   return nobleHkdf(nobleSha256, ikm, salt, info, 32);
 }
 
+/** Incremental SHA-256 for large inputs (file transfers hash gigabytes —
+ *  WebCrypto digest() would need the whole file in memory). */
+export function sha256Incremental(): { update(d: Uint8Array): void; digest(): Uint8Array } {
+  const h = nobleSha256.create();
+  return { update: (d) => void h.update(d), digest: () => h.digest() };
+}
+
 export async function sha256(data: Uint8Array): Promise<Uint8Array> {
   if (usingNativeCrypto) {
     return new Uint8Array(await crypto.subtle.digest("SHA-256", data as BufferSource));
@@ -137,7 +144,3 @@ export async function importAesGcmKey(raw: Uint8Array): Promise<AesGcmKey> {
   };
 }
 
-/** Random 96-bit AES-GCM nonce. */
-export function randomNonce(): Uint8Array {
-  return randomBytes(12);
-}
