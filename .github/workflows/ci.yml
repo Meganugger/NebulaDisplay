@@ -19,7 +19,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: cargo fmt --all --check
+        run: |
+          rustfmt --version
+          if ! cargo fmt --all --check > /tmp/fmt.out 2>&1; then
+            head -c 4000 /tmp/fmt.out | while IFS= read -r l; do echo "::warning title=fmt::$l"; done
+            exit 1
+          fi
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (unit + protocol + e2e over real sockets)

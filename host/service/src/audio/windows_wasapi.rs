@@ -130,7 +130,7 @@ impl WasapiLoopback {
         out: &mut Vec<[f32; 2]>,
     ) {
         if silent {
-            out.extend(std::iter::repeat([0.0f32; 2]).take(frames));
+            out.extend(std::iter::repeat_n([0.0f32; 2], frames));
             return;
         }
         let ch = self.fmt.channels;
@@ -219,7 +219,8 @@ impl AudioSource for WasapiLoopback {
                 // gently and emit silence keepalive after ~40 ms of nothing
                 // so the Opus stream (and viewer clocks) keep flowing.
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                stereo.extend(std::iter::repeat([0.0f32; 2]).take(
+                stereo.extend(std::iter::repeat_n(
+                    [0.0f32; 2],
                     (self.fmt.sample_rate as usize) / 100, // 10 ms of silence
                 ));
                 break;
