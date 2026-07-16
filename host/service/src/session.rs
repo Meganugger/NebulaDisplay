@@ -274,7 +274,7 @@ pub async fn run(
         opener,
         shared.clone(),
         ctl_tx.clone(),
-        input_sink,
+        input_sink.clone(),
         handle.clone(),
     ));
     let audio = tokio::spawn(audio_task(state.clone(), shared.clone(), aud_tx));
@@ -432,6 +432,8 @@ pub async fn run(
     }
 
     state.unregister_client(client_id);
+    // Never leave the host mid-gesture: cancel held touch contacts / drags.
+    input_sink.release();
     state.transfers.drop_for_device(&auth.client.device_id);
     if let Some(t) = shared.transfer.lock().unwrap().take() {
         warn!(id = %t.id, "session ended mid-transfer; discarding partial file");
