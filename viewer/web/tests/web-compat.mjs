@@ -91,9 +91,11 @@ console.log(`host up, pin=${pin}`);
 // ---- 1. pair with PIN using the real web session code ----------------------
 let frames = [];
 let controls = [];
+let audioFrames = [];
 let closed = null;
 const events = {
   onVideo: (f) => frames.push(f),
+  onAudio: (f) => audioFrames.push(f),
   onControl: (m) => controls.push(m),
   onClose: (r) => (closed = r),
 };
@@ -120,6 +122,26 @@ const pong = controls.find((c) => c.type === "pong");
 if (!pong || pong.t0_us !== 424242) fail("no matching pong");
 console.log("encrypted ping/pong OK");
 if (new Set(frames.map((f) => f.seq)).size !== frames.length) fail("duplicate seq");
+
+// ---- 1b. audio channel: opt in (PCM — decodable without WebCodecs), verify
+// framing, then opt out and verify the stream stops -------------------------
+await s1.send({ type: "set_audio", enabled: true, codec: "pcm" });
+for (let i = 0; i < 100 && audioFrames.length < 10; i++) await sleep(100);
+if (audioFrames.length < 10) fail(`only ${audioFrames.length} audio frames received`);
+const a0 = audioFrames[0];
+if (a0.codec !== "pcm_s16le") fail(`unexpected audio codec ${a0.codec}`);
+if (a0.sampleRate !== 48000 || a0.channels !== 2) fail("audio format contract violated");
+if (a0.payload.length !== 480 * 2 * 2) fail(`bad PCM block size ${a0.payload.length}`);
+if (!audioFrames.slice(0, 10).every((f, i, arr) => i === 0 || f.seq > arr[i - 1].seq))
+  fail("audio seq must increase");
+// The test tone must be non-silent.
+if (!audioFrames.some((f) => f.payload.some((b) => b !== 0))) fail("audio is all silence");
+await s1.send({ type: "set_audio", enabled: false });
+await sleep(400);
+const countAfterOff = audioFrames.length;
+await sleep(500);
+if (audioFrames.length > countAfterOff + 2) fail("audio kept flowing after disable");
+console.log(`audio channel OK (${countAfterOff} PCM frames, off-switch works)`);
 
 s1.close();
 await sleep(300);

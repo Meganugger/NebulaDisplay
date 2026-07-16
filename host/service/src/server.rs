@@ -30,13 +30,8 @@ pub async fn run(state: Arc<AppState>, bind: IpAddr, port: u16) -> anyhow::Resul
     serve_on(state, listener).await
 }
 
-/// Serve on an already-bound listener (embedded/test mode uses ephemeral ports).
-pub async fn serve_on(
-    state: Arc<AppState>,
-    listener: tokio::net::TcpListener,
-) -> anyhow::Result<()> {
-    let local = listener.local_addr()?;
-    state.set_serving_port(local.port());
+/// Build the viewer router (shared by the plaintext and TLS front ends).
+fn build_app(state: Arc<AppState>) -> Router {
     let input_sink: Arc<dyn crate::input::InputSink> = Arc::from(create_sink(state.clone()));
 
     let mut app = Router::new()
@@ -54,7 +49,17 @@ pub async fn serve_on(
         }
     }
 
-    let app = app.with_state((state, input_sink));
+    app.with_state((state, input_sink))
+}
+
+/// Serve on an already-bound listener (embedded/test mode uses ephemeral ports).
+pub async fn serve_on(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
+    let local = listener.local_addr()?;
+    state.set_serving_port(local.port());
+    let app = build_app(state);
     info!("viewer endpoint listening on {local}");
     // TCP_NODELAY: Nagle would coalesce small control/video writes with up
     // to ~40 ms of delayed-ACK interaction — poison for input echo latency.
@@ -70,6 +75,84 @@ pub async fn serve_on(
     )
     .await?;
     Ok(())
+}
+
+/// Serve the same app over TLS (`--https`) with the persisted self-signed
+/// certificate (see `crate::tls`). Enables secure-context browser features
+/// (WebCodecs H.264/Opus, WebCrypto, clipboard API) on LAN addresses and
+/// gives the served viewer code integrity via fingerprint pinning.
+pub async fn run_tls(
+    state: Arc<AppState>,
+    bind: IpAddr,
+    port: u16,
+    material: &crate::tls::TlsMaterial,
+) -> anyhow::Result<()> {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::ServerConfig;
+
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut material.cert_pem.as_bytes()).collect::<Result<_, _>>()?;
+    anyhow::ensure!(!certs.is_empty(), "no certificate in tls-cert.pem");
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut material.key_pem.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("no private key in tls-key.pem"))?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()]; // WS upgrade needs 1.1
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind, port)).await?;
+    let local = listener.local_addr()?;
+    state.set_serving_port(local.port());
+    let app = build_app(state);
+    info!("viewer endpoint listening on {local} (TLS)");
+
+    loop {
+        let (tcp, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                debug!("tcp accept error: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        // TCP_NODELAY: same latency rationale as the plaintext path.
+        if let Err(e) = tcp.set_nodelay(true) {
+            debug!("set_nodelay failed: {e}");
+        }
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        // Per-connection task: a stalled TLS handshake can't wedge accepts.
+        tokio::spawn(async move {
+            let tls = match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp)).await
+            {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => {
+                    debug!(%addr, "tls handshake failed: {e}");
+                    return;
+                }
+                Err(_) => {
+                    debug!(%addr, "tls handshake timed out");
+                    return;
+                }
+            };
+            // Provide the peer address exactly the way
+            // `into_make_service_with_connect_info` would — the ConnectInfo
+            // extractor falls back to this request extension.
+            let svc = app.layer(axum::Extension(axum::extract::ConnectInfo(addr)));
+            let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            if let Err(e) = builder
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), hyper_svc)
+                .await
+            {
+                debug!(%addr, "tls connection ended: {e}");
+            }
+        });
+    }
 }
 
 async fn no_viewer_page() -> impl IntoResponse {

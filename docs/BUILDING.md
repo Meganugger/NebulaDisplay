@@ -4,7 +4,7 @@
 
 | Component | Needs |
 |---|---|
-| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`) |
+| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`), CMake (libopus build — preinstalled on GitHub runners; `apt install cmake` / `brew install cmake` / VS Build Tools otherwise) |
 | Web viewer + panel | Node 22+ / npm |
 | Windows virtual display driver | Windows + VS2022 + WDK (see `host/windows-driver/README.md`) |
 | Android viewer | Android SDK 35, JDK 17 (see `viewer/android/README.md`) |

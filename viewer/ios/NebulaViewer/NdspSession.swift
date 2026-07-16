@@ -91,7 +91,7 @@ public final class NdspSession: NSObject {
             "type": "hello", "protocol": 1,
             "client": [
                 "device_id": deviceId, "name": deviceName,
-                "platform": "ios", "app_version": "0.2.0",
+                "platform": "ios", "app_version": "0.5.0",
             ],
             "auth": credentials != nil
                 ? ["method": "token", "device_id": deviceId]

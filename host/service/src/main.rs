@@ -34,6 +34,11 @@ pub struct Args {
     /// Force the synthetic test-pattern source even on Windows.
     #[arg(long)]
     pub test_pattern: bool,
+    /// Serve the viewer endpoint over HTTPS with a persistent self-signed
+    /// certificate (fingerprint shown in the panel). Enables secure-context
+    /// browser features (WebCodecs, clipboard API) on LAN addresses.
+    #[arg(long)]
+    pub https: bool,
     /// Capture size for the test pattern source, e.g. 1280x720.
     #[arg(long, default_value = "1280x720")]
     pub capture_size: String,
@@ -82,6 +87,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
 
+    // Audio pipeline (runs only while a permitted viewer has audio enabled).
+    if state.cfg.file.audio_enabled {
+        tokio::spawn(nebulad::audio::run_audio_loop(
+            state.clone(),
+            args.test_pattern,
+        ));
+    }
+
+    // Clipboard watcher (polls only while a granted device is connected).
+    tokio::spawn(nebulad::clipboard::run_clipboard_watcher(state.clone()));
+
     // UDP discovery responder.
     if args.discovery_port != 0 {
         tokio::spawn(discovery::run(state.clone(), args.discovery_port));
@@ -96,8 +112,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     });
 
-    // LAN-facing viewer endpoint (HTTP static + NDSP WebSocket).
-    let server = tokio::spawn(server::run(state.clone(), args.bind, args.port));
+    // LAN-facing viewer endpoint (HTTP(S) static + NDSP WebSocket).
+    let server = if args.https {
+        let material = nebulad::tls::load_or_create(&state.cfg.data_dir)?;
+        *state.tls_fingerprint.lock().unwrap() = Some(material.fingerprint.clone());
+        let srv_state = state.clone();
+        tokio::spawn(
+            async move { server::run_tls(srv_state, args.bind, args.port, &material).await },
+        )
+    } else {
+        tokio::spawn(server::run(state.clone(), args.bind, args.port))
+    };
 
     print_banner(&state, args.port, args.panel_port);
 
@@ -118,13 +143,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
 fn print_banner(state: &state::AppState, port: u16, panel_port: u16) {
     let pin = state.pins.current_pin();
     let ips = util::local_ips();
+    let scheme = state.viewer_scheme();
     println!("\n  NebulaDisplay host ready");
     println!("  ── Viewer URLs ─────────────────────────────");
     for ip in &ips {
-        println!("     http://{ip}:{port}/");
+        println!("     {scheme}://{ip}:{port}/");
     }
     if ips.is_empty() {
-        println!("     http://<this-machine-ip>:{port}/");
+        println!("     {scheme}://<this-machine-ip>:{port}/");
+    }
+    if let Some(fp) = state.tls_fingerprint.lock().unwrap().as_ref() {
+        println!("  ── TLS certificate fingerprint (SHA-256) ───");
+        println!("     {fp}");
+        println!("     (self-signed: browsers warn once — compare this string)");
     }
     println!("  ── Pairing PIN (single-use) ────────────────");
     println!("     {pin}");

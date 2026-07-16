@@ -43,11 +43,43 @@ harness (`viewer/web/tests/bench.mjs`).
    step is feeding rectangle hints into encoder rate control (needs the
    MF/NVENC encoders — OpenH264's ROI support is too limited to matter).
 
+Shipped in v0.5 (no longer roadmap items):
+
+* **PAKE pairing (was P1.4)** — SPAKE2 over P-256 with mutual confirmation
+  MACs (`shared/protocol/src/spake2.rs`), spoken by the web viewer (both
+  crypto backends, verified byte-compatible cross-stack in CI) and the
+  desktop viewer / client SDK. Legacy PIN-HKDF pairing remains for the
+  mobile apps and is host-disableable (`allow_legacy_pairing = false`).
+* **Audio (was P2.8)** — WASAPI loopback (Windows) / test tone (elsewhere)
+  → Opus 48 kHz stereo on channel 3, with a raw-PCM variant for web viewers
+  on insecure origins (no WebCodecs there). Per-viewer opt-in, per-device
+  panel mute, live "listening" indicator, capture device released at zero
+  listeners. Chromium E2E decodes real Opus in CI; WASAPI runtime needs a
+  Windows machine (same gate as DXGI — docs/TESTING.md).
+* **Clipboard sync (was P2.9)** — text, both directions, deny-by-default
+  per-device grant, 256 KiB cap, echo suppression, never ships pre-session
+  clipboard content. `arboard` backend with headless in-memory fallback.
+* **File drop (was P2.10)** — viewer→host with an explicit per-transfer
+  accept in the panel, sanitized filenames, size caps, in-order chunking,
+  sha256 verification, automatic cleanup of failed/denied transfers.
+* **Layout-aware keyboard (was P2.13)** — viewers send `code` + `key`; the
+  Windows sink injects the exact character (KEYEVENTF_UNICODE) when the
+  host layout would render a different glyph, and keeps scancode semantics
+  for shortcuts/named keys.
+* **Optional HTTPS (was P1.7)** — `--https` with a persistent self-signed
+  cert; fingerprint pinned in panel + banner; unlocks secure-context
+  browser features (WebCodecs H.264/Opus, clipboard API) on LAN addresses.
+* **At-rest key protection (was P1.6, Windows part)** — DPAPI wrapping of
+  the trust store, identity key, and TLS key with transparent migration
+  from plaintext stores. (Android already uses the platform Keystore; a
+  macOS/Linux keychain backend remains open below.)
+
 ## P1 — security & transports
 
-4. **PAKE pairing** (CPace or SPAKE2) replacing PIN-bound HKDF: removes the
-   offline-grinding caveat in SECURITY.md; wire format has room (new
-   `auth.method`).
+4. **SPAKE2 on Android/iOS**, then flip `allow_legacy_pairing` default to
+   off — removes the last offline-grinding caveat in SECURITY.md. Requires
+   EC group arithmetic on the platforms (BouncyCastle / swift-crypto HPKE
+   primitives or a small vetted implementation).
 5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
    video, streams for control; WebTransport for the web viewer where
    available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
@@ -57,33 +89,28 @@ harness (`viewer/web/tests/bench.mjs`).
    Kept at P1: real, but smaller than hardware encoders (P0.2). Browser
    WebTransport additionally requires TLS certs (serverCertificateHashes =
    Chromium-only today), so the web path stays WS regardless.*
-6. OS keystore for trust tokens (DPAPI / Keychain / Keystore).
-7. Optional HTTPS with self-signed cert + fingerprint pinning for the web
-   viewer's *code* integrity on hostile LANs.
+6. Keychain/keyring backends for trust tokens on macOS/Linux hosts (Windows
+   DPAPI + Android Keystore shipped).
 
 ## P2 — features
 
-8. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
-   mute/volume; off by default with a visible indicator.
-9. **Clipboard sync** with explicit per-device permission + per-event size
-   caps (protocol slot: control messages).
-10. **File drop** with explicit accept dialog per transfer.
 11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
     already parameterized by `MaxMonitorsSupported`), per-client monitor
     assignment, video-wall spanning mode.
 12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
     clean-room scope; use Windows.Gaming.Input injection when available).
-13. Layout-aware keyboard mapping (send both `code` and `key`, host picks).
 14. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
     (current fallback maps pen to mouse).
+15. Host→viewer file send (viewer→host shipped in v0.5); audio for the
+    desktop/mobile viewers (web shipped).
 
 ## P3 — platform breadth
 
-15. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
+16. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
     packaging docs.
-16. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
+17. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
     protocol and viewers are already host-OS-agnostic.
-17. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees
+18. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees
     ciphertext only), separate binary + explicit user action; never on by
     default.
 

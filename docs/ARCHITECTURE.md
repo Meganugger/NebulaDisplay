@@ -35,7 +35,7 @@ with its own protocol (NDSP), no cloud, no accounts, no telemetry.
 |---|---|---|
 | `shared/protocol` | Rust | NDSP v1: control messages, encrypted envelopes, media framing, handshake crypto, discovery beacons. The single wire-format authority. |
 | `shared/client` | Rust | Client SDK (pair / token reconnect / encrypted session) used by the desktop viewer and by integration tests against the real server. |
-| `host/service` (`nebulad`) | Rust | The host: capture sources, encoders, per-client sessions, adaptation, PIN/trust security, discovery, loopback panel. |
+| `host/service` (`nebulad`) | Rust | The host: capture sources, encoders, audio loop, per-client sessions, adaptation, PIN/trust security (SPAKE2 + legacy), clipboard bridge, file-transfer approvals, discovery, loopback panel, optional TLS front end, DPAPI keystore. |
 | `host/windows-driver` | C++ | IddCx UMDF driver: real virtual monitor, swap-chain processing, shared-memory frame ring. |
 | `host/tray-ui` | Rust | Windows notification-area companion (thin HTTP client of the panel API). |
 | `viewer/web` | TypeScript | Zero-install browser viewer + host control panel (served by nebulad). |
@@ -59,15 +59,26 @@ are shared zero-copy (`Arc<CapturedFrame>` in a `tokio::sync::watch`); an
 encoder only runs when its client is keeping up — slow clients naturally skip
 to the newest frame instead of queueing stale ones.
 
-**Input never waits behind video.** Each session is four independent tasks:
+**Input never waits behind video.** Each session is five independent tasks:
 the *pump* decrypts inbound envelopes and applies input / answers pings the
-instant they arrive; the *video task* encodes event-driven (a new capture
-starts encoding immediately, rate-limited to the adaptive fps); the *writer*
-owns the socket and lets control messages preempt video, with video flowing
-through a latest-only slot (bounded everywhere, stale frames dropped, pending
-keyframes protected). No stage can block another; there is no shared pacing
-timer to disturb. Every queue in the pipeline is bounded at 1 (video) or
-small-and-preempting (control).
+instant they arrive (it also runs the clipboard/file-transfer state
+machines); the *video task* encodes event-driven (a new capture starts
+encoding immediately, rate-limited to the adaptive fps); the *audio task*
+forwards blocks from the global audio loop while the viewer has audio
+enabled and permitted; the *writer* owns the socket with a strict priority
+order — control preempts audio preempts video — video flowing through a
+latest-only slot and audio through a short drop-oldest FIFO (continuity
+matters for sound, staleness matters for frames). No stage can block
+another; there is no shared pacing timer to disturb.
+
+**Audio is captured once, fanned out per client.** A single global loop
+(WASAPI loopback on Windows, tone source elsewhere) resamples/downmixes to
+48 kHz stereo, Opus-encodes each 10 ms block, and broadcasts
+`Arc<AudioBlock>`s carrying *both* the Opus packet and the raw PCM; each
+session picks the representation its client negotiated (PCM exists for web
+viewers on insecure origins, which have no WebCodecs Opus decoder). The
+loop — and the OS capture device — only exists while at least one permitted
+viewer has audio enabled.
 
 **Application-layer encryption, transport-agnostic.** Instead of relying on
 TLS (self-signed certs on LAN = warning fatigue = users clicking through),

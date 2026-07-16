@@ -10,11 +10,11 @@ use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -28,6 +28,10 @@ pub struct WindowsInputSink {
     state: Arc<AppState>,
     /// Touch state so single-finger touch maps to press-drag-release.
     touch_down: Mutex<bool>,
+    /// Non-Shift modifiers currently held by the viewer (bitmask: 1 = Ctrl,
+    /// 2 = Alt, 4 = Meta). While any is down, printable keys go through the
+    /// scancode path — Ctrl+C must be a *position*, not a character.
+    modifiers: Mutex<u8>,
 }
 
 impl WindowsInputSink {
@@ -35,6 +39,7 @@ impl WindowsInputSink {
         Self {
             state,
             touch_down: Mutex::new(false),
+            modifiers: Mutex::new(0),
         }
     }
 
@@ -229,6 +234,87 @@ fn code_to_scancode(code: &str) -> Option<u16> {
     Some(sc)
 }
 
+/// Layout-aware key selection (ROADMAP P2.13): viewers send both the
+/// physical `code` and the layout-resolved `key`. Rules:
+///
+/// 1. Named keys ("Enter", "ArrowUp", …) and anything pressed while a
+///    non-Shift modifier is held → **scancode** injection: shortcuts are
+///    positions, and the host resolves them against its own layout.
+/// 2. A single printable `key` whose character matches what the host layout
+///    produces for that physical position → scancode too (cheapest, plays
+///    nicest with games and key-repeat).
+/// 3. A printable `key` the host layout would render *differently* (AZERTY
+///    viewer on a QWERTY host, ü on a US layout, …) → **Unicode** injection
+///    of the exact character, so what the user typed is what appears.
+fn layout_aware_key_input(
+    code: &str,
+    key: Option<&str>,
+    pressed: bool,
+    shortcut_held: bool,
+) -> Option<INPUT> {
+    if !shortcut_held {
+        if let Some(k) = key {
+            let mut chars = k.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if !ch.is_control() && host_char_for_code(code) != Some(normalize_char(ch)) {
+                    return Some(unicode_key_input(ch, pressed));
+                }
+            }
+        }
+    }
+    key_input(code, pressed)
+}
+
+/// Character the *host's* active layout produces for the physical key, in
+/// normalized (uppercase base) form. `None` for non-printables/unknowns.
+fn host_char_for_code(code: &str) -> Option<char> {
+    let sc = code_to_scancode(code)?;
+    if sc & 0xE000 == 0xE000 {
+        return None; // extended keys are never printable
+    }
+    // SAFETY: MapVirtualKeyW is always safe to call.
+    let vk = unsafe { MapVirtualKeyW((sc & 0xFF) as u32, MAPVK_VSC_TO_VK) };
+    if vk == 0 {
+        return None;
+    }
+    let ch = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) };
+    // High bit set = dead key; low 16 bits = the character.
+    let ch = char::from_u32(ch & 0xFFFF).filter(|c| *c != '\0')?;
+    Some(normalize_char(ch))
+}
+
+/// Case-fold for comparison: MAPVK_VK_TO_CHAR reports the *unshifted base*
+/// character in uppercase for letters.
+fn normalize_char(c: char) -> char {
+    c.to_uppercase().next().unwrap_or(c)
+}
+
+/// Inject an exact character irrespective of the host keyboard layout.
+fn unicode_key_input(ch: char, pressed: bool) -> INPUT {
+    let mut buf = [0u16; 2];
+    let units = ch.encode_utf16(&mut buf);
+    let mut flags = KEYEVENTF_UNICODE;
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    // Characters outside the BMP need surrogate pairs; those are so rare on
+    // keyboards that sending the first unit only would corrupt them — route
+    // them through the Text path instead by picking the replacement char.
+    let scan = if units.len() == 1 { buf[0] } else { 0xFFFD };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
 fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
     let sc = code_to_scancode(code)?;
     let extended = sc & 0xE000 == 0xE000;
@@ -292,8 +378,26 @@ impl InputSink for WindowsInputSink {
                         batch.push(mouse_input(0, 0, (dx * 120.0) as i32, MOUSEEVENTF_HWHEEL));
                     }
                 }
-                InputEvent::Key { code, pressed } => {
-                    if let Some(i) = key_input(code, *pressed) {
+                InputEvent::Key { code, pressed, key } => {
+                    // Track non-Shift modifier state (shortcut detection).
+                    let modifier_bit = match code.as_str() {
+                        "ControlLeft" | "ControlRight" => 1u8,
+                        "AltLeft" | "AltRight" => 2,
+                        "MetaLeft" | "MetaRight" => 4,
+                        _ => 0,
+                    };
+                    if modifier_bit != 0 {
+                        let mut m = self.modifiers.lock().unwrap();
+                        if *pressed {
+                            *m |= modifier_bit;
+                        } else {
+                            *m &= !modifier_bit;
+                        }
+                    }
+                    let shortcut_held = *self.modifiers.lock().unwrap() != 0;
+                    if let Some(i) =
+                        layout_aware_key_input(code, key.as_deref(), *pressed, shortcut_held)
+                    {
                         batch.push(i);
                     } else {
                         tracing::debug!(code, "unmapped key code ignored");

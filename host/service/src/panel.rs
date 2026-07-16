@@ -28,6 +28,8 @@ pub async fn run(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         .route("/api/pin/rotate", post(rotate_pin))
         .route("/api/grant", post(grant))
         .route("/api/revoke", post(revoke))
+        .route("/api/transfers", get(transfers_list))
+        .route("/api/transfers/answer", post(transfers_answer))
         .route("/api/qr.svg", get(qr_svg));
 
     if let Some(dir) = &state.cfg.web_dir {
@@ -50,6 +52,8 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    audio_allowed: bool,
     online: bool,
 }
 
@@ -62,6 +66,11 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    audio_allowed: bool,
+    /// The device is currently receiving host audio (the "listening"
+    /// indicator required by the audio privacy design).
+    audio_active: bool,
     stats: ndsp_protocol::messages::ViewerStats,
 }
 
@@ -70,9 +79,14 @@ struct StatusView {
     name: String,
     version: String,
     fingerprint: String,
+    /// SHA-256 fingerprint of the TLS cert when serving HTTPS.
+    tls_fingerprint: Option<String>,
+    audio_enabled: bool,
     port: u16,
     pin: String,
     viewer_urls: Vec<String>,
+    /// File offers waiting for an accept/deny decision here.
+    pending_transfers: Vec<crate::transfers::PendingOfferView>,
     mode: ndsp_protocol::messages::DisplayMode,
     host_stats: ndsp_protocol::messages::HostStats,
     clients: Vec<ClientView>,
@@ -94,6 +108,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            audio_allowed: c.audio_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            audio_active: c.audio_active.load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,19 +132,25 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
+            audio_allowed: d.audio_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
+    let scheme = state.viewer_scheme();
     Json(StatusView {
         name: state.cfg.name.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
         fingerprint: state.fingerprint.clone(),
+        tls_fingerprint: state.tls_fingerprint.lock().unwrap().clone(),
+        audio_enabled: state.cfg.file.audio_enabled,
         port,
         pin: state.pins.current_pin(),
         viewer_urls: local_ips()
             .iter()
-            .map(|ip| format!("http://{ip}:{port}/"))
+            .map(|ip| format!("{scheme}://{ip}:{port}/"))
             .collect(),
+        pending_transfers: state.transfers.list(),
         mode: *state.mode.lock().unwrap(),
         host_stats: state.host_stats.lock().unwrap().clone(),
         clients,
@@ -142,13 +167,52 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// Which permission to change: "input" (default), "clipboard", "audio".
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.kind.as_deref().unwrap_or("input") {
+        "input" => state.set_input_grant(&req.device_id, req.allowed),
+        "clipboard" => state.set_clipboard_grant(&req.device_id, req.allowed),
+        "audio" => state.set_audio_grant(&req.device_id, req.allowed),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown grant kind {other:?}"),
+            )
+                .into_response()
+        }
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn transfers_list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "pending": state.transfers.list(),
+        "save_dir": state.cfg.file_transfer_dir().display().to_string(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct TransferAnswerReq {
+    id: String,
+    accept: bool,
+}
+
+async fn transfers_answer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TransferAnswerReq>,
+) -> impl IntoResponse {
+    if state.transfers.answer(&req.id, req.accept) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "unknown or expired transfer").into_response()
     }
 }
 
@@ -178,7 +242,8 @@ async fn qr_svg(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .unwrap_or_else(|| "HOST-IP".into());
     let pin = state.pins.current_pin();
     let url = format!(
-        "http://{ip}:{port}/?pin={pin}&fp={}",
+        "{}://{ip}:{port}/?pin={pin}&fp={}",
+        state.viewer_scheme(),
         &state.fingerprint[..16]
     );
     match QrCode::new(url.as_bytes()) {

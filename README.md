@@ -22,14 +22,20 @@ Windows PC (host)                            any device (viewer)
   driver — plus a zero-driver **mirror mode** that works out of the box.
 - **Web viewer with no install**: WebCodecs H.264 decode, touch/pen/keyboard,
   stats overlay with *measured* end-to-end latency.
-- **Encrypted by default**: ECDH P-256 + single-use PIN pairing → AES-256-GCM
-  on every frame; per-device trust tokens; input **denied until you allow it**.
+- **Encrypted by default**: **SPAKE2 (PAKE)** single-use-PIN pairing →
+  AES-256-GCM on every frame; per-device trust tokens; input **denied until
+  you allow it**; optional `--https` with a pinned self-signed cert.
+- **Audio**: hear the PC on the viewer (WASAPI loopback → Opus) — strictly
+  opt-in, per-device mutable, with a live "listening" indicator.
+- **Clipboard sync & file drop** — both permission-gated: clipboard is
+  deny-by-default per device; every file transfer needs an explicit accept
+  in the panel.
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
   for Office / Video / Drawing / Gaming.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
   required, nothing phones home.
-- Control panel with QR pairing, live client stats, per-device input grants,
-  one-click revocation.
+- Control panel with QR pairing, live client stats, per-device input /
+  clipboard / audio grants, file-transfer approvals, one-click revocation.
 
 ## Quick start
 
@@ -62,13 +68,16 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (32 Rust tests + Node compat + full Chromium E2E
-in CI): protocol/crypto, pairing/trust/grants, H.264+JPEG streaming, web
-viewer, adaptation, discovery, panel. Written but **needing a Windows/WDK/SDK
-machine to build & validate**: the IddCx driver (extend mode), DXGI
-mirror/SendInput runtime behavior, tray app runtime, Android/iOS apps. Not
-implemented yet (designed, reserved in the protocol): audio, clipboard,
-hardware encoders, PAKE pairing — see [ROADMAP](docs/ROADMAP.md).
+Verified by automated tests (82 Rust tests + Node cross-stack compat + full
+Chromium E2E in CI): protocol/crypto, **SPAKE2 + legacy pairing**,
+trust/grants, H.264+JPEG streaming, **Opus/PCM audio (channel 3)**,
+**clipboard sync**, **file drop with panel approval**, web viewer,
+adaptation, discovery, panel, **HTTPS/WSS serving**. Written but **needing a
+Windows/WDK/SDK machine to build & validate at runtime**: the IddCx driver
+(extend mode), DXGI mirror/SendInput/**WASAPI loopback**/DPAPI runtime
+behavior (all compile-gated through the Windows CI job), tray app runtime,
+Android/iOS apps. Still open (designed): QUIC, SPAKE2 on mobile,
+multi-monitor layout — see [ROADMAP](docs/ROADMAP.md).
 
 ## Clean-room statement
 
