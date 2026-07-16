@@ -30,8 +30,9 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, VideoFrame},
     messages::{ControlMsg, InputMode, Profile},
+    MAX_CLIPBOARD_BYTES,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -56,6 +57,14 @@ const HOST_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// never across an await point).
 struct Shared {
     input_allowed: Arc<AtomicBool>,
+    clipboard_allowed: Arc<AtomicBool>,
+    /// Viewer opted into audio (SetAudio) — panel indicator + send gate.
+    audio_active: Arc<AtomicBool>,
+    /// Panel-side per-client audio mute.
+    audio_muted: Arc<AtomicBool>,
+    /// Hash of the last clipboard text this client pushed to the host —
+    /// suppresses echoing its own update straight back.
+    last_client_clip_hash: AtomicU64,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
     input_mode: AtomicU32,
     force_keyframe: AtomicBool,
@@ -111,6 +120,15 @@ fn mode_to_u8(m: InputMode) -> u32 {
     }
 }
 
+/// Cheap 64-bit content hash for clipboard echo suppression (not security
+/// relevant — a collision merely suppresses one host→client sync).
+fn clip_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
 pub async fn run(
     state: Arc<AppState>,
     socket: WebSocket,
@@ -133,8 +151,15 @@ pub async fn run(
     };
 
     let input_allowed = Arc::new(AtomicBool::new(auth.input_allowed));
+    let clipboard_allowed = Arc::new(AtomicBool::new(auth.clipboard_allowed));
+    let audio_active = Arc::new(AtomicBool::new(false));
+    let audio_muted = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
+        audio_active: audio_active.clone(),
+        audio_muted: audio_muted.clone(),
+        last_client_clip_hash: AtomicU64::new(0),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
         ctl: Mutex::new(AdaptiveController::new(Profile::Office, auth.codec)),
@@ -150,6 +175,7 @@ pub async fn run(
     });
 
     let supports_cursor = auth.client.features.iter().any(|f| f == "cursor");
+    let supports_clipboard = auth.client.features.iter().any(|f| f == "clipboard");
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(8);
     let handle = Arc::new(ClientHandle {
         device_id: auth.client.device_id.clone(),
@@ -161,7 +187,10 @@ pub async fn run(
             .unwrap_or_default()
             .as_secs(),
         input_allowed: input_allowed.clone(),
+        clipboard_allowed: clipboard_allowed.clone(),
         supports_cursor,
+        audio_active: audio_active.clone(),
+        audio_muted: audio_muted.clone(),
         stats: Mutex::new(Default::default()),
         commands: cmd_tx,
     });
@@ -171,6 +200,10 @@ pub async fn run(
     // Control messages to send (pongs, grants, stats, bye). Small + rare;
     // the writer drains these before video.
     let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(32);
+    // Encoded audio packets for this client (20 ms each). Bounded + try_send:
+    // a wedged socket drops audio packets (short glitch) instead of queueing
+    // them into growing latency.
+    let (aud_tx, aud_rx) = mpsc::channel::<Arc<AudioFrame>>(16);
     // Latest-only encoded video slot: a stale frame is overwritten, never
     // queued. (seq, frame) — seq lets the video task detect unconsumed slots.
     let (vid_tx, vid_rx) = watch::channel::<Option<(u64, Arc<VideoFrame>)>>(None);
@@ -180,6 +213,7 @@ pub async fn run(
         ws_tx,
         sealer,
         ctl_rx,
+        aud_rx,
         vid_rx,
         shared.clone(),
         consumed_seq.clone(),
@@ -187,10 +221,18 @@ pub async fn run(
     let pump = tokio::spawn(incoming_pump(
         ws_rx,
         opener,
+        state.clone(),
         shared.clone(),
         ctl_tx.clone(),
         input_sink,
         handle.clone(),
+    ));
+    // Audio fan-in: forward host Opus packets while the viewer opted in and
+    // the panel hasn't muted this client. Cheap no-op otherwise.
+    let audio_fwd = tokio::spawn(audio_forward_task(
+        state.audio_tx.subscribe(),
+        shared.clone(),
+        aud_tx,
     ));
     let video = tokio::spawn(video_task(
         state.clone(),
@@ -212,6 +254,12 @@ pub async fn run(
     // Deliver the current cursor state right away (a client connecting while
     // the mouse is idle should not wait for the first physical move).
     cursor_rx.mark_changed();
+    // Host clipboard → client (clipboard-capable clients only; the grant is
+    // re-checked per update since the panel can flip it live). mark_changed
+    // delivers the latest clipboard to a client that connects later.
+    let mut clip_rx = state.clipboard_tx.subscribe();
+    clip_rx.mark_changed();
+    let mut sent_clip_seq: u64 = 0;
     let mut sent_shape_seq: u64 = 0;
     let mut sent_cursor_hidden = false;
     loop {
@@ -220,6 +268,13 @@ pub async fn run(
                 SessionCommand::SetInputGrant(allowed) => {
                     input_allowed.store(allowed, Ordering::Relaxed);
                     if ctl_tx.send(ControlMsg::InputGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetClipboardGrant(allowed) => {
+                    clipboard_allowed.store(allowed, Ordering::Relaxed);
+                    if ctl_tx.send(ControlMsg::ClipboardGrant { allowed }).await.is_err() { break; }
+                }
+                SessionCommand::SetAudioMute(muted) => {
+                    audio_muted.store(muted, Ordering::Relaxed);
                 }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
@@ -230,6 +285,20 @@ pub async fn run(
             },
 
             _ = &mut pump => break, // client went away / protocol violation
+
+            changed = clip_rx.changed(), if supports_clipboard => {
+                if changed.is_err() { continue; }
+                let update = clip_rx.borrow_and_update().clone();
+                let Some(update) = update else { continue };
+                if update.seq == sent_clip_seq { continue; }
+                sent_clip_seq = update.seq;
+                if !clipboard_allowed.load(Ordering::Relaxed) { continue; }
+                // Don't echo the client's own push straight back at it.
+                if clip_hash(&update.text) == shared.last_client_clip_hash.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if ctl_tx.send(ControlMsg::Clipboard { text: (*update.text).clone() }).await.is_err() { break; }
+            }
 
             changed = cursor_rx.changed(), if supports_cursor => {
                 if changed.is_err() { continue; }
@@ -300,16 +369,44 @@ pub async fn run(
     state.unregister_client(client_id);
     pump.abort();
     video.abort();
+    audio_fwd.abort();
     drop(ctl_tx); // writer exits once both inputs are gone
     writer.abort();
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts video; video is latest-only.
+/// Forwards host Opus packets into this session's audio lane while the
+/// viewer has audio on and the panel hasn't muted it.
+async fn audio_forward_task(
+    mut audio_rx: tokio::sync::broadcast::Receiver<Arc<AudioFrame>>,
+    shared: Arc<Shared>,
+    aud_tx: mpsc::Sender<Arc<AudioFrame>>,
+) {
+    loop {
+        match audio_rx.recv().await {
+            Ok(frame) => {
+                if !shared.audio_active.load(Ordering::Relaxed)
+                    || shared.audio_muted.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                // try_send: a backed-up socket drops packets (viewer hears a
+                // short glitch and sees the seq gap) instead of adding delay.
+                let _ = aud_tx.try_send(frame);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Owns the socket sink. Control preempts audio preempts video; video is
+/// latest-only, audio is a short bounded queue.
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
+    mut aud_rx: mpsc::Receiver<Arc<AudioFrame>>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
@@ -322,6 +419,13 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+            }
+
+            frame = aud_rx.recv() => {
+                let Some(af) = frame else { break };
+                let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &af.payload]);
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
 
@@ -536,6 +640,7 @@ async fn video_task(
 async fn incoming_pump(
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
+    state: Arc<AppState>,
     shared: Arc<Shared>,
     ctl_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
@@ -590,6 +695,30 @@ async fn incoming_pump(
                         }
                         ControlMsg::RequestKeyframe => {
                             shared.force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        ControlMsg::Clipboard { text } => {
+                            if !shared.clipboard_allowed.load(Ordering::Relaxed) {
+                                debug!("dropping clipboard push (no grant)");
+                            } else if text.len() > MAX_CLIPBOARD_BYTES {
+                                warn!(len = text.len(), "clipboard push over size cap; dropped");
+                            } else {
+                                shared
+                                    .last_client_clip_hash
+                                    .store(clip_hash(&text), Ordering::Relaxed);
+                                let clipboard = state.clipboard.clone();
+                                // Windows clipboard calls can block briefly.
+                                tokio::task::spawn_blocking(move || clipboard.set_text(&text));
+                            }
+                        }
+                        ControlMsg::SetAudio { enabled } => {
+                            let on = enabled && state.audio_available();
+                            shared.audio_active.store(on, Ordering::Relaxed);
+                            if enabled && !on {
+                                let _ = ctl_tx.try_send(ControlMsg::Error {
+                                    code: "audio_unavailable".into(),
+                                    message: "host audio is disabled or unsupported".into(),
+                                });
+                            }
                         }
                         ControlMsg::Bye { reason } => {
                             info!(%reason, "client said bye");

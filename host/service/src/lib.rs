@@ -2,7 +2,9 @@
 //! e.g. the tray app) run a full host in-process.
 
 pub mod adapt;
+pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod encode;
@@ -28,6 +30,23 @@ pub struct EmbeddedOptions {
     pub name: String,
     pub capture: (u32, u32),
     pub max_fps: u32,
+    /// Run the audio pipeline with the synthetic tone source (tests/CI).
+    pub audio_test_tone: bool,
+    /// Accept legacy (pre-PAKE) PIN pairing. Mirrors `FileConfig`.
+    pub legacy_pin_pairing: bool,
+}
+
+impl Default for EmbeddedOptions {
+    fn default() -> Self {
+        Self {
+            data_dir: std::path::PathBuf::from("nebuladisplay-data"),
+            name: "embedded-host".into(),
+            capture: (320, 240),
+            max_fps: 30,
+            audio_test_tone: false,
+            legacy_pin_pairing: true,
+        }
+    }
 }
 
 /// A running in-process host (for tests / embedding).
@@ -48,6 +67,8 @@ impl EmbeddedHost {
             web_dir: None,
             file: FileConfig {
                 max_fps: opts.max_fps,
+                audio: opts.audio_test_tone,
+                legacy_pin_pairing: opts.legacy_pin_pairing,
                 ..Default::default()
             },
         };
@@ -59,6 +80,20 @@ impl EmbeddedHost {
             capture::run_capture_loop(cap_state, source).await;
         });
 
+        let clip_state = state.clone();
+        let clip = tokio::spawn(async move {
+            clipboard::run_clipboard_watch(clip_state).await;
+        });
+
+        let mut tasks = vec![cap, clip];
+        if opts.audio_test_tone {
+            let audio_state = state.clone();
+            let source = audio::create_source(true)?;
+            tasks.push(tokio::spawn(async move {
+                audio::run_audio_pipeline(audio_state, source).await;
+            }));
+        }
+
         // Bind explicitly so we know the ephemeral port before returning.
         let listener =
             tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -66,17 +101,13 @@ impl EmbeddedHost {
         let port = listener.local_addr()?.port();
         state.set_serving_port(port);
         let srv_state = state.clone();
-        let srv = tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             if let Err(e) = server::serve_on(srv_state, listener).await {
                 tracing::error!("embedded server failed: {e:#}");
             }
-        });
+        }));
 
-        Ok(Self {
-            state,
-            port,
-            tasks: vec![cap, srv],
-        })
+        Ok(Self { state, port, tasks })
     }
 
     pub async fn shutdown(self) {

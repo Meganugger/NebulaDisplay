@@ -11,8 +11,9 @@ use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys},
     envelope::{Channel, Direction, Opener, Sealer},
-    media::VideoFrame,
+    media::{AudioFrame, VideoFrame},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, DisplayMode},
+    pake::{Pake, PakeRole},
     PROTOCOL_VERSION, WS_PATH,
 };
 use tokio::net::TcpStream;
@@ -30,8 +31,13 @@ pub struct Credentials {
 }
 
 pub enum Auth<'a> {
-    /// First contact: pair with the PIN shown on the host.
+    /// First contact: pair with the PIN shown on the host via SPAKE2 (the
+    /// transcript is not offline-grindable). Fails against pre-v0.5 hosts —
+    /// use [`Auth::PinLegacy`] for those *explicitly* (automatic fallback
+    /// would let an active MITM downgrade pairing to the grindable scheme).
     Pin(&'a str),
+    /// First contact against a pre-v0.5 host: legacy PIN-bound-HKDF pairing.
+    PinLegacy(&'a str),
     /// Returning device.
     Token(&'a Credentials),
 }
@@ -44,6 +50,9 @@ pub struct Session {
     pub codec: Codec,
     pub mode: DisplayMode,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
+    /// Host can stream audio (still requires an explicit `SetAudio` opt-in).
+    pub audio_available: bool,
     /// Set when this connection performed a fresh pairing.
     pub new_credentials: Option<Credentials>,
     pub server_fingerprint: String,
@@ -52,6 +61,7 @@ pub struct Session {
 /// Anything a session can yield to the app.
 pub enum Incoming {
     Video(VideoFrame),
+    Audio(AudioFrame),
     Control(ControlMsg),
     Closed,
 }
@@ -69,7 +79,7 @@ pub async fn connect(
         .with_context(|| format!("connecting {url}"))?;
 
     let auth_method = match &auth {
-        Auth::Pin(_) => AuthMethod::Pair,
+        Auth::Pin(_) | Auth::PinLegacy(_) => AuthMethod::Pair,
         Auth::Token(c) => AuthMethod::Token {
             device_id: c.device_id.clone(),
         },
@@ -114,16 +124,21 @@ pub async fn connect(
         &mut ws,
         &ControlMsg::PairStart {
             client_pubkey: B64.encode(&client_pub),
+            pake: matches!(auth, Auth::Pin(_)),
         },
     )
     .await?;
-    let (server_pub, salt) = match recv_json(&mut ws).await? {
+    let (server_pub, salt, server_pake_share) = match recv_json(&mut ws).await? {
         ControlMsg::PairChallenge {
             server_pubkey,
             salt,
+            pake_share,
         } => (
             B64.decode(server_pubkey).context("server pub b64")?,
             B64.decode(salt).context("salt b64")?,
+            pake_share
+                .map(|s| B64.decode(s).context("pake share b64"))
+                .transpose()?,
         ),
         ControlMsg::AuthErr { error } => bail!("server rejected: {error}"),
         other => bail!("expected pair_challenge, got {other:?}"),
@@ -135,8 +150,25 @@ pub async fn connect(
 
     let mut new_credentials = None;
     match auth {
-        Auth::Pin(pin) => {
-            let pair_key = shared.pairing_key(&salt, pin, &nonce);
+        Auth::Pin(pin) | Auth::PinLegacy(pin) => {
+            // Derive the pairing key: SPAKE2 when negotiated, legacy PIN-HKDF
+            // only when the caller explicitly opted into it.
+            let (pair_key, client_pake_share) = match (&auth, server_pake_share) {
+                (Auth::Pin(_), Some(server_share)) => {
+                    let pake = Pake::new(PakeRole::Client, pin, &salt, &nonce);
+                    let my_share = pake.share().to_vec();
+                    let key = pake
+                        .finish(&server_share, &client_pub, &server_pub)
+                        .map_err(|e| anyhow::anyhow!("PAKE: {e}"))?;
+                    (key, Some(B64.encode(my_share)))
+                }
+                (Auth::Pin(_), None) => bail!(
+                    "host did not offer PAKE pairing (pre-v0.5?); refusing the \
+                     downgradable legacy path — use PinLegacy explicitly if you \
+                     trust this network"
+                ),
+                _ => (shared.pairing_key(&salt, pin, &nonce), None),
+            };
             let mut confirm = crypto::CONFIRM_CONTEXT.to_vec();
             confirm.extend_from_slice(&nonce);
             let sealed = crypto::seal(&pair_key, &confirm, b"");
@@ -144,6 +176,7 @@ pub async fn connect(
                 &mut ws,
                 &ControlMsg::PairConfirm {
                     sealed: B64.encode(sealed),
+                    pake_share: client_pake_share,
                 },
             )
             .await?;
@@ -186,15 +219,24 @@ pub async fn connect(
         }
     }
 
-    let (codec, mode, input_allowed) = match recv_json(&mut ws).await? {
-        ControlMsg::AuthOk {
-            codec,
-            mode,
-            input_allowed,
-        } => (codec, mode, input_allowed),
-        ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
-        other => bail!("expected auth_ok, got {other:?}"),
-    };
+    let (codec, mode, input_allowed, clipboard_allowed, audio_available) =
+        match recv_json(&mut ws).await? {
+            ControlMsg::AuthOk {
+                codec,
+                mode,
+                input_allowed,
+                clipboard_allowed,
+                audio_available,
+            } => (
+                codec,
+                mode,
+                input_allowed,
+                clipboard_allowed,
+                audio_available,
+            ),
+            ControlMsg::AuthErr { error } => bail!("auth rejected: {error}"),
+            other => bail!("expected auth_ok, got {other:?}"),
+        };
 
     Ok(Session {
         ws,
@@ -203,6 +245,8 @@ pub async fn connect(
         codec,
         mode,
         input_allowed,
+        clipboard_allowed,
+        audio_available,
         new_credentials,
         server_fingerprint,
     })
@@ -239,7 +283,12 @@ impl Session {
                             let s = std::str::from_utf8(&pt).context("control utf8")?;
                             return Ok(Incoming::Control(ControlMsg::from_json(s)?));
                         }
-                        Channel::Audio => continue, // reserved
+                        Channel::Audio => {
+                            return Ok(Incoming::Audio(
+                                AudioFrame::decode(&pt)
+                                    .map_err(|e| anyhow::anyhow!("audio frame: {e}"))?,
+                            ))
+                        }
                     }
                 }
                 Message::Close(_) => return Ok(Incoming::Closed),

@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod envelope;
 pub mod media;
 pub mod messages;
+pub mod pake;
 
 /// Current protocol version. Bump on breaking changes; peers negotiate
 /// `min(client, server)` and refuse to talk below [`MIN_PROTOCOL_VERSION`].
@@ -40,6 +41,11 @@ pub const DEFAULT_DISCOVERY_PORT: u16 = 41799;
 
 /// WebSocket route on the host that speaks NDSP.
 pub const WS_PATH: &str = "/ndsp";
+
+/// Hard cap for one clipboard sync payload (UTF-8 bytes), enforced by both
+/// sender and receiver. Big-enough for text, small enough that a hostile peer
+/// can't use the clipboard channel as a memory hose.
+pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

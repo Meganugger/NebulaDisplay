@@ -86,9 +86,11 @@ impl HandshakeKeys {
 pub struct SharedSecret(Vec<u8>);
 
 impl SharedSecret {
-    /// Key that gates pairing on knowledge of the PIN.
+    /// Key that gates pairing on knowledge of the PIN (legacy path; see
+    /// [`crate::pake`] for the SPAKE2 replacement that removes the
+    /// offline-grinding caveat).
     pub fn pairing_key(&self, salt: &[u8], pin: &str, connection_nonce: &[u8]) -> [u8; 32] {
-        derive(
+        derive_key(
             &self.0,
             salt,
             &[PAIR_INFO, pin.as_bytes(), connection_nonce],
@@ -98,11 +100,12 @@ impl SharedSecret {
     /// Post-handshake transport key (independent of the PIN so a later PIN
     /// leak can't decrypt recorded sessions beyond the pairing exchange).
     pub fn session_key(&self, salt: &[u8], connection_nonce: &[u8]) -> [u8; 32] {
-        derive(&self.0, salt, &[SESSION_INFO, connection_nonce])
+        derive_key(&self.0, salt, &[SESSION_INFO, connection_nonce])
     }
 }
 
-fn derive(ikm: &[u8], salt: &[u8], info_parts: &[&[u8]]) -> [u8; 32] {
+/// HKDF-SHA256 → 32-byte key with a concatenated multi-part info string.
+pub(crate) fn derive_key(ikm: &[u8], salt: &[u8], info_parts: &[&[u8]]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let info: Vec<u8> = info_parts.concat();
     let mut okm = [0u8; 32];

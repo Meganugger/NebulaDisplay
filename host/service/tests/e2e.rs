@@ -26,6 +26,7 @@ async fn start_host(tag: &str) -> EmbeddedHost {
         name: format!("e2e-host-{tag}"),
         capture: (320, 240),
         max_fps: 30,
+        ..Default::default()
     })
     .await
     .expect("host starts")
@@ -74,7 +75,7 @@ async fn pairing_streams_video_and_ping_pong_works() {
                 assert!(t1_us > 0);
                 got_pong = true;
             }
-            Incoming::Control(_) => {}
+            Incoming::Control(_) | Incoming::Audio(_) => {}
             Incoming::Closed => panic!("server closed unexpectedly"),
         }
     }
@@ -373,7 +374,7 @@ async fn video_keeps_flowing_under_input_flood() {
         loop {
             match tokio::time::timeout(Duration::from_micros(100), session.recv()).await {
                 Ok(Ok(Incoming::Video(_))) => frames += 1,
-                Ok(Ok(Incoming::Control(_))) => {}
+                Ok(Ok(Incoming::Control(_) | Incoming::Audio(_))) => {}
                 Ok(Ok(Incoming::Closed)) => panic!("server closed during input flood"),
                 Ok(Err(e)) => panic!("recv error during flood: {e:#}"),
                 Err(_) => break, // nothing pending
@@ -400,6 +401,268 @@ async fn video_keeps_flowing_under_input_flood() {
         frames >= 60,
         "video starved under input flood: only {frames} frames in 3s (expect ~90)"
     );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 features: PAKE gating, clipboard sync, audio opt-in
+// ---------------------------------------------------------------------------
+
+async fn start_host_opts(tag: &str, opts: impl FnOnce(&mut EmbeddedOptions)) -> EmbeddedHost {
+    let dir = std::env::temp_dir().join(format!("ndsp-e2e-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut o = EmbeddedOptions {
+        data_dir: dir,
+        name: format!("e2e-host-{tag}"),
+        capture: (320, 240),
+        max_fps: 30,
+        ..Default::default()
+    };
+    opts(&mut o);
+    EmbeddedHost::start(o).await.expect("host starts")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pin_pairing_works_when_enabled_and_is_refused_when_disabled() {
+    // Default host: legacy path still accepted (Android/iOS viewers).
+    let host = start_host("legacy-on").await;
+    let pin = host.state.pins.current_pin();
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Old Phone"),
+        Auth::PinLegacy(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("legacy pairing accepted by default");
+    assert!(session.new_credentials.is_some());
+    session.close().await;
+    host.shutdown().await;
+
+    // Hardened host: legacy pairing is refused before any PIN processing.
+    let host = start_host_opts("legacy-off", |o| o.legacy_pin_pairing = false).await;
+    let pin = host.state.pins.current_pin();
+    let err = must_fail(
+        connect(
+            "127.0.0.1",
+            host.port,
+            client_info("Old Phone"),
+            Auth::PinLegacy(&pin),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "legacy pairing on hardened host",
+    );
+    assert!(
+        format!("{err:#}").contains("PAKE"),
+        "error should point at PAKE requirement: {err:#}"
+    );
+    // PAKE pairing still works on the hardened host, of course.
+    let pin = host.state.pins.current_pin();
+    let session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("New Viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("PAKE pairing on hardened host");
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_sync_respects_grant_and_caps() {
+    let host = start_host("clipboard").await;
+    let pin = host.state.pins.current_pin();
+    let mut info = client_info("Clipboard Viewer");
+    info.features = vec!["clipboard".into()];
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        info.clone(),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    assert!(
+        !session.clipboard_allowed,
+        "clipboard must be denied by default"
+    );
+
+    // 1. Without a grant, client pushes are dropped by the host.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "stolen?".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        host.state.clipboard.get_text(),
+        None,
+        "ungranted clipboard push must not reach the host clipboard"
+    );
+
+    // 2. Grant clipboard from the panel → live ClipboardGrant notification.
+    assert!(host
+        .state
+        .set_clipboard_grant(&info.device_id, true)
+        .unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("grant timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::ClipboardGrant { allowed }) => {
+                assert!(allowed);
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for clipboard grant"),
+            _ => {}
+        }
+    }
+
+    // 3. Client → host now lands on the host clipboard.
+    session
+        .send(&ControlMsg::Clipboard {
+            text: "from viewer 📋".into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if host.state.clipboard.get_text().as_deref() == Some("from viewer 📋") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "granted clipboard push never reached the host clipboard"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 4. Host → client: a host-side copy is pushed to granted viewers…
+    host.state.clipboard.set_text("from host");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("host clipboard timeout")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::Clipboard { text }) => {
+                assert_eq!(text, "from host");
+                break;
+            }
+            Incoming::Closed => panic!("closed while waiting for host clipboard"),
+            _ => {}
+        }
+    }
+
+    // 5. …but an oversized client push is rejected by the size cap.
+    let huge = "x".repeat(ndsp_protocol::MAX_CLIPBOARD_BYTES + 1);
+    session
+        .send(&ControlMsg::Clipboard { text: huge })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        host.state.clipboard.get_text().as_deref(),
+        Some("from host"),
+        "oversized clipboard push must be dropped"
+    );
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_streams_only_after_explicit_opt_in() {
+    let host = start_host_opts("audio", |o| o.audio_test_tone = true).await;
+    let pin = host.state.pins.current_pin();
+
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Audio Viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("pairing ok");
+    assert!(
+        session.audio_available,
+        "host with audio pipeline must advertise audio_available"
+    );
+
+    // Off by default: half a second of streaming must carry zero audio.
+    let silent_until = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout_at(silent_until, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio arrived before opt-in"),
+            Ok(Ok(Incoming::Closed)) => panic!("closed unexpectedly"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("recv: {e:#}"),
+            Err(_) => break,
+        }
+    }
+
+    // Opt in → 48 kHz stereo Opus packets with sane sequencing arrive.
+    session
+        .send(&ControlMsg::SetAudio { enabled: true })
+        .await
+        .unwrap();
+    let mut audio_frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while audio_frames.len() < 10 {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("timed out waiting for audio")
+            .expect("recv ok")
+        {
+            Incoming::Audio(f) => audio_frames.push(f),
+            Incoming::Closed => panic!("closed while streaming audio"),
+            _ => {}
+        }
+    }
+    for f in &audio_frames {
+        assert_eq!(f.codec, ndsp_protocol::media::AUDIO_CODEC_OPUS);
+        assert_eq!(f.sample_rate, 48_000);
+        assert_eq!(f.channels, 2);
+        assert!(!f.payload.is_empty() && f.payload.len() < 1500);
+    }
+    for w in audio_frames.windows(2) {
+        assert!(w[1].seq > w[0].seq, "audio seq must be increasing");
+        assert!(w[1].timestamp_us >= w[0].timestamp_us);
+    }
+
+    // Opt back out → audio stops (allow in-flight packets to drain).
+    session
+        .send(&ControlMsg::SetAudio { enabled: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Drain whatever was in flight…
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(10), session.recv()).await {}
+    // …then verify nothing new arrives.
+    let quiet_until = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout_at(quiet_until, session.recv()).await {
+            Ok(Ok(Incoming::Audio(_))) => panic!("audio kept flowing after opt-out"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("recv: {e:#}"),
+            Err(_) => break,
+        }
+    }
 
     session.close().await;
     host.shutdown().await;

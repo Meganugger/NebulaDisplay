@@ -99,10 +99,16 @@ pub enum InputEvent {
         dx: f32,
         dy: f32,
     },
-    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...).
+    /// `code` is a W3C `KeyboardEvent.code` string ("KeyA", "Enter", ...) —
+    /// a *physical* key position. `key` optionally carries the layout-aware
+    /// `KeyboardEvent.key` value ("a", "A", "é", …) so hosts can honor the
+    /// viewer's keyboard layout for printable keys and fall back to the
+    /// positional code otherwise (ROADMAP P2.13).
     Key {
         code: String,
         pressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Touch {
         id: u32,
@@ -208,19 +214,30 @@ pub enum ControlMsg {
         /// the pairing transcript and token proofs to prevent replay.
         connection_nonce: String,
     },
-    /// Client ephemeral P-256 public key (base64 SEC1 compressed).
+    /// Client ephemeral P-256 public key (base64 SEC1 uncompressed).
+    /// `pake: true` requests SPAKE2 pairing (see [`crate::pake`]); absent /
+    /// false selects the legacy PIN-bound-HKDF path (hosts may refuse it).
     PairStart {
         client_pubkey: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        pake: bool,
     },
-    /// Server ephemeral key + HKDF salt (both base64).
+    /// Server ephemeral key + HKDF salt (both base64). `pake_share` is the
+    /// server's SPAKE2 share `pB` — present iff PAKE pairing is in use.
     PairChallenge {
         server_pubkey: String,
         salt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pake_share: Option<String>,
     },
     /// AES-GCM(seal) of `"ndsp-confirm-v1" || connection_nonce` under the
-    /// PIN-bound pairing key. Proves the client knew the PIN.
+    /// pairing key. Proves the client knew the PIN. With PAKE pairing the
+    /// key comes from the SPAKE2 exchange and `pake_share` carries the
+    /// client's share `pA` (it needs the salt from `pair_challenge` first).
     PairConfirm {
         sealed: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pake_share: Option<String>,
     },
     /// On success carries the sealed long-term trust token for this device.
     PairResult {
@@ -244,6 +261,13 @@ pub enum ControlMsg {
         mode: DisplayMode,
         /// Whether this device is currently allowed to inject input.
         input_allowed: bool,
+        /// Whether this device is currently allowed to sync clipboards.
+        #[serde(default)]
+        clipboard_allowed: bool,
+        /// True when the host can stream audio (host-side capture available
+        /// and enabled). The viewer still has to opt in with `SetAudio`.
+        #[serde(default)]
+        audio_available: bool,
     },
     AuthErr {
         error: String,
@@ -285,6 +309,24 @@ pub enum ControlMsg {
     InputGrant {
         allowed: bool,
     },
+    /// Server informs the viewer its clipboard grant changed (panel toggle).
+    ClipboardGrant {
+        allowed: bool,
+    },
+    /// Clipboard text sync, either direction. Only honored when the device's
+    /// clipboard grant is on (deny by default) and the payload is within
+    /// [`crate::MAX_CLIPBOARD_BYTES`]. Nothing is synced implicitly — both
+    /// ends send only on explicit user action / observed local copy while
+    /// sync is enabled in the viewer UI.
+    Clipboard {
+        text: String,
+    },
+    /// Viewer opts in/out of the host's audio stream (channel 3). Audio is
+    /// only sent while the host globally enables it *and* the viewer opted
+    /// in — off by default on both ends.
+    SetAudio {
+        enabled: bool,
+    },
     /// Server is about to switch modes (resolution change etc.).
     ModeChange {
         mode: DisplayMode,
@@ -317,6 +359,12 @@ pub enum ControlMsg {
     },
 }
 
+/// serde helper: omit boolean fields that are false (wire compat with peers
+/// that predate the field).
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 impl ControlMsg {
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -338,6 +386,7 @@ mod tests {
                 InputEvent::Key {
                     code: "KeyA".into(),
                     pressed: true,
+                    key: None,
                 },
                 InputEvent::Touch {
                     id: 1,
@@ -363,5 +412,74 @@ mod tests {
         let msg =
             ControlMsg::from_json(r#"{"type":"ping","t0_us":7,"future_field":true}"#).unwrap();
         assert_eq!(msg, ControlMsg::Ping { t0_us: 7 });
+    }
+
+    #[test]
+    fn v1_0_pair_messages_still_parse_and_serialize_compactly() {
+        // A v1.0 peer sends pair_start without the pake field …
+        let msg = ControlMsg::from_json(r#"{"type":"pair_start","client_pubkey":"AA=="}"#).unwrap();
+        assert_eq!(
+            msg,
+            ControlMsg::PairStart {
+                client_pubkey: "AA==".into(),
+                pake: false,
+            }
+        );
+        // … and a legacy pair_start we emit is byte-identical to v1.0.
+        assert_eq!(
+            msg.to_json().unwrap(),
+            r#"{"type":"pair_start","client_pubkey":"AA=="}"#
+        );
+        // Same for key events without the optional layout-aware field.
+        let key = ControlMsg::from_json(
+            r#"{"type":"input","events":[{"kind":"key","code":"KeyA","pressed":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            key,
+            ControlMsg::Input {
+                events: vec![InputEvent::Key {
+                    code: "KeyA".into(),
+                    pressed: true,
+                    key: None,
+                }],
+            }
+        );
+        assert_eq!(
+            key.to_json().unwrap(),
+            r#"{"type":"input","events":[{"kind":"key","code":"KeyA","pressed":true}]}"#
+        );
+    }
+
+    #[test]
+    fn v1_0_auth_ok_parses_with_defaults() {
+        let msg = ControlMsg::from_json(
+            r#"{"type":"auth_ok","codec":"h264","mode":{"width":1,"height":2,"refresh_hz":60},"input_allowed":false}"#,
+        )
+        .unwrap();
+        let ControlMsg::AuthOk {
+            clipboard_allowed,
+            audio_available,
+            ..
+        } = msg
+        else {
+            panic!("wrong variant");
+        };
+        assert!(!clipboard_allowed);
+        assert!(!audio_available);
+    }
+
+    #[test]
+    fn clipboard_and_audio_messages_roundtrip() {
+        for msg in [
+            ControlMsg::Clipboard {
+                text: "héllo 📋".into(),
+            },
+            ControlMsg::ClipboardGrant { allowed: true },
+            ControlMsg::SetAudio { enabled: true },
+        ] {
+            let json = msg.to_json().unwrap();
+            assert_eq!(ControlMsg::from_json(&json).unwrap(), msg);
+        }
     }
 }
