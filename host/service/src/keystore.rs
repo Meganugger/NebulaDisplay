@@ -77,11 +77,19 @@ mod keychain {
     /// when no keychain is reachable — callers fall back to plaintext.
     /// Success is memoized; failures are retried on the next call (the
     /// daemon may simply not be up yet during login).
+    ///
+    /// `NDSP_NO_KEYCHAIN=1` skips the keychain entirely (plaintext-0600
+    /// keystore). For headless boxes and CI: a *locked* macOS keychain
+    /// makes `SecItem*` calls wait indefinitely for an interactive unlock
+    /// prompt that will never be answered.
     pub fn wrapping_key() -> Option<[u8; 32]> {
         use std::sync::OnceLock;
         static KEY: OnceLock<[u8; 32]> = OnceLock::new();
         if let Some(k) = KEY.get() {
             return Some(*k);
+        }
+        if std::env::var_os("NDSP_NO_KEYCHAIN").is_some_and(|v| v != "0" && !v.is_empty()) {
+            return None;
         }
         let fetched = fetch_or_create()?;
         Some(*KEY.get_or_init(|| fetched))

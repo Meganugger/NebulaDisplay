@@ -65,7 +65,9 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
    all three cases another local account or an exfiltrated copy of the
    files cannot read them (`host/service/src/keystore.rs`; also covers the
    identity key and the TLS private key). Headless Unix systems without a
-   keychain daemon fall back to 0600 plaintext (logged loudly). Proofs are
+   keychain daemon fall back to 0600 plaintext (logged loudly);
+   `NDSP_NO_KEYCHAIN=1` opts out explicitly (headless boxes / CI, where a
+   locked macOS keychain would block waiting for an interactive unlock). Proofs are
    keyed hashes, so the verifier needs the key material; host compromise
    already means screen compromise.
 4. **QUIC TLS certificates are not verified by clients** — deliberately.

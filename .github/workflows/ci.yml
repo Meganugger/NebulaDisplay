@@ -46,6 +46,13 @@ jobs:
   rust-macos:
     name: Rust (macOS) — keychain/CoreAudio paths compile + tests
     runs-on: macos-latest
+    timeout-minutes: 30
+    # NDSP_NO_KEYCHAIN: runner keychains can be locked; SecItem* calls
+    # would block forever waiting for an interactive unlock (the keystore
+    # documents this env for headless boxes). The seal/open crypto is
+    # still fully unit-tested; only the live keychain round-trip is skipped.
+    env:
+      NDSP_NO_KEYCHAIN: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
