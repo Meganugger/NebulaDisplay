@@ -1,0 +1,5 @@
+[env]
+# libopus (via audiopus_sys, the `opus` crate's backend) ships a CMakeLists
+# older than the CMake 4 compatibility floor; without this pin, hosts with
+# CMake >= 4 (e.g. GitHub's windows-latest runners) fail to configure it.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
