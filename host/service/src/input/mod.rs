@@ -4,10 +4,12 @@
 //! input grant is on (deny by default, toggled in the panel); this module is
 //! the last line and re-checks nothing — callers enforce grants.
 //!
-//! * Windows: `SendInput` for mouse/keyboard; touch is mapped to mouse until
-//!   the InjectTouchInput path lands (roadmap).
+//! * Windows: `SendInput` for mouse/keyboard; **synthetic pointers**
+//!   (Windows Ink, Win10 1809+) for pen (pressure/tilt) and multi-touch,
+//!   with automatic fallback to the mouse mapping where the API is missing.
 //! * Non-Windows hosts: structured log sink (useful for tests/CI).
 
+pub mod touch;
 #[cfg(windows)]
 mod windows_inject;
 

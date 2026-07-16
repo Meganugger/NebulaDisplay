@@ -143,11 +143,11 @@ viewers on insecure origins, which have no WebCodecs Opus decoder
 | `audio_grant {allowed}` | S→C | live audio-permission change from the panel (mute) |
 | `clipboard {text}` | both | clipboard sync; only honored with the device's clipboard grant; ≤ 256 KiB |
 | `clipboard_grant {allowed}` | S→C | live clipboard-permission change |
-| `file_offer {id,name,size_bytes,sha256}` | C→S | offer a file; host queues an explicit panel accept |
-| `file_answer {id,accept,reason?}` | S→C | the user's panel decision |
-| `file_chunk {id,seq,data}` | C→S | in-order b64 chunk, ≤ 256 KiB raw |
-| `file_end {id}` | C→S | sender done → host verifies size + sha256 |
-| `file_done {id}` | S→C | verified, moved into the receive directory |
+| `file_offer {id,name,size_bytes,sha256}` | both | offer a file; the receiver gates it on an explicit human decision (host: panel accept; viewer: on-screen prompt) |
+| `file_answer {id,accept,reason?}` | both | the receiving side's decision |
+| `file_chunk {id,seq,data}` | both | in-order b64 chunk, ≤ 256 KiB raw; host→viewer chunks ride the writer's lowest-priority lane so they never starve video/audio/control |
+| `file_end {id}` | both | sender done → receiver verifies size + sha256 |
+| `file_done {id}` | both | verified (host: moved into the receive directory; viewer: handed to the browser as a download) |
 | `file_abort {id,reason}` | both | cancel / verification failure (partial file deleted) |
 | `bye {reason}` | both | graceful close |
 | `error {code,message}` | both | non-fatal report |
@@ -157,7 +157,10 @@ Input events (coordinates normalized 0..1 on the streamed surface):
 `wheel{dx,dy}`, `key{code,pressed,key?}` (W3C `KeyboardEvent.code` position
 plus the optional layout-resolved `KeyboardEvent.key` character — hosts
 prefer `key` for printables so viewer keyboard layouts survive the trip),
-`touch{id,phase,x,y,pressure}`, `pen{phase,x,y,pressure,tilt_x,tilt_y}`
+`touch{id,phase,x,y,pressure}` (`id` is a per-finger contact id, stable from
+`start` through `end`/`cancel` — hosts with synthetic pointers inject every
+finger as a real touch contact, so pinch/multi-finger gestures work; others
+map the first finger to the mouse), `pen{phase,x,y,pressure,tilt_x,tilt_y}`
 (pressure 0..1; tilts normalized -1..1 = ±90° — injected as true Windows Ink
 pen input with pressure/tilt on hosts that support synthetic pointers),
 `text{text}`.

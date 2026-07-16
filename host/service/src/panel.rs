@@ -5,7 +5,7 @@
 //! web dist as the viewer (`panel.html`).
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -30,6 +30,12 @@ pub async fn run(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         .route("/api/revoke", post(revoke))
         .route("/api/transfers", get(transfers_list))
         .route("/api/transfers/answer", post(transfers_answer))
+        // The upload is streamed to a spool file with our own max_file_mb
+        // cap — axum's default 2 MiB body limit must not apply here.
+        .route(
+            "/api/send-file",
+            post(send_file).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/qr.svg", get(qr_svg));
 
     if let Some(dir) = &state.cfg.web_dir {
@@ -213,6 +219,94 @@ async fn transfers_answer(
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::NOT_FOUND, "unknown or expired transfer").into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct SendFileQuery {
+    /// Live client id (from `/api/status`), not the device id — sending is
+    /// an action on a *connected* session.
+    client_id: u64,
+    name: String,
+}
+
+/// Host→viewer file send (ROADMAP P2.15). The panel browser uploads the
+/// file bytes (the user explicitly picked them — the service deliberately
+/// exposes no "send an arbitrary host path" primitive to other local
+/// processes); they are spooled + hashed, then offered to the viewer, which
+/// must explicitly accept before anything is streamed.
+async fn send_file(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SendFileQuery>,
+    body: axum::body::Body,
+) -> impl IntoResponse {
+    use futures_util::StreamExt as _;
+    use sha2::Digest as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let max = state.cfg.file.max_file_mb.saturating_mul(1024 * 1024);
+    let dir = state.cfg.file_transfer_dir();
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage: {e}")).into_response();
+    }
+    let spool = dir.join(format!(".send-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = match tokio::fs::File::create(&spool).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("storage: {e}")).into_response()
+        }
+    };
+    let discard = |spool: std::path::PathBuf| async move {
+        let _ = tokio::fs::remove_file(&spool).await;
+    };
+
+    let mut hasher = sha2::Sha256::new();
+    let mut size: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                drop(file);
+                discard(spool).await;
+                return (StatusCode::BAD_REQUEST, format!("upload aborted: {e}")).into_response();
+            }
+        };
+        size += chunk.len() as u64;
+        if size > max {
+            drop(file);
+            discard(spool).await;
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file exceeds the max_file_mb limit",
+            )
+                .into_response();
+        }
+        hasher.update(&chunk);
+        if let Err(e) = file.write_all(&chunk).await {
+            drop(file);
+            discard(spool).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+        }
+    }
+    if size == 0 {
+        drop(file);
+        discard(spool).await;
+        return (StatusCode::BAD_REQUEST, "empty file").into_response();
+    }
+    if let Err(e) = file.flush().await {
+        drop(file);
+        discard(spool).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("flush: {e}")).into_response();
+    }
+    drop(file);
+    let sha256_hex = hex::encode(hasher.finalize());
+    match state.send_file_to_client(q.client_id, &q.name, size, &sha256_hex, spool.clone()) {
+        Ok(id) => Json(serde_json::json!({ "id": id, "size_bytes": size })).into_response(),
+        Err(e) => {
+            discard(spool).await;
+            (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response()
+        }
     }
 }
 

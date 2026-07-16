@@ -280,6 +280,39 @@ if (got !== fileContent) await fail("delivered file content mismatch");
 await page.screenshot({ path: join(shotDir, "4-features.png") });
 console.log(`file drop verified (${fileContent.length} bytes, panel-gated, sha256-checked)`);
 
+// ---- host→viewer file send: panel upload → in-browser accept prompt →
+// verified browser download --------------------------------------------------
+const sendBytes = Buffer.alloc(300_001);
+for (let i = 0; i < sendBytes.length; i++) sendBytes[i] = (i * 131) & 0xff;
+const statusRes = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+if (statusRes.clients.length !== 1) await fail(`panel sees ${statusRes.clients.length} clients`);
+const sendRes = await fetch(
+  `http://127.0.0.1:${panelPort}/api/send-file?client_id=${statusRes.clients[0].id}&name=e2e-recv.bin`,
+  { method: "POST", body: sendBytes },
+);
+if (!sendRes.ok) await fail(`send-file API failed: ${sendRes.status} ${await sendRes.text()}`);
+// The offer prompt must appear in the viewer…
+try {
+  await page.waitForSelector("#file-offer button", { timeout: 10000 });
+} catch {
+  await fail("file offer prompt never appeared in the viewer");
+}
+const offerText = await page.locator("#file-offer span").textContent();
+if (!offerText.includes("e2e-recv.bin") || !offerText.includes("0.30 MB"))
+  await fail(`bad offer prompt text: ${offerText}`);
+await page.screenshot({ path: join(shotDir, "5-file-offer.png") });
+// …and accepting it must produce a bit-exact, sha256-verified download.
+const downloadP = page.waitForEvent("download", { timeout: 20000 });
+await page.locator("#file-offer button", { hasText: "Save file" }).click();
+const download = await downloadP.catch(() => null);
+if (!download) await fail("accepting the offer produced no download");
+if (download.suggestedFilename() !== "e2e-recv.bin")
+  await fail(`bad download name ${download.suggestedFilename()}`);
+const dlPath = await download.path();
+const dlBytes = await import("node:fs").then((fs) => fs.readFileSync(dlPath));
+if (!dlBytes.equals(sendBytes)) await fail("downloaded file content mismatch");
+console.log(`host→viewer send verified (${sendBytes.length} bytes, accept-gated, downloaded bit-exact)`);
+
 await browser.close();
 host.kill();
 rmSync(dataDir, { recursive: true, force: true });

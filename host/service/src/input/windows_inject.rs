@@ -1,9 +1,11 @@
-//! Windows input injection: `SendInput` for mouse/keyboard/touch-as-mouse,
-//! and **Windows Ink synthetic pointers** for the stylus
-//! (`CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput`,
-//! Win10 1809+) so remote pen strokes carry real **pressure and tilt** into
-//! ink-aware apps (ROADMAP P2.14). If the synthetic-pointer API is
-//! unavailable or fails, pen events fall back to the mouse mapping.
+//! Windows input injection: `SendInput` for mouse/keyboard, and **Windows
+//! Ink synthetic pointers** (`CreateSyntheticPointerDevice` +
+//! `InjectSyntheticPointerInput`, Win10 1809+) for the stylus — real
+//! **pressure and tilt** into ink-aware apps — and for **multi-touch**
+//! (ROADMAP P2.14): every viewer finger becomes a real touch contact, so
+//! pinch-zoom / two-finger scroll / multi-finger gestures work. If the
+//! synthetic-pointer API is unavailable or fails, pen falls back to the
+//! mouse mapping and touch to a primary-finger mouse mapping.
 //!
 //! Coordinates arrive normalized (0..1) relative to the *streamed monitor*.
 //! They are mapped through the captured output's desktop rectangle into the
@@ -14,7 +16,7 @@
 
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
@@ -30,13 +32,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::Pointer::{
     InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT,
     POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
+    POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    XBUTTON1, XBUTTON2,
+    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
+    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_PRESSURE, XBUTTON1, XBUTTON2,
 };
 
+use super::touch::{ContactAction, FrameContact, TouchTracker, MAX_TOUCH_CONTACTS};
 use super::{pen_pressure_1024, pen_tilt_deg, InputSink};
 use crate::state::AppState;
 
@@ -51,6 +55,13 @@ pub struct WindowsInputSink {
     /// Lazily-created Windows Ink synthetic pen (None = untried, Some(None)
     /// = unavailable on this system → mouse fallback).
     pen: Mutex<Option<Option<PenDevice>>>,
+    /// Lazily-created synthetic touch device + its frame tracker (same
+    /// tri-state as `pen`).
+    touch: Mutex<Option<Option<TouchInjector>>>,
+    /// In mouse-fallback mode, the wire id of the finger driving the mouse
+    /// (only the first finger does — a second finger must not fight over
+    /// the single cursor).
+    fallback_finger: Mutex<Option<u32>>,
 }
 
 impl WindowsInputSink {
@@ -60,6 +71,8 @@ impl WindowsInputSink {
             touch_down: Mutex::new(false),
             modifiers: Mutex::new(0),
             pen: Mutex::new(None),
+            touch: Mutex::new(None),
+            fallback_finger: Mutex::new(None),
         }
     }
 
@@ -135,6 +148,73 @@ impl WindowsInputSink {
             return false;
         }
         true
+    }
+
+    /// Inject one touch event through the synthetic-pointer API. Returns
+    /// false when that path is unavailable (caller falls back to mouse).
+    fn inject_touch(&self, id: u32, phase: TouchPhase, x: f32, y: f32, pressure: f32) -> bool {
+        let mut slot = self.touch.lock().unwrap();
+        let injector = slot.get_or_insert_with(|| match TouchDevice::create() {
+            Ok(device) => {
+                tracing::info!("synthetic touch device active (multi-touch enabled)");
+                Some(TouchInjector {
+                    device,
+                    tracker: TouchTracker::default(),
+                })
+            }
+            Err(e) => {
+                tracing::info!("synthetic touch unavailable ({e:#}); touch maps to mouse");
+                None
+            }
+        });
+        let Some(injector) = injector else {
+            return false;
+        };
+        let Some(frame) = injector.tracker.event(id, phase, x, y, pressure) else {
+            return true; // nothing to inject (overflow / unknown lift) — handled
+        };
+        if let Err(e) = injector
+            .device
+            .inject(&frame, |x, y| self.desktop_pixel(x, y))
+        {
+            // A failing injection (session switch, device loss) downgrades
+            // to the mouse path permanently rather than erroring per event.
+            tracing::warn!("touch injection failed ({e:#}); falling back to mouse");
+            *slot = Some(None);
+            return false;
+        }
+        true
+    }
+
+    /// Mouse-fallback touch mapping: only the first finger drives the
+    /// cursor; additional fingers are ignored until it lifts.
+    fn touch_as_mouse(&self, batch: &mut Vec<INPUT>, id: u32, phase: TouchPhase, x: f32, y: f32) {
+        {
+            let mut finger = self.fallback_finger.lock().unwrap();
+            match phase {
+                TouchPhase::Start => {
+                    if finger.is_some() && *finger != Some(id) {
+                        return;
+                    }
+                    *finger = Some(id);
+                }
+                TouchPhase::Move => {
+                    // Unknown finger = stream began mid-gesture; adopt it.
+                    if finger.is_none() {
+                        *finger = Some(id);
+                    } else if *finger != Some(id) {
+                        return;
+                    }
+                }
+                TouchPhase::End | TouchPhase::Cancel => {
+                    if *finger != Some(id) {
+                        return;
+                    }
+                    *finger = None;
+                }
+            }
+        }
+        self.pointer_as_mouse(batch, phase, x, y);
     }
 
     /// Map a normalized (0..1) point on the streamed monitor to the 0..65535
@@ -517,6 +597,103 @@ impl Drop for PenDevice {
     }
 }
 
+/// Owned synthetic touch device + the tracker that turns per-finger wire
+/// events into the full frames the API requires.
+struct TouchInjector {
+    device: TouchDevice,
+    tracker: TouchTracker,
+}
+
+struct TouchDevice {
+    handle: HSYNTHETICPOINTERDEVICE,
+}
+
+// SAFETY: the device handle is only used under the sink's mutex.
+unsafe impl Send for TouchDevice {}
+
+impl TouchDevice {
+    fn create() -> windows::core::Result<Self> {
+        // SAFETY: plain API call; the returned handle is owned by us.
+        let handle = unsafe {
+            CreateSyntheticPointerDevice(
+                PT_TOUCH,
+                MAX_TOUCH_CONTACTS as u32,
+                POINTER_FEEDBACK_DEFAULT,
+            )
+        }?;
+        Ok(Self { handle })
+    }
+
+    /// Inject one full frame (all active contacts).
+    fn inject(
+        &self,
+        frame: &[FrameContact],
+        to_pixel: impl Fn(f32, f32) -> POINT,
+    ) -> windows::core::Result<()> {
+        if frame.is_empty() {
+            return Ok(());
+        }
+        let infos: Vec<POINTER_TYPE_INFO> = frame
+            .iter()
+            .map(|c| {
+                let (flags, in_contact) = match c.action {
+                    ContactAction::Down => (
+                        POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
+                        true,
+                    ),
+                    ContactAction::Update => (
+                        POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
+                        true,
+                    ),
+                    ContactAction::Up => (POINTER_FLAG_UP, false),
+                    ContactAction::Cancel => (POINTER_FLAG_UP | POINTER_FLAG_CANCELED, false),
+                };
+                let pos = to_pixel(c.x, c.y);
+                POINTER_TYPE_INFO {
+                    r#type: PT_TOUCH,
+                    Anonymous: POINTER_TYPE_INFO_0 {
+                        touchInfo: POINTER_TOUCH_INFO {
+                            pointerInfo: POINTER_INFO {
+                                pointerType: PT_TOUCH,
+                                pointerId: c.slot,
+                                pointerFlags: flags,
+                                ptPixelLocation: pos,
+                                ..Default::default()
+                            },
+                            touchFlags: 0,
+                            touchMask: TOUCH_MASK_CONTACTAREA | TOUCH_MASK_PRESSURE,
+                            // A small square around the point — apps use the
+                            // contact area for touch-target disambiguation.
+                            rcContact: RECT {
+                                left: pos.x - 2,
+                                top: pos.y - 2,
+                                right: pos.x + 2,
+                                bottom: pos.y + 2,
+                            },
+                            rcContactRaw: RECT::default(),
+                            orientation: 0,
+                            pressure: if in_contact {
+                                pen_pressure_1024(c.pressure, true)
+                            } else {
+                                0
+                            },
+                        },
+                    },
+                }
+            })
+            .collect();
+        // SAFETY: every info is fully initialized; the handle is live.
+        unsafe { InjectSyntheticPointerInput(self.handle, &infos) }
+    }
+}
+
+impl Drop for TouchDevice {
+    fn drop(&mut self) {
+        // SAFETY: handle owned by this struct, dropped exactly once.
+        unsafe { DestroySyntheticPointerDevice(self.handle) };
+    }
+}
+
 impl InputSink for WindowsInputSink {
     fn apply(&self, events: &[InputEvent]) {
         let mut batch: Vec<INPUT> = Vec::with_capacity(events.len() + 2);
@@ -618,10 +795,22 @@ impl InputSink for WindowsInputSink {
                     // Fallback: same single-pointer mouse mapping as touch.
                     self.pointer_as_mouse(&mut batch, *phase, *x, *y);
                 }
-                InputEvent::Touch { phase, x, y, .. } => {
-                    // Single-pointer mapping to mouse until InjectTouchInput
-                    // integration (see docs/ROADMAP.md).
-                    self.pointer_as_mouse(&mut batch, *phase, *x, *y);
+                InputEvent::Touch {
+                    id,
+                    phase,
+                    x,
+                    y,
+                    pressure,
+                } => {
+                    // Preserve ordering: anything already queued for
+                    // SendInput must land before the touch frame.
+                    self.send(&batch);
+                    batch.clear();
+                    if self.inject_touch(*id, *phase, *x, *y, *pressure) {
+                        continue;
+                    }
+                    // Fallback: primary finger drives the mouse.
+                    self.touch_as_mouse(&mut batch, *id, *phase, *x, *y);
                 }
             }
         }

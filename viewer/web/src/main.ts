@@ -8,6 +8,7 @@ import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
 import { FileSender } from "./filedrop";
+import { FileReceiver } from "./filerecv";
 import { contentBox, InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
 import { Session } from "./session";
@@ -38,6 +39,7 @@ let input: InputCapture | null = null;
 let audioPlayer: AudioPlayer | null = null;
 let audioWanted = false;
 let fileSender: FileSender | null = null;
+let fileReceiver: FileReceiver | null = null;
 let statsTimer: number | undefined;
 let pingTimer: number | undefined;
 const clock = new ClockSync();
@@ -187,8 +189,10 @@ function onSessionClosed(host: string, reason: string): void {
 }
 
 function onControl(msg: ControlMsg): void {
-  // Transfer messages are consumed by the active file sender.
+  // Transfer messages are consumed by the active file sender (answers to
+  // our own offers) or the receiver (host→viewer offers/chunks).
   if (fileSender?.handleControl(msg)) return;
+  if (fileReceiver?.handleControl(msg)) return;
   switch (msg.type) {
     case "pong":
       clock.onPong(Number(msg.t0_us), Number(msg.t1_us));
@@ -290,6 +294,7 @@ function enterViewer(s: Session): void {
   $("server-name").textContent = `${s.info.serverName} · ${s.info.codec.toUpperCase()}`;
   if (s.info.newlyPaired) showToast("Paired ✓ — this device is now trusted by the host");
   fileSender = new FileSender(s);
+  fileReceiver = new FileReceiver(s, receiveUi());
   const audioBtn = $<HTMLButtonElement>("audio-btn");
   if (audioPreference() === null) {
     audioBtn.style.display = "none"; // nothing here can play audio
@@ -363,6 +368,8 @@ function endSession(reason: string): void {
   input = null;
   stopAudio(false);
   fileSender = null;
+  fileReceiver = null;
+  fileOfferBox.style.display = "none";
   transferStatus.style.display = "none";
   renderer?.destroy();
   renderer = null;
@@ -516,6 +523,70 @@ function xferUi() {
     onFail(reason: string) {
       transferStatus.style.display = "none";
       showToast(`File not sent: ${reason}`, 7000);
+    },
+  };
+}
+
+// --- host → viewer file receive -------------------------------------------
+
+const fileOfferBox = $("file-offer");
+
+function fmtMb(bytes: number): string {
+  return `${(bytes / 1e6).toFixed(bytes < 1e6 ? 2 : 1)} MB`;
+}
+
+/** Ask the user about an incoming file offer (explicit per-transfer accept). */
+function confirmFileOffer(name: string, sizeBytes: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    fileOfferBox.innerHTML = "";
+    const label = document.createElement("span");
+    label.textContent = `The PC wants to send you “${name}” (${fmtMb(sizeBytes)}).`;
+    const accept = document.createElement("button");
+    accept.textContent = "Save file";
+    const decline = document.createElement("button");
+    decline.textContent = "Decline";
+    decline.className = "danger";
+    const finish = (ok: boolean) => {
+      fileOfferBox.style.display = "none";
+      resolve(ok);
+    };
+    accept.onclick = () => finish(true);
+    decline.onclick = () => finish(false);
+    fileOfferBox.append(label, accept, decline);
+    fileOfferBox.style.display = "flex";
+  });
+}
+
+/** Hand a verified received file to the browser as a download. */
+function downloadBlob(name: string, data: Blob): void {
+  const url = URL.createObjectURL(data);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Give the download a moment to start before releasing the object URL.
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function receiveUi() {
+  return {
+    confirm: confirmFileOffer,
+    onProgress(received: number, total: number) {
+      const pct = total ? Math.floor((received / total) * 100) : 0;
+      transferStatus.textContent = `Receiving… ${pct}% (${fmtMb(received)} / ${fmtMb(total)})`;
+      transferStatus.style.display = "block";
+    },
+    onFile(name: string, data: Blob) {
+      transferStatus.style.display = "none";
+      downloadBlob(name, data);
+      showToast(`${name} received and verified ✓`, 6000);
+    },
+    onFail(reason: string) {
+      fileOfferBox.style.display = "none";
+      transferStatus.style.display = "none";
+      showToast(`File not received: ${reason}`, 7000);
     },
   };
 }

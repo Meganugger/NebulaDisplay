@@ -45,6 +45,11 @@ execSync(
   { cwd: webRoot, stdio: "inherit" },
 );
 const { Session } = await import("/tmp/ndsp-session-bundle.mjs");
+execSync(
+  `npx esbuild src/filerecv.ts --bundle --format=esm --outfile=/tmp/ndsp-filerecv-bundle.mjs --log-level=error`,
+  { cwd: webRoot, stdio: "inherit" },
+);
+const { FileReceiver } = await import("/tmp/ndsp-filerecv-bundle.mjs");
 
 // ---- start a real host -----------------------------------------------------
 const dataDir = mkdtempSync(join(tmpdir(), "ndsp-webcompat-"));
@@ -93,10 +98,14 @@ let frames = [];
 let controls = [];
 let audioFrames = [];
 let closed = null;
+let controlHook = null; // extra per-test consumer (file receive)
 const events = {
   onVideo: (f) => frames.push(f),
   onAudio: (f) => audioFrames.push(f),
-  onControl: (m) => controls.push(m),
+  onControl: (m) => {
+    if (controlHook?.(m)) return;
+    controls.push(m);
+  },
   onClose: (r) => (closed = r),
 };
 const hostAddr = `127.0.0.1:${port}`;
@@ -142,6 +151,51 @@ const countAfterOff = audioFrames.length;
 await sleep(500);
 if (audioFrames.length > countAfterOff + 2) fail("audio kept flowing after disable");
 console.log(`audio channel OK (${countAfterOff} PCM frames, off-switch works)`);
+
+// ---- 1c. host→viewer file send: panel upload → explicit viewer accept →
+// chunked stream → sha256-verified file, using the REAL FileReceiver code ----
+{
+  const sent = new Uint8Array(600_123);
+  for (let i = 0; i < sent.length; i += 65536) {
+    crypto.getRandomValues(sent.subarray(i, Math.min(i + 65536, sent.length)));
+  }
+  let offered = null;
+  let gotFile = null;
+  let recvFail = null;
+  const receiver = new FileReceiver(s1, {
+    confirm: async (name, size) => {
+      offered = { name, size };
+      return true; // the "user" accepts
+    },
+    onProgress: () => {},
+    onFile: (name, blob) => (gotFile = { name, blob }),
+    onFail: (r) => (recvFail = r),
+  });
+  controlHook = (m) => receiver.handleControl(m);
+
+  const panel = "http://127.0.0.1:41998";
+  const status = await (await fetch(`${panel}/api/status`)).json();
+  if (status.clients.length !== 1) fail(`panel sees ${status.clients.length} clients`);
+  const res = await fetch(
+    `${panel}/api/send-file?client_id=${status.clients[0].id}&name=compat.bin`,
+    { method: "POST", body: sent },
+  );
+  if (!res.ok) fail(`send-file API: ${res.status} ${await res.text()}`);
+
+  for (let i = 0; i < 200 && !gotFile && !recvFail; i++) await sleep(100);
+  if (recvFail) fail(`file receive failed: ${recvFail}`);
+  if (!gotFile) fail("file never arrived");
+  if (!offered || offered.name !== "compat.bin" || offered.size !== sent.length)
+    fail(`bad offer metadata: ${JSON.stringify(offered)}`);
+  if (gotFile.name !== "compat.bin") fail(`bad received name ${gotFile.name}`);
+  const got = new Uint8Array(await gotFile.blob.arrayBuffer());
+  if (got.length !== sent.length) fail(`received ${got.length} of ${sent.length} bytes`);
+  for (let i = 0; i < got.length; i++) {
+    if (got[i] !== sent[i]) fail(`received file differs at byte ${i}`);
+  }
+  controlHook = null;
+  console.log(`host→viewer file send OK (${sent.length} bytes, sha256 verified by the receiver)`);
+}
 
 s1.close();
 await sleep(300);

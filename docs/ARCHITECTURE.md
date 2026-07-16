@@ -66,10 +66,12 @@ machines); the *video task* encodes event-driven (a new capture starts
 encoding immediately, rate-limited to the adaptive fps); the *audio task*
 forwards blocks from the global audio loop while the viewer has audio
 enabled and permitted; the *writer* owns the socket with a strict priority
-order — control preempts audio preempts video — video flowing through a
-latest-only slot and audio through a short drop-oldest FIFO (continuity
-matters for sound, staleness matters for frames). No stage can block
-another; there is no shared pacing timer to disturb.
+order — control preempts audio preempts video preempts bulk file chunks —
+video flowing through a latest-only slot, audio through a short drop-oldest
+FIFO (continuity matters for sound, staleness matters for frames), and
+host→viewer file chunks through a tightly bounded lowest-priority lane
+(bulk transfers pace on socket drain and never add latency). No stage can
+block another; there is no shared pacing timer to disturb.
 
 **Audio is captured once, fanned out per client.** A single global loop
 (WASAPI loopback on Windows, tone source elsewhere) resamples/downmixes to
@@ -153,8 +155,10 @@ coordinates → discrete events sent immediately, move samples coalesced ≤4 ms
 (device-rate via pointerrawupdate/getCoalescedEvents where available) →
 encrypted control channel → session pump applies them the moment they
 decrypt (never queued behind video) after checking the device's grant
-(deny by default, toggled live from the panel) → `SendInput` mapped through
-the captured monitor's desktop rect (multi-monitor correct).
+(deny by default, toggled live from the panel) → injection mapped through
+the captured monitor's desktop rect (multi-monitor correct): `SendInput`
+for mouse/keyboard, Windows Ink synthetic pointers for pen (pressure/tilt)
+and multi-touch, with automatic mouse fallback where those are missing.
 
 ### Control/health
 2 Hz Ping/Pong (clock sync + RTT, answered off the fast path), 2 s HostStats
