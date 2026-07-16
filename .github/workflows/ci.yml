@@ -43,10 +43,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.out 2>&1; then
-            grep -E "^(error|warning)" -B1 -A4 clippy.out | head -c 3500 | while IFS= read -r l; do echo "::warning title=clippy::$l"; done
-            tail -c 1500 clippy.out | while IFS= read -r l; do echo "::warning title=clippy-tail::$l"; done
+            tail -c 6000 clippy.out
+            git config user.email ci@local && git config user.name ci-debug
+            git checkout -B ci-debug-win
+            git add -f clippy.out && git commit -q -m "ci debug: windows clippy log"
+            git push -f -q origin ci-debug-win || true
             exit 1
           fi
       - name: Tests
