@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: System deps (ALSA for cpal, D-Bus for keyring)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -41,6 +43,65 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  rust-macos:
+    name: Rust (macOS) — keychain/CoreAudio paths compile + tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings) — validates keyring apple-native + cpal CoreAudio code
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  spake2-interop:
+    name: SPAKE2 — Kotlin (Android) vs Rust byte-compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build the Rust reference server
+        run: cargo build -p ndsp-protocol --example spake2_interop
+      - name: Run the cross-stack exchange (25 rounds + negatives)
+        run: gradle -p viewer/android/interop --no-daemon run --args="$PWD/target/debug/examples/spake2_interop"
+
+  android-build:
+    name: Android viewer — assembleDebug
+    runs-on: ubuntu-latest
+    # Advisory until proven stable on runners (the app needs the Android
+    # SDK, which only exists in CI — see docs/TESTING.md).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Assemble debug APK
+        working-directory: viewer/android
+        run: gradle --no-daemon :app:assembleDebug
+
+  ios-typecheck:
+    name: iOS viewer — Swift type check (iphonesimulator SDK)
+    runs-on: macos-latest
+    # Advisory until proven stable on runners (no Xcode project yet; this
+    # gates the Swift sources the way driver-syntax gates the driver).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Type-check against the simulator SDK
+        working-directory: viewer/ios
+        run: |
+          xcrun -sdk iphonesimulator swiftc -typecheck             -target arm64-apple-ios16.0-simulator             NebulaViewer/*.swift
+
   driver-syntax:
     name: IddCx driver — syntax/type check (both header models)
     runs-on: ubuntu-latest
@@ -54,6 +115,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: System deps (ALSA for cpal, D-Bus for keyring)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -84,6 +147,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: System deps (ALSA for cpal, D-Bus for keyring)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4

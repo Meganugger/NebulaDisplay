@@ -20,7 +20,7 @@ with its own protocol (NDSP), no cloud, no accounts, no telemetry.
 │  nebula-tray (host/tray-ui) ──► loopback ────┤  discovery (UDP)   │
 │  panel.html  (127.0.0.1 only) ──────────────►│  panel API         │
 └──────────────────────────────────────────────┼───────────────────┘
-                                               │ NDSP over WebSocket
+                                               │ NDSP over WebSocket or QUIC
               ┌────────────────┬───────────────┼────────────┬──────────────┐
               ▼                ▼               ▼            ▼              ▼
         web viewer      desktop viewer     Android        iOS         (future)
@@ -35,7 +35,7 @@ with its own protocol (NDSP), no cloud, no accounts, no telemetry.
 |---|---|---|
 | `shared/protocol` | Rust | NDSP v1: control messages, encrypted envelopes, media framing, handshake crypto, discovery beacons. The single wire-format authority. |
 | `shared/client` | Rust | Client SDK (pair / token reconnect / encrypted session) used by the desktop viewer and by integration tests against the real server. |
-| `host/service` (`nebulad`) | Rust | The host: capture sources, encoders, audio loop, per-client sessions, adaptation, PIN/trust security (SPAKE2 + legacy), clipboard bridge, file-transfer approvals, discovery, loopback panel, optional TLS front end, DPAPI keystore. |
+| `host/service` (`nebulad`) | Rust | The host: capture sources, encoders (OpenH264 + Media Foundation H.264/HEVC), audio loop, per-client sessions over WebSocket **or QUIC** (`transport.rs`/`quic.rs`), adaptation, PIN/trust security (SPAKE2 + legacy), clipboard bridge, file transfers in both directions, discovery, loopback panel, optional TLS front end, keystore (DPAPI / OS keychain). |
 | `host/windows-driver` | C++ | IddCx UMDF driver: real virtual monitor, swap-chain processing, shared-memory frame ring. |
 | `host/tray-ui` | Rust | Windows notification-area companion (thin HTTP client of the panel API). |
 | `viewer/web` | TypeScript | Zero-install browser viewer + host control panel (served by nebulad). |
