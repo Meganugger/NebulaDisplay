@@ -25,10 +25,7 @@
 //!   messages preempt video; video frames flow through a latest-only slot,
 //!   so a slow socket drops stale frames instead of queueing them.
 
-use axum::extract::ws::{Message, WebSocket};
 use base64::Engine as _;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use ndsp_protocol::{
     envelope::{Channel, Direction, Opener, Sealer},
     media::{AudioCodec, AudioFrame, VideoFrame},
@@ -48,6 +45,7 @@ use crate::adapt::AdaptiveController;
 use crate::input::InputSink;
 use crate::pairing::AuthComplete;
 use crate::state::{AppState, ClientHandle, SessionCommand};
+use crate::transport::{Inbound, SessionSink, SessionStream, Transport};
 use crate::util::now_us;
 
 /// Liveness: drop the session if nothing (not even pings) arrives for this long.
@@ -200,12 +198,12 @@ fn mode_to_u8(m: InputMode) -> u32 {
 
 pub async fn run(
     state: Arc<AppState>,
-    socket: WebSocket,
+    transport: Transport,
     auth: AuthComplete,
     addr: SocketAddr,
     input_sink: Arc<dyn InputSink>,
 ) {
-    let (ws_tx, ws_rx) = socket.split();
+    let (ws_tx, ws_rx) = transport.split();
     let session_key = auth.session_key;
     let sealer = Sealer::new(&session_key, Direction::ServerToClient);
     let opener = Opener::new(&session_key, Direction::ClientToServer);
@@ -506,7 +504,7 @@ pub async fn run(
 /// Owns the socket sink. Control preempts audio preempts video; video is
 /// latest-only, audio is a short FIFO (continuity matters), control is rare.
 async fn writer_task(
-    mut ws_tx: SplitSink<WebSocket, Message>,
+    mut ws_tx: SessionSink,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
     mut aud_rx: mpsc::Receiver<AudioFrame>,
@@ -522,14 +520,14 @@ async fn writer_task(
                 let Some(msg) = msg else { break };
                 let json = msg.to_json().expect("control message serialization");
                 let envelope = sealer.seal(Channel::Control, json.as_bytes());
-                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+                if ws_tx.send_control(envelope).await.is_err() { break; }
             }
 
             frame = aud_rx.recv() => {
                 let Some(af) = frame else { break };
                 let envelope = sealer.seal_parts(Channel::Audio, &[&af.header(), &af.payload]);
                 shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
-                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+                if ws_tx.send_audio(envelope).await.is_err() { break; }
             }
 
             changed = vid_rx.changed() => {
@@ -547,7 +545,7 @@ async fn writer_task(
                     sealer.seal_parts(Channel::Video, &[&vf.header(), &vf.payload]);
                 shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
                 let t_send = Instant::now();
-                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
+                if ws_tx.send_video(envelope).await.is_err() { break; }
                 ema_update(&shared.seal_send_us_avg, t_seal.elapsed().as_micros() as u64);
                 shared.frames_sent.fetch_add(1, Ordering::Relaxed);
                 // A send that takes longer than a frame period means the TCP
@@ -562,7 +560,7 @@ async fn writer_task(
             }
         }
     }
-    let _ = ws_tx.close().await;
+    ws_tx.close().await;
 }
 
 /// Event-driven encode loop with a pacing floor.
@@ -815,16 +813,24 @@ fn open_transfer(
 /// waits behind an encode or a video send.
 async fn incoming_pump(
     state: Arc<AppState>,
-    mut ws_rx: SplitStream<WebSocket>,
+    mut ws_rx: SessionStream,
     mut opener: Opener,
     shared: Arc<Shared>,
     ctl_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
     handle: Arc<ClientHandle>,
 ) {
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        match msg {
-            Message::Binary(data) => match opener.open(&data) {
+    loop {
+        let data = match ws_rx.next().await {
+            Inbound::Envelope(data) => data,
+            Inbound::Closed => return,
+            Inbound::Violation(what) => {
+                warn!("{what}; closing");
+                return;
+            }
+        };
+        {
+            match opener.open(&data) {
                 Ok((Channel::Control, plaintext)) => {
                     shared.touch_recv();
                     let Some(ctl) = std::str::from_utf8(&plaintext)
@@ -1101,14 +1107,7 @@ async fn incoming_pump(
                     warn!("envelope rejected: {e}; closing session");
                     return;
                 }
-            },
-            Message::Close(_) => return,
-            // Plaintext frames after auth are a protocol violation.
-            Message::Text(_) => {
-                warn!("plaintext message after auth; closing");
-                return;
             }
-            _ => {}
         }
     }
 }

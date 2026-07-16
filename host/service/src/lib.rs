@@ -13,11 +13,13 @@ pub mod keystore;
 pub mod pairing;
 pub mod panel;
 pub mod pin;
+pub mod quic;
 pub mod server;
 pub mod session;
 pub mod state;
 pub mod tls;
 pub mod transfers;
+pub mod transport;
 pub mod trust;
 pub mod util;
 
@@ -85,11 +87,27 @@ impl EmbeddedHost {
             }
         });
 
-        Ok(Self {
-            state,
-            port,
-            tasks: vec![cap, srv, audio, clip],
-        })
+        // QUIC endpoint on the same port number (UDP side).
+        let quic = if state.cfg.file.quic_enabled {
+            let endpoint = quic::make_endpoint(
+                &state,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            )?;
+            let quic_state = state.clone();
+            let input_sink: Arc<dyn input::InputSink> =
+                Arc::from(input::create_sink(state.clone()));
+            Some(tokio::spawn(async move {
+                if let Err(e) = quic::serve_on(quic_state, input_sink, endpoint).await {
+                    tracing::error!("embedded quic endpoint failed: {e:#}");
+                }
+            }))
+        } else {
+            None
+        };
+
+        let mut tasks = vec![cap, srv, audio, clip];
+        tasks.extend(quic);
+        Ok(Self { state, port, tasks })
     }
 
     pub async fn shutdown(self) {

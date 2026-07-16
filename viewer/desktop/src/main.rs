@@ -50,6 +50,11 @@ struct Args {
     /// (host→viewer file send is declined when unset).
     #[arg(long)]
     receive_dir: Option<std::path::PathBuf>,
+    /// Connect over QUIC (UDP) instead of WebSocket — avoids video
+    /// head-of-line blocking on lossy Wi-Fi. The host must have
+    /// quic_enabled (default on).
+    #[arg(long)]
+    quic: bool,
 }
 
 /// One decoded RGBA frame ready for presentation.
@@ -96,6 +101,7 @@ fn main() -> anyhow::Result<()> {
             pin: args.pin.clone(),
             name: args.name.clone(),
             receive_dir: args.receive_dir.clone(),
+            quic: args.quic,
             profile: args.profile.clone(),
         };
         std::thread::spawn(move || net::run(args_net, shared, proxy, input_rx));

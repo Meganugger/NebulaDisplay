@@ -16,6 +16,8 @@ h264 = ["dep:openh264", "dep:openh264-sys2"]
 ndsp-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

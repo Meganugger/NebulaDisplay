@@ -112,6 +112,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     });
 
+    // QUIC viewer endpoint (UDP, same port number as the TCP endpoint).
+    if state.cfg.file.quic_enabled {
+        let quic_state = state.clone();
+        let input_sink: std::sync::Arc<dyn nebulad::input::InputSink> =
+            std::sync::Arc::from(nebulad::input::create_sink(state.clone()));
+        let (bind, port) = (args.bind, args.port);
+        tokio::spawn(async move {
+            if let Err(e) = nebulad::quic::run(quic_state, input_sink, bind, port).await {
+                error!("quic endpoint failed: {e:#}");
+            }
+        });
+    }
+
     // LAN-facing viewer endpoint (HTTP(S) static + NDSP WebSocket).
     let server = if args.https {
         let material = nebulad::tls::load_or_create(&state.cfg.data_dir)?;

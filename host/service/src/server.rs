@@ -196,7 +196,14 @@ async fn handle_socket(
             return;
         }
     };
-    crate::session::run(state, socket, auth, addr, input_sink).await;
+    crate::session::run(
+        state,
+        crate::transport::Transport::Ws(socket),
+        auth,
+        addr,
+        input_sink,
+    )
+    .await;
 }
 
 async fn drive_handshake(
