@@ -50,7 +50,13 @@ jobs:
             exit 1
           fi
       - name: Tests
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          if ! cargo test --workspace > tests.out 2>&1; then
+            { grep -E "FAILED|panicked|^failures:" -A 6 tests.out | head -c 2500; tail -c 1200 tests.out; } | while IFS= read -r l; do echo "::warning title=win-tests::$l"; done
+            exit 1
+          fi
+          grep "test result" tests.out
 
   driver-syntax:
     name: IddCx driver — syntax/type check (both header models)
