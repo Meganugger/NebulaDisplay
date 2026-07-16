@@ -1,16 +1,24 @@
 //! Persistent trusted-device store.
 //!
-//! Stored as JSON in the data dir (`devices.json`, mode 0600 on unix). Raw
-//! trust tokens are stored because reconnect proofs are keyed hashes over the
-//! token + handshake transcript (see `docs/SECURITY.md` §Trust store). The
-//! host machine is inside the trust boundary — it renders the screen content
-//! in the first place.
+//! Stored in the data dir (`devices.json`). Raw trust tokens are stored
+//! because reconnect proofs are keyed hashes over the token + handshake
+//! transcript (see `docs/SECURITY.md` §Trust store). At-rest protection
+//! (ROADMAP P1.6):
+//!
+//! * **Windows**: the file is wrapped with **DPAPI** (`CryptProtectData`,
+//!   user scope) — only this Windows account on this machine can read it.
+//!   Legacy plaintext stores are migrated transparently on first save.
+//! * **Unix**: plaintext JSON at mode 0600 (the host machine is inside the
+//!   trust boundary — it renders the screen content in the first place).
 
 use ndsp_protocol::crypto::{random_bytes, reauth_transcript, token_proof, TOKEN_LEN};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+/// File prefix marking a DPAPI-wrapped store.
+const DPAPI_MAGIC: &[u8] = b"NDSP-DPAPI1\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedDevice {
@@ -23,6 +31,9 @@ pub struct TrustedDevice {
     pub last_seen_unix: u64,
     /// Whether this device may inject input. **Deny by default.**
     pub input_allowed: bool,
+    /// Whether this device may sync clipboards. **Deny by default.**
+    #[serde(default)]
+    pub clipboard_allowed: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -45,14 +56,15 @@ fn now_unix() -> u64 {
 impl TrustStore {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let devices = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str::<StoreFile>(&raw)
-                .map(|f| f.devices)
-                .unwrap_or_else(|e| {
-                    warn!("trust store corrupt ({e}); starting empty (old file kept as .bak)");
+            let raw = std::fs::read(&path)?;
+            match decode_store(&raw) {
+                Ok(f) => f.devices,
+                Err(e) => {
+                    warn!("trust store unreadable ({e:#}); starting empty (old file kept as .bak)");
                     let _ = std::fs::copy(&path, path.with_extension("json.bak"));
                     Vec::new()
-                })
+                }
+            }
         } else {
             Vec::new()
         };
@@ -61,9 +73,10 @@ impl TrustStore {
 
     fn save(&self) -> anyhow::Result<()> {
         let tmp = self.path.with_extension("json.tmp");
-        let raw = serde_json::to_string_pretty(&StoreFile {
+        let json = serde_json::to_string_pretty(&StoreFile {
             devices: self.devices.clone(),
         })?;
+        let raw = at_rest::protect(json.as_bytes())?;
         std::fs::write(&tmp, raw)?;
         #[cfg(unix)]
         {
@@ -91,7 +104,8 @@ impl TrustStore {
             token_hex: hex::encode(token),
             created_unix: now_unix(),
             last_seen_unix: now_unix(),
-            input_allowed: false, // never grant input implicitly
+            input_allowed: false,     // never grant input implicitly
+            clipboard_allowed: false, // never share clipboards implicitly
         });
         self.save()?;
         info!(device_id, name, "device enrolled (input DENIED by default)");
@@ -145,6 +159,20 @@ impl TrustStore {
         Ok(true)
     }
 
+    pub fn set_clipboard_allowed(
+        &mut self,
+        device_id: &str,
+        allowed: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return Ok(false);
+        };
+        dev.clipboard_allowed = allowed;
+        self.save()?;
+        info!(device_id, allowed, "clipboard grant updated");
+        Ok(true)
+    }
+
     pub fn revoke(&mut self, device_id: &str) -> anyhow::Result<bool> {
         let before = self.devices.len();
         self.devices.retain(|d| d.device_id != device_id);
@@ -159,6 +187,103 @@ impl TrustStore {
     #[cfg(test)]
     pub fn get(&self, device_id: &str) -> Option<&TrustedDevice> {
         self.devices.iter().find(|d| d.device_id == device_id)
+    }
+}
+
+/// Parse a store file: DPAPI-wrapped (magic prefix) or plaintext JSON. Plain
+/// JSON always parses (Unix format + pre-v0.5 Windows migration source).
+fn decode_store(raw: &[u8]) -> anyhow::Result<StoreFile> {
+    if let Some(wrapped) = raw.strip_prefix(DPAPI_MAGIC) {
+        let plain = at_rest::unprotect(wrapped)?;
+        return Ok(serde_json::from_slice(&plain)?);
+    }
+    Ok(serde_json::from_slice(raw)?)
+}
+
+/// Platform at-rest wrapping for the serialized store.
+mod at_rest {
+    #[cfg(windows)]
+    pub fn protect(plain: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut out = super::DPAPI_MAGIC.to_vec();
+        out.extend_from_slice(&dpapi::protect(plain)?);
+        Ok(out)
+    }
+
+    #[cfg(windows)]
+    pub fn unprotect(wrapped: &[u8]) -> anyhow::Result<Vec<u8>> {
+        dpapi::unprotect(wrapped)
+    }
+
+    #[cfg(not(windows))]
+    pub fn protect(plain: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(plain.to_vec())
+    }
+
+    #[cfg(not(windows))]
+    pub fn unprotect(_wrapped: &[u8]) -> anyhow::Result<Vec<u8>> {
+        // A DPAPI blob can only be opened by the Windows account that wrote
+        // it; a store copied to another OS is unreadable by design.
+        anyhow::bail!("store is DPAPI-protected (written on Windows)")
+    }
+
+    #[cfg(windows)]
+    mod dpapi {
+        use anyhow::Context;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Cryptography::{
+            CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        };
+
+        fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+            CRYPT_INTEGER_BLOB {
+                cbData: data.len() as u32,
+                pbData: data.as_ptr() as *mut u8,
+            }
+        }
+
+        fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+            let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec() };
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(out.pbData as *mut _)));
+            }
+            v
+        }
+
+        pub fn protect(plain: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let input = blob(plain);
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            unsafe {
+                CryptProtectData(
+                    &input,
+                    None,
+                    None,
+                    None,
+                    None,
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut output,
+                )
+            }
+            .context("CryptProtectData")?;
+            Ok(take(output))
+        }
+
+        pub fn unprotect(wrapped: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let input = blob(wrapped);
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            unsafe {
+                CryptUnprotectData(
+                    &input,
+                    None,
+                    None,
+                    None,
+                    None,
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut output,
+                )
+            }
+            .context("CryptUnprotectData")?;
+            Ok(take(output))
+        }
     }
 }
 

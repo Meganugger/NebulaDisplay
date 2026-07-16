@@ -28,6 +28,8 @@ pub async fn run(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         .route("/api/pin/rotate", post(rotate_pin))
         .route("/api/grant", post(grant))
         .route("/api/revoke", post(revoke))
+        .route("/api/audio", post(audio_toggle))
+        .route("/api/audio-mute", post(audio_mute))
         .route("/api/qr.svg", get(qr_svg));
 
     if let Some(dir) = &state.cfg.web_dir {
@@ -50,6 +52,7 @@ struct TrustedDeviceView {
     created_unix: u64,
     last_seen_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
     online: bool,
 }
 
@@ -62,6 +65,11 @@ struct ClientView {
     addr: String,
     connected_unix: u64,
     input_allowed: bool,
+    clipboard_allowed: bool,
+    /// Viewer opted into audio this session (privacy indicator).
+    audio_active: bool,
+    /// Panel-side mute for this client.
+    audio_muted: bool,
     stats: ndsp_protocol::messages::ViewerStats,
 }
 
@@ -75,6 +83,9 @@ struct StatusView {
     viewer_urls: Vec<String>,
     mode: ndsp_protocol::messages::DisplayMode,
     host_stats: ndsp_protocol::messages::HostStats,
+    /// Host audio switch state + whether the pipeline can run at all.
+    audio_enabled: bool,
+    audio_available: bool,
     clients: Vec<ClientView>,
     trusted: Vec<TrustedDeviceView>,
 }
@@ -94,6 +105,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             addr: c.addr.to_string(),
             connected_unix: c.connected_unix,
             input_allowed: c.input_allowed.load(std::sync::atomic::Ordering::Relaxed),
+            clipboard_allowed: c
+                .clipboard_allowed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            audio_active: c.audio_active.load(std::sync::atomic::Ordering::Relaxed),
+            audio_muted: c.audio_muted.load(std::sync::atomic::Ordering::Relaxed),
             stats: c.stats.lock().unwrap().clone(),
         })
         .collect();
@@ -113,6 +129,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             created_unix: d.created_unix,
             last_seen_unix: d.last_seen_unix,
             input_allowed: d.input_allowed,
+            clipboard_allowed: d.clipboard_allowed,
             online: online.contains(&d.device_id),
         })
         .collect();
@@ -128,6 +145,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusView> {
             .collect(),
         mode: *state.mode.lock().unwrap(),
         host_stats: state.host_stats.lock().unwrap().clone(),
+        audio_enabled: state.audio_enabled(),
+        audio_available: state.audio_available(),
         clients,
         trusted,
     })
@@ -142,13 +161,63 @@ async fn rotate_pin(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 struct GrantReq {
     device_id: String,
     allowed: bool,
+    /// Which capability the grant targets. Default "input" (v0.4 clients).
+    #[serde(default = "default_capability")]
+    capability: String,
+}
+
+fn default_capability() -> String {
+    "input".into()
 }
 
 async fn grant(State(state): State<Arc<AppState>>, Json(req): Json<GrantReq>) -> impl IntoResponse {
-    match state.set_input_grant(&req.device_id, req.allowed) {
+    let result = match req.capability.as_str() {
+        "input" => state.set_input_grant(&req.device_id, req.allowed),
+        "clipboard" => state.set_clipboard_grant(&req.device_id, req.allowed),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown capability {other}"),
+            )
+                .into_response()
+        }
+    };
+    match result {
         Ok(true) => (StatusCode::OK, "ok").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown device").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AudioToggleReq {
+    enabled: bool,
+}
+
+/// Host-side global audio switch (config default; live-flippable here).
+async fn audio_toggle(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AudioToggleReq>,
+) -> impl IntoResponse {
+    state.set_audio_enabled(req.enabled);
+    info!(enabled = req.enabled, "panel toggled audio");
+    (StatusCode::OK, "ok")
+}
+
+#[derive(Deserialize)]
+struct AudioMuteReq {
+    device_id: String,
+    muted: bool,
+}
+
+async fn audio_mute(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AudioMuteReq>,
+) -> impl IntoResponse {
+    if state.set_audio_mute(&req.device_id, req.muted) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "device not connected").into_response()
     }
 }
 

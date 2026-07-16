@@ -5,7 +5,9 @@
 //! fresh AES-256-GCM key:
 //!
 //! * **Pair** (first contact) — client must prove knowledge of the on-screen
-//!   PIN by sealing a confirmation under the PIN-bound pairing key.
+//!   PIN. Preferred: **SPAKE2** (`pair_start.pake = true`; transcript is not
+//!   offline-grindable). Legacy PIN-bound-HKDF is accepted only while
+//!   `legacy_pin_pairing = true` (pre-v0.5 mobile viewers).
 //! * **Token** (returning device) — client proves possession of its trust
 //!   token via a hash bound to the full handshake transcript.
 
@@ -13,6 +15,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ndsp_protocol::{
     crypto::{self, HandshakeKeys, SharedSecret},
     messages::{AuthMethod, ClientInfo, Codec, ControlMsg, ServerInfo},
+    pake::{Pake, PakeRole},
     PROTOCOL_VERSION,
 };
 use std::net::IpAddr;
@@ -28,6 +31,7 @@ pub struct AuthComplete {
     pub session_key: [u8; 32],
     pub codec: Codec,
     pub input_allowed: bool,
+    pub clipboard_allowed: bool,
     pub newly_paired: bool,
 }
 
@@ -39,6 +43,8 @@ enum Phase {
         salt: [u8; 16],
         client_pub: Vec<u8>,
         server_pub: Vec<u8>,
+        /// SPAKE2 state when the client requested PAKE pairing.
+        pake: Option<Box<Pake>>,
     },
     Done,
 }
@@ -105,11 +111,13 @@ impl ServerHandshake {
         Codec::Jpeg
     }
 
-    fn auth_ok(&self, input_allowed: bool) -> ControlMsg {
+    fn auth_ok(&self, input_allowed: bool, clipboard_allowed: bool) -> ControlMsg {
         ControlMsg::AuthOk {
             codec: self.select_codec(),
             mode: *self.state.mode.lock().unwrap(),
             input_allowed,
+            clipboard_allowed,
+            audio_available: self.state.audio_available(),
         }
     }
 
@@ -150,9 +158,16 @@ impl ServerHandshake {
                 })
             }
 
-            (Phase::AwaitPairStart, ControlMsg::PairStart { client_pubkey }) => {
+            (
+                Phase::AwaitPairStart,
+                ControlMsg::PairStart {
+                    client_pubkey,
+                    pake,
+                },
+            ) => {
+                let pairing = matches!(self.auth, Some(AuthMethod::Pair));
                 // Rate-limit before any expensive crypto.
-                if matches!(self.auth, Some(AuthMethod::Pair)) {
+                if pairing {
                     if let PinGate::LockedOut { retry_after } = self.state.pins.gate(self.peer_ip) {
                         return Step::reject(
                             ControlMsg::AuthErr {
@@ -162,6 +177,16 @@ impl ServerHandshake {
                                 ),
                             },
                             "pairing lockout",
+                        );
+                    }
+                    if !pake && !self.state.cfg.file.legacy_pin_pairing {
+                        return Step::reject(
+                            ControlMsg::AuthErr {
+                                error: "this host requires PAKE pairing (SPAKE2); \
+                                        update the viewer app or set legacy_pin_pairing = true"
+                                    .into(),
+                            },
+                            "legacy pairing disabled",
                         );
                     }
                 }
@@ -187,22 +212,43 @@ impl ServerHandshake {
                     }
                 };
                 let salt: [u8; 16] = crypto::random_bytes();
+                // SPAKE2 server share (pairing only; token auth needs no PIN
+                // binding). The PIN is sampled *now* — a rotation between
+                // start and confirm simply fails the exchange, like a wrong
+                // PIN would.
+                let pake_state = (pairing && pake).then(|| {
+                    Box::new(Pake::new(
+                        PakeRole::Server,
+                        &self.state.pins.current_pin(),
+                        &salt,
+                        &self.nonce,
+                    ))
+                });
                 let reply = ControlMsg::PairChallenge {
                     server_pubkey: B64.encode(&server_pub),
                     salt: B64.encode(salt),
+                    pake_share: pake_state.as_ref().map(|p| B64.encode(p.share())),
                 };
                 self.phase = Phase::AwaitProof {
                     shared: Box::new(shared),
                     salt,
                     client_pub,
                     server_pub,
+                    pake: pake_state,
                 };
                 Step::reply(reply)
             }
 
-            (Phase::AwaitProof { shared, salt, .. }, ControlMsg::PairConfirm { sealed })
-                if matches!(self.auth, Some(AuthMethod::Pair)) =>
-            {
+            (
+                Phase::AwaitProof {
+                    shared,
+                    salt,
+                    client_pub,
+                    server_pub,
+                    pake,
+                },
+                ControlMsg::PairConfirm { sealed, pake_share },
+            ) if matches!(self.auth, Some(AuthMethod::Pair)) => {
                 let Ok(sealed) = B64.decode(&sealed) else {
                     return Step::reject(
                         ControlMsg::PairResult {
@@ -213,8 +259,45 @@ impl ServerHandshake {
                         "bad confirm b64",
                     );
                 };
-                let pin = self.state.pins.current_pin();
-                let pair_key = shared.pairing_key(salt.as_ref(), &pin, &self.nonce);
+                let pair_key = match pake.take() {
+                    // PAKE path: derive the pairing key from the SPAKE2
+                    // exchange — nothing about the PIN is grindable from the
+                    // transcript.
+                    Some(pake_state) => {
+                        let share = pake_share.as_deref().and_then(|s| B64.decode(s).ok());
+                        let Some(client_share) = share else {
+                            self.state.pins.record_failure(self.peer_ip);
+                            return Step::reject(
+                                ControlMsg::PairResult {
+                                    ok: false,
+                                    sealed_token: None,
+                                    error: Some("missing PAKE share".into()),
+                                },
+                                "missing pake share",
+                            );
+                        };
+                        match pake_state.finish(&client_share, client_pub, server_pub) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                warn!("PAKE finish failed: {e}");
+                                self.state.pins.record_failure(self.peer_ip);
+                                return Step::reject(
+                                    ControlMsg::PairResult {
+                                        ok: false,
+                                        sealed_token: None,
+                                        error: Some("invalid PAKE share".into()),
+                                    },
+                                    "bad pake share",
+                                );
+                            }
+                        }
+                    }
+                    // Legacy path (config-gated): PIN-bound HKDF.
+                    None => {
+                        let pin = self.state.pins.current_pin();
+                        shared.pairing_key(salt.as_ref(), &pin, &self.nonce)
+                    }
+                };
                 let mut expected = crypto::CONFIRM_CONTEXT.to_vec();
                 expected.extend_from_slice(&self.nonce);
                 match crypto::open(&pair_key, &sealed, b"") {
@@ -241,7 +324,7 @@ impl ServerHandshake {
                         };
                         let sealed_token = crypto::seal(&pair_key, &token, b"token");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
-                        let auth_ok = self.auth_ok(false);
+                        let auth_ok = self.auth_ok(false, false);
                         let codec = self.select_codec();
                         self.phase = Phase::Done;
                         Step {
@@ -258,6 +341,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed: false,
+                                clipboard_allowed: false,
                                 newly_paired: true,
                             }),
                             reject: None,
@@ -283,6 +367,7 @@ impl ServerHandshake {
                     salt,
                     client_pub,
                     server_pub,
+                    ..
                 },
                 ControlMsg::TokenProof { proof },
             ) => {
@@ -314,7 +399,8 @@ impl ServerHandshake {
                         let client = self.client.clone().expect("hello precedes proof");
                         let session_key = shared.session_key(salt.as_ref(), &self.nonce);
                         let input_allowed = dev.input_allowed;
-                        let auth_ok = self.auth_ok(input_allowed);
+                        let clipboard_allowed = dev.clipboard_allowed;
+                        let auth_ok = self.auth_ok(input_allowed, clipboard_allowed);
                         let codec = self.select_codec();
                         info!(device = %device_id, "token reconnect ok");
                         self.phase = Phase::Done;
@@ -325,6 +411,7 @@ impl ServerHandshake {
                                 session_key,
                                 codec,
                                 input_allowed,
+                                clipboard_allowed,
                                 newly_paired: false,
                             }),
                             reject: None,

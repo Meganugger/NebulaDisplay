@@ -4,9 +4,10 @@
 //! streaming. Design goals:
 //!
 //! * **Local-first**: no cloud, no accounts. Discovery is separate from trust.
-//! * **Encrypted by default**: an ECDH(P-256) + PIN-bound HKDF handshake
-//!   establishes an AES-256-GCM session key. Everything after authentication
-//!   travels inside encrypted envelopes, even on plain WebSocket transports.
+//! * **Encrypted by default**: an ECDH(P-256) handshake with SPAKE2
+//!   PIN-bound pairing establishes an AES-256-GCM session key. Everything
+//!   after authentication travels inside encrypted envelopes, even on plain
+//!   WebSocket transports.
 //! * **Versioned**: every `Hello` carries `PROTOCOL_VERSION`; peers negotiate
 //!   down to the highest common version. v1 is the baseline described in
 //!   `docs/PROTOCOL.md`.
@@ -16,7 +17,7 @@
 //! ```text
 //! transport   WebSocket (binary) — QUIC/WebTransport planned
 //! envelope    [chan u8][counter u64 BE][AES-256-GCM ciphertext+tag]
-//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (reserved)
+//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (Opus)
 //! ```
 
 pub mod crypto;
@@ -24,6 +25,7 @@ pub mod discovery;
 pub mod envelope;
 pub mod media;
 pub mod messages;
+pub mod pake;
 
 /// Current protocol version. Bump on breaking changes; peers negotiate
 /// `min(client, server)` and refuse to talk below [`MIN_PROTOCOL_VERSION`].
@@ -40,6 +42,11 @@ pub const DEFAULT_DISCOVERY_PORT: u16 = 41799;
 
 /// WebSocket route on the host that speaks NDSP.
 pub const WS_PATH: &str = "/ndsp";
+
+/// Hard cap for one clipboard sync payload (UTF-8 bytes), enforced by both
+/// sender and receiver. Big-enough for text, small enough that a hostile peer
+/// can't use the clipboard channel as a memory hose.
+pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

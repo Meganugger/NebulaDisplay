@@ -19,7 +19,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: cargo fmt --all --check
+        run: |
+          rustfmt --version
+          if ! cargo fmt --all --check > /tmp/fmt.out 2>&1; then
+            head -c 4000 /tmp/fmt.out | while IFS= read -r l; do echo "::warning title=fmt::$l"; done
+            exit 1
+          fi
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (unit + protocol + e2e over real sockets)
@@ -37,9 +42,26 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.out 2>&1; then
+            tail -c 6000 clippy.out
+            git config user.email ci@local && git config user.name ci-debug
+            git checkout -B ci-debug-win
+            git add -f clippy.out && git commit -q -m "ci debug: windows clippy log"
+            git push -f -q origin ci-debug-win || true
+            exit 1
+          fi
       - name: Tests
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          if ! cargo test --workspace > tests.out 2>&1; then
+            { grep -E "FAILED|panicked|^failures:" -A 6 tests.out | head -c 2500; tail -c 1200 tests.out; } | while IFS= read -r l; do echo "::warning title=win-tests::$l"; done
+            exit 1
+          fi
+          grep "test result" tests.out
 
   driver-syntax:
     name: IddCx driver — syntax/type check (both header models)
@@ -70,14 +92,27 @@ jobs:
       - name: Letterbox coordinate-mapping unit tests
         working-directory: viewer/web
         run: node tests/mapping.mjs
+      - name: SPAKE2 cross-stack vectors (TS vs Rust fixed vector)
+        working-directory: viewer/web
+        run: node tests/pake-vectors.mjs
       - name: Build host for compat test
         run: cargo build -p nebulad
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)
         working-directory: viewer/web
-        run: node tests/web-compat.mjs
+        run: |
+          if ! node tests/web-compat.mjs > compat.out 2>&1; then
+            tail -c 2500 compat.out | while IFS= read -r l; do echo "::warning title=web-compat::$l"; done
+            exit 1
+          fi
+          tail -3 compat.out
       - name: Cross-stack compatibility — pure-JS crypto fallback (insecure-context path)
         working-directory: viewer/web
-        run: NDSP_CRYPTO=fallback node tests/web-compat.mjs
+        run: |
+          if ! NDSP_CRYPTO=fallback node tests/web-compat.mjs > compat2.out 2>&1; then
+            tail -c 2500 compat2.out | while IFS= read -r l; do echo "::warning title=web-compat-fallback::$l"; done
+            exit 1
+          fi
+          tail -3 compat2.out
 
   browser-e2e:
     name: Browser E2E — Chromium pairing/H.264/input/panel

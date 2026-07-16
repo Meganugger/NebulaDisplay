@@ -29,6 +29,16 @@ pub struct FileConfig {
     pub lockout_secs: u64,
     /// Default max FPS cap applied on top of profiles.
     pub max_fps: u32,
+    /// Accept the legacy (pre-v0.5) PIN-bound-HKDF pairing in addition to
+    /// SPAKE2. Legacy transcripts are offline-grindable by a *passive*
+    /// recorder (see docs/SECURITY.md); first-party web/desktop viewers
+    /// always use SPAKE2, so this only matters for viewers that predate it
+    /// (current Android/iOS apps). Set to `false` to require PAKE.
+    pub legacy_pin_pairing: bool,
+    /// Allow audio streaming (WASAPI loopback → Opus). Even when true,
+    /// nothing is sent until a viewer explicitly opts in, and the panel
+    /// shows a live indicator. Off by default.
+    pub audio: bool,
 }
 
 impl Default for FileConfig {
@@ -40,6 +50,8 @@ impl Default for FileConfig {
             max_pin_attempts: 5,
             lockout_secs: 300,
             max_fps: 60,
+            legacy_pin_pairing: true,
+            audio: false,
         }
     }
 }
@@ -50,6 +62,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub web_dir: Option<PathBuf>,
     pub file: FileConfig,
+    /// Use the in-memory clipboard backend instead of the OS one. Set by
+    /// embedded/test hosts so tests never touch (or race on) the machine's
+    /// real clipboard.
+    pub memory_clipboard: bool,
 }
 
 impl Config {
@@ -86,6 +102,7 @@ impl Config {
             data_dir,
             web_dir,
             file,
+            memory_clipboard: false,
         })
     }
 }

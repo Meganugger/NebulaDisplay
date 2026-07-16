@@ -28,23 +28,28 @@
           <div class="urls" id="urls"></div>
           <h2 style="margin-top:1.2rem">Streaming</h2>
           <div id="host-stats"></div>
+          <h2 style="margin-top:1.2rem">Audio</h2>
+          <div class="statline"><span id="audio-note">System audio streaming (viewers still opt in)</span>
+            <label class="switch"><input type="checkbox" id="audio-toggle"><span></span></label>
+          </div>
+          <div class="statline" id="audio-indicator" style="display:none"><span style="color:var(--warn,#e6b34d)">● audio is being streamed</span><span class="v" id="audio-listeners"></span></div>
         </div>
       </div>
       <div class="tile" style="margin-top:1rem">
         <h2>Connected now</h2>
         <table id="clients">
           <thead>
-            <tr><th>Device</th><th>From</th><th>FPS</th><th>Latency</th><th>RTT</th><th>Input</th></tr>
+            <tr><th>Device</th><th>From</th><th>FPS</th><th>Latency</th><th>RTT</th><th>Input</th><th>Audio</th></tr>
           </thead>
           <tbody></tbody>
         </table>
         <p id="no-clients" style="color:var(--fg-dim)">No viewers connected.</p>
       </div>
       <div class="tile" style="margin-top:1rem">
-        <h2>Trusted devices <span style="text-transform:none;letter-spacing:0">(input is <b>off by default</b> — enable per device)</span></h2>
+        <h2>Trusted devices <span style="text-transform:none;letter-spacing:0">(input &amp; clipboard are <b>off by default</b> — enable per device)</span></h2>
         <table id="trusted">
           <thead>
-            <tr><th>Device</th><th>Platform</th><th>Last seen</th><th>Allow input</th><th></th></tr>
+            <tr><th>Device</th><th>Platform</th><th>Last seen</th><th>Allow input</th><th>Allow clipboard</th><th></th></tr>
           </thead>
           <tbody></tbody>
         </table>

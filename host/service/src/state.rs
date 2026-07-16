@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
+use crate::clipboard::{ClipboardBackend, ClipboardUpdate, MemoryClipboard};
 use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
@@ -55,7 +56,12 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SetInputGrant(bool),
-    Kick { reason: String },
+    SetClipboardGrant(bool),
+    /// Panel-side per-client audio mute (viewer opt-in state is separate).
+    SetAudioMute(bool),
+    Kick {
+        reason: String,
+    },
 }
 
 /// Panel-visible live client entry.
@@ -66,8 +72,13 @@ pub struct ClientHandle {
     pub addr: SocketAddr,
     pub connected_unix: u64,
     pub input_allowed: Arc<AtomicBool>,
+    pub clipboard_allowed: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
+    /// Viewer opted into audio this session (panel indicator).
+    pub audio_active: Arc<AtomicBool>,
+    /// Panel-side mute for this client (independent of the viewer's opt-in).
+    pub audio_muted: Arc<AtomicBool>,
     pub stats: Mutex<ViewerStats>,
     pub commands: mpsc::Sender<SessionCommand>,
 }
@@ -82,6 +93,17 @@ pub struct AppState {
     pub frame_tx: watch::Sender<Option<Arc<CapturedFrame>>>,
     /// Latest host cursor state; sessions `watch` this.
     pub cursor_tx: watch::Sender<CursorState>,
+    /// Host clipboard backend (real on Windows, in-memory elsewhere/tests).
+    pub clipboard: Arc<dyn ClipboardBackend>,
+    /// Latest host clipboard text; sessions `watch` this and forward it to
+    /// clipboard-granted, clipboard-capable viewers.
+    pub clipboard_tx: watch::Sender<Option<Arc<ClipboardUpdate>>>,
+    /// Encoded Opus packets fan-out (None until the audio pipeline runs).
+    pub audio_tx: tokio::sync::broadcast::Sender<Arc<ndsp_protocol::media::AudioFrame>>,
+    /// The audio pipeline is up (capture + encoder created successfully).
+    audio_ready: AtomicBool,
+    /// Host-side global audio switch (config default; panel can flip live).
+    audio_enabled: AtomicBool,
     pub host_stats: Mutex<HostStats>,
     /// Mode currently produced by the capture source.
     pub mode: Mutex<DisplayMode>,
@@ -106,6 +128,17 @@ impl AppState {
         let trust = TrustStore::load(cfg.data_dir.join("devices.json"))?;
         let (frame_tx, _) = watch::channel(None);
         let (cursor_tx, _) = watch::channel(CursorState::default());
+        let (clipboard_tx, _) = watch::channel(None);
+        // 32 × 20 ms ≈ 640 ms of audio buffering per slow client before the
+        // broadcast channel starts dropping (a drop = short glitch, counted
+        // client-side via seq gaps — always better than growing latency).
+        let (audio_tx, _) = tokio::sync::broadcast::channel(32);
+        let audio_enabled = cfg.file.audio;
+        let clipboard: Arc<dyn ClipboardBackend> = if cfg.memory_clipboard {
+            Arc::new(MemoryClipboard::default())
+        } else {
+            crate::clipboard::create_backend()
+        };
         Ok(Self {
             cfg,
             fingerprint,
@@ -113,6 +146,11 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
+            clipboard,
+            clipboard_tx,
+            audio_tx,
+            audio_ready: AtomicBool::new(false),
+            audio_enabled: AtomicBool::new(audio_enabled),
             host_stats: Mutex::new(HostStats::default()),
             mode: Mutex::new(DisplayMode {
                 width: 1280,
@@ -206,6 +244,67 @@ impl AppState {
             }
         }
         Ok(found)
+    }
+
+    /// Same as [`Self::set_input_grant`] for the clipboard capability.
+    pub fn set_clipboard_grant(&self, device_id: &str, allowed: bool) -> anyhow::Result<bool> {
+        let found = self
+            .trust
+            .lock()
+            .unwrap()
+            .set_clipboard_allowed(device_id, allowed)?;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                client.clipboard_allowed.store(allowed, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetClipboardGrant(allowed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Panel-side per-client audio mute (not persisted — a live control).
+    pub fn set_audio_mute(&self, device_id: &str, muted: bool) -> bool {
+        let mut found = false;
+        for client in self.clients.lock().unwrap().values() {
+            if client.device_id == device_id {
+                found = true;
+                client.audio_muted.store(muted, Ordering::Relaxed);
+                let _ = client
+                    .commands
+                    .try_send(SessionCommand::SetAudioMute(muted));
+            }
+        }
+        found
+    }
+
+    /// The audio pipeline exists (capture source + encoder came up).
+    pub fn set_audio_ready(&self, ready: bool) {
+        self.audio_ready.store(ready, Ordering::Relaxed);
+    }
+
+    /// Host-side global audio switch (panel toggle; starts at the config value).
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Audio can actually be delivered right now (pipeline up **and** the
+    /// host switch is on). Advertised to viewers in `auth_ok`.
+    pub fn audio_available(&self) -> bool {
+        self.audio_ready.load(Ordering::Relaxed) && self.audio_enabled()
+    }
+
+    /// Someone is actually listening (opted in and not muted) — the encode
+    /// gate, so an enabled-but-unused audio pipeline costs ~nothing.
+    pub fn audio_has_listeners(&self) -> bool {
+        self.clients.lock().unwrap().values().any(|c| {
+            c.audio_active.load(Ordering::Relaxed) && !c.audio_muted.load(Ordering::Relaxed)
+        })
     }
 
     /// Revoke trust and kick any live session for that device.

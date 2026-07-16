@@ -1,13 +1,14 @@
 // Viewer application: connect card → streaming canvas with toolbar/stats.
 
 import "./style.css";
+import { AudioPlayer, audioPlaybackSupported } from "./audio";
 import { capabilityReport, caps, fullscreen, storage } from "./caps";
 import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
 import { contentBox, InputCapture } from "./input";
-import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
+import { ControlMsg, HostStats, InputMode, MAX_CLIPBOARD_BYTES, Profile } from "./protocol";
 import { Session } from "./session";
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -29,6 +30,9 @@ const statsOverlay = $("stats-overlay");
 const inputDenied = $("input-denied");
 const toast = $("toast");
 const remoteCursor = $<HTMLImageElement>("remote-cursor");
+const audioBtn = $<HTMLButtonElement>("audio-btn");
+const audioVolume = $<HTMLInputElement>("audio-volume");
+const clipboardBtn = $<HTMLButtonElement>("clipboard-btn");
 
 let session: Session | null = null;
 let renderer: Renderer | null = null;
@@ -43,6 +47,13 @@ let netMsAvg = 0;
 /** Host cursor overlay state (cursor channel). */
 let cursorHot = { x: 0, y: 0 };
 let cursorPos: { x: number; y: number; visible: boolean } | null = null;
+/** Audio playback (created on user gesture; null = off). */
+let audioPlayer: AudioPlayer | null = null;
+/** Clipboard sync toggle + grant state. */
+let clipboardSync = false;
+let clipboardAllowed = false;
+/** Last text synced either way — avoids re-sending what we just received. */
+let lastClipboardText = "";
 
 function defaultHost(): string {
   // When served by nebulad itself, the page origin *is* the host.
@@ -124,6 +135,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
         if (lat !== null && lat >= 0) netMsAvg = netMsAvg === 0 ? lat : netMsAvg * 0.9 + lat * 0.1;
         void renderer?.push(frame);
       },
+      onAudio: (frame) => audioPlayer?.push(frame),
       onControl: onControl,
       onClose: (reason) => onSessionClosed(host, reason),
     });
@@ -134,6 +146,7 @@ async function openSession(host: string, pin: string | null): Promise<void> {
       showToast(`Video error: ${e.message}`, 8000);
     };
     inputAllowed = s.info.inputAllowed;
+    clipboardAllowed = s.info.clipboardAllowed;
     userDisconnected = false; // fresh session — clear any stale flag
     enterViewer(s);
   } catch (e) {
@@ -192,6 +205,26 @@ function onControl(msg: ControlMsg): void {
       inputAllowed = Boolean(msg.allowed);
       refreshInputBadge();
       showToast(inputAllowed ? "Host granted input control" : "Host revoked input control");
+      break;
+    }
+    case "clipboard_grant": {
+      clipboardAllowed = Boolean(msg.allowed);
+      showToast(
+        clipboardAllowed ? "Host granted clipboard sync" : "Host revoked clipboard sync",
+      );
+      refreshClipboardButton();
+      break;
+    }
+    case "clipboard": {
+      // Host clipboard changed. Only touch the local clipboard while the
+      // user has sync switched on here (grant alone is not consent on this
+      // side), and remember the text so we don't bounce it straight back.
+      if (!clipboardSync) break;
+      const text = String(msg.text ?? "");
+      lastClipboardText = text;
+      navigator.clipboard?.writeText(text).catch(() => {
+        showToast("Clipboard blocked by the browser — click the page and try again");
+      });
       break;
     }
     case "cursor_shape": {
@@ -257,6 +290,86 @@ function refreshInputBadge(): void {
   inputDenied.style.display = wantsInput && !inputAllowed ? "inline" : "none";
 }
 
+// --- audio ------------------------------------------------------------------
+
+function refreshAudioButton(): void {
+  const available =
+    session !== null && session.info.audioAvailable && audioPlaybackSupported();
+  audioBtn.style.display = available ? "" : "none";
+  audioVolume.style.display = available && audioPlayer ? "" : "none";
+  audioBtn.textContent = audioPlayer ? "🔊" : "🔇";
+  audioBtn.title = audioPlayer
+    ? "Host audio on — click to stop"
+    : "Host audio (off — click to listen)";
+}
+
+function toggleAudio(): void {
+  if (!session) return;
+  if (audioPlayer) {
+    void session.send({ type: "set_audio", enabled: false });
+    audioPlayer.close();
+    audioPlayer = null;
+  } else {
+    // Constructed inside the click handler → AudioContext may start.
+    audioPlayer = new AudioPlayer();
+    audioPlayer.volume = Number(audioVolume.value) / 100;
+    audioPlayer.onError = (e) => {
+      console.error("audio error", e);
+      showToast(`Audio error: ${e.message}`);
+    };
+    void session.send({ type: "set_audio", enabled: true });
+  }
+  refreshAudioButton();
+}
+
+// --- clipboard --------------------------------------------------------------
+
+function refreshClipboardButton(): void {
+  const supported = typeof navigator !== "undefined" && !!navigator.clipboard;
+  clipboardBtn.style.display = supported && session ? "" : "none";
+  clipboardBtn.textContent = clipboardSync ? "📋✓" : "📋";
+  clipboardBtn.title = clipboardSync
+    ? clipboardAllowed
+      ? "Clipboard sync on — click to stop"
+      : "Clipboard sync on, but the host has not granted it (enable in the host panel)"
+    : "Clipboard sync (off — click to sync clipboards both ways)";
+  clipboardBtn.style.opacity = clipboardSync && !clipboardAllowed ? "0.5" : "";
+}
+
+function toggleClipboard(): void {
+  clipboardSync = !clipboardSync;
+  if (clipboardSync) {
+    if (!clipboardAllowed) {
+      showToast("Clipboard sync needs a grant from the host panel (like input)");
+    }
+    void pushLocalClipboard(); // user gesture → permission prompt is allowed
+  }
+  refreshClipboardButton();
+}
+
+/** Read the local clipboard and send it if it changed (explicit-sync model). */
+async function pushLocalClipboard(): Promise<void> {
+  if (!session || !clipboardSync || !navigator.clipboard?.readText) return;
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text || text === lastClipboardText) return;
+    if (text.length > MAX_CLIPBOARD_BYTES) {
+      showToast("Clipboard too large to sync (256 KiB cap)");
+      return;
+    }
+    lastClipboardText = text;
+    void session.send({ type: "clipboard", text });
+  } catch {
+    // Permission denied / focus lost — silent; the user can retry.
+  }
+}
+
+// Local copies while sync is on are pushed to the host; window focus (coming
+// back from another app where the user copied something) re-checks too.
+window.addEventListener("copy", () => setTimeout(() => void pushLocalClipboard(), 50));
+window.addEventListener("cut", () => setTimeout(() => void pushLocalClipboard(), 50));
+window.addEventListener("focus", () => void pushLocalClipboard());
+
 function enterViewer(s: Session): void {
   connectScreen.style.display = "none";
   viewerScreen.classList.add("active");
@@ -272,6 +385,8 @@ function enterViewer(s: Session): void {
   );
   input.attach();
   refreshInputBadge();
+  refreshAudioButton();
+  refreshClipboardButton();
 
   // 2 Hz keeps the clock/RTT estimate fresh enough for adaptation without
   // measurable cost.
@@ -311,6 +426,9 @@ function enterViewer(s: Session): void {
         `net+host   ${netMsAvg.toFixed(1)} ms`,
         `present    ${st.presentWaitMsAvg.toFixed(2)} ms`,
         `dropped    ${st.framesDropped}`,
+        audioPlayer
+          ? `audio      ${audioPlayer.packetsPlayed} pkts · lost ${audioPlayer.packetsLost} · buf ${audioPlayer.bufferedMs.toFixed(0)} ms`
+          : "audio      off",
         hostStats
           ? `host       ${hostStats.capture_fps.toFixed(0)} fps cap · enc ${hostStats.encode_ms_avg.toFixed(1)} ms (cvt ${hostStats.convert_ms_avg.toFixed(1)}) · age ${hostStats.capture_age_ms_avg.toFixed(1)} · send ${hostStats.seal_send_ms_avg.toFixed(1)} · ${(hostStats.actual_bitrate_kbps / 1000).toFixed(1)} Mbps`
           : "host       …",
@@ -330,6 +448,12 @@ function endSession(reason: string): void {
   session = null;
   hostStats = null;
   cursorPos = null;
+  audioPlayer?.close();
+  audioPlayer = null;
+  clipboardSync = false;
+  clipboardAllowed = false;
+  refreshAudioButton();
+  refreshClipboardButton();
   remoteCursor.style.display = "none";
   remoteCursor.removeAttribute("src");
   viewerScreen.classList.remove("active");
@@ -344,6 +468,11 @@ function round1(n: number): number {
 
 // --- toolbar wiring -------------------------------------------------------
 $("stats-btn").onclick = () => statsOverlay.classList.toggle("visible");
+audioBtn.onclick = toggleAudio;
+audioVolume.oninput = () => {
+  if (audioPlayer) audioPlayer.volume = Number(audioVolume.value) / 100;
+};
+clipboardBtn.onclick = toggleClipboard;
 if (fullscreen.supported) {
   $("fullscreen-btn").onclick = () => {
     if (fullscreen.element()) void fullscreen.exit();

@@ -30,7 +30,7 @@ const host = spawn(
       ? join(repoRoot, "target", "release", "nebulad")
       : join(repoRoot, "target", "debug", "nebulad")),
   [
-    "--test-pattern", "--bind", "127.0.0.1",
+    "--test-pattern", "--audio-test-tone", "--bind", "127.0.0.1",
     "--port", String(port), "--panel-port", String(panelPort),
     "--discovery-port", "0",
     "--data-dir", dataDir,
@@ -196,6 +196,77 @@ const cur2 = await page.evaluate(() => {
 if (!cur1 || cur1.display === "none" || !cur1.src) await fail("remote cursor overlay not visible");
 if (cur1.t === cur2.t) await fail("remote cursor is not moving (cursor channel stalled)");
 console.log("cursor channel verified (shape delivered, position updating)");
+
+// ---- audio: opt-in via toolbar, WebCodecs Opus decode, live indicator ------
+// localhost is a secure context, so AudioDecoder is available in Chromium.
+const audioSupported = await page.evaluate(() => typeof AudioDecoder === "function");
+if (audioSupported) {
+  const audioVisible = await page.evaluate(
+    () => getComputedStyle(document.getElementById("audio-btn")).display !== "none",
+  );
+  if (!audioVisible) await fail("audio button hidden although host streams the test tone");
+  await page.click("#audio-btn");
+  // Packets played must climb (stats overlay line: "audio  N pkts · lost …").
+  let audioLine = "";
+  for (let i = 0; i < 40; i++) {
+    await sleep(250);
+    audioLine = await page.evaluate(
+      () => document.getElementById("stats-overlay").textContent.match(/audio\s+(.*)/)?.[1] ?? "",
+    );
+    if (/^[1-9]\d* pkts/.test(audioLine)) break;
+  }
+  if (!/^[1-9]\d* pkts/.test(audioLine)) await fail(`no audio packets decoded (line: "${audioLine}")`);
+  console.log(`audio verified in-browser (${audioLine.trim()})`);
+
+  // Panel shows the privacy indicator naming the listening client.
+  const stAudio = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+  const panelAudio = {
+    enabled: stAudio.audio_enabled,
+    listeners: stAudio.clients.filter((c) => c.audio_active && !c.audio_muted).length,
+  };
+  if (!panelAudio.enabled || panelAudio.listeners !== 1) {
+    await fail(`panel audio indicator wrong: ${JSON.stringify(panelAudio)}`);
+  }
+  console.log("panel audio indicator verified (1 listener)");
+
+  // Opt out again → indicator clears.
+  await page.click("#audio-btn");
+  await sleep(400);
+  const stAfter = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+  const after = stAfter.clients.filter((c) => c.audio_active).length;
+  if (after !== 0) await fail("client still marked audio_active after opt-out");
+  console.log("audio opt-out verified");
+} else {
+  console.log("SKIP audio (this Chromium build lacks AudioDecoder)");
+}
+
+// ---- clipboard: grant via panel API, host→client sync ----------------------
+const stClip = await (await fetch(`http://127.0.0.1:${panelPort}/api/status`)).json();
+const clipDeviceId = stClip.clients[0]?.device_id;
+await fetch(`http://127.0.0.1:${panelPort}/api/grant`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ device_id: clipDeviceId, allowed: true, capability: "clipboard" }),
+});
+await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+await page.click("#clipboard-btn"); // enable sync client-side
+await sleep(300);
+// Simulate a host-side copy through the embedded test clipboard? The real
+// backend on Linux CI is the in-memory one inside nebulad — not reachable
+// from here, so exercise the client→host direction instead: write to the
+// page clipboard and let the focus/copy hook push it. The host accepts it
+// (grant is on) — verified by it echoing back to a second capable client in
+// the Rust e2e; here we assert the send path doesn't error and sync stays on.
+await page.evaluate(async () => {
+  await navigator.clipboard.writeText("e2e clipboard payload");
+  window.dispatchEvent(new Event("focus"));
+});
+await sleep(400);
+const clipState = await page.evaluate(
+  () => document.getElementById("clipboard-btn").textContent,
+);
+if (!clipState.includes("✓")) await fail("clipboard sync toggle did not stay enabled");
+console.log("clipboard sync UI verified (granted + enabled + push path ran)");
 
 await browser.close();
 host.kill();

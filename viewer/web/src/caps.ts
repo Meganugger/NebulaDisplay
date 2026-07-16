@@ -32,6 +32,12 @@ export const caps = {
   webCodecsH264: detect(
     () => typeof VideoDecoder === "function" && typeof EncodedVideoChunk === "function",
   ),
+  /** WebCodecs Opus decode (audio streaming). Secure contexts only. */
+  audioDecoder: detect(
+    () => typeof AudioDecoder === "function" && typeof EncodedAudioChunk === "function",
+  ),
+  /** Web Audio output (playback of decoded audio). */
+  audioContext: detect(() => typeof AudioContext === "function"),
   /**
    * Media Source Extensions with H.264 — available on *insecure* origins
    * (unlike WebCodecs), so plain-HTTP LAN pages can still stream real H.264
@@ -107,6 +113,7 @@ export function capabilityReport(): string {
     `  getRandomValues     ${mark(caps.getRandomValues)}`,
     `  WebCodecs h264      ${mark(caps.webCodecsH264)}${caps.webCodecsH264 ? "" : caps.mseH264 ? " (MSE h264 fallback)" : " (JPEG streaming fallback)"}`,
     `  MSE h264            ${mark(caps.mseH264)}`,
+    `  WebCodecs opus      ${mark(caps.audioDecoder)}${caps.audioDecoder ? "" : " (no audio streaming)"}`,
     `  createImageBitmap   ${mark(caps.createImageBitmap)}${caps.createImageBitmap ? "" : " (<img> decode fallback)"}`,
     `  PointerEvent        ${mark(caps.pointerEvents)}${caps.pointerEvents ? "" : " (touch/mouse fallback)"}`,
     `  BigInt64 DataView   ${mark(caps.bigInt64DataView)}${caps.bigInt64DataView ? "" : " (u32-pair fallback)"}`,

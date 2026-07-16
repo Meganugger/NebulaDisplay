@@ -9,12 +9,12 @@
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MAPVK_VSC_TO_VK,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -256,6 +256,58 @@ fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
     })
 }
 
+/// Layout-aware injection of a printable character (ROADMAP P2.13): resolve
+/// the *host* layout's virtual key for `ch` with `VkKeyScanW`. Modifier
+/// state travels as separate key events from the viewer, so only the base VK
+/// is injected here. Characters the host layout can't type at all fall back
+/// to Unicode injection (`KEYEVENTF_UNICODE`).
+fn char_key_input(ch: char, pressed: bool) -> INPUT {
+    let mut units = [0u16; 2];
+    let encoded = ch.encode_utf16(&mut units);
+    // VkKeyScanW only handles BMP characters; astral chars go straight to
+    // the Unicode path (which needs surrogate pairs — handled by Text events
+    // in practice; a single keydown injects the first unit best-effort).
+    if encoded.len() == 1 {
+        let scan_result = unsafe { VkKeyScanW(units[0]) };
+        if scan_result != -1 {
+            let vk = (scan_result as u16) & 0xFF;
+            let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+            let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
+            if !pressed {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            return INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: scan,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+        }
+    }
+    let mut flags = KEYEVENTF_UNICODE;
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: units[0],
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
 impl InputSink for WindowsInputSink {
     fn apply(&self, events: &[InputEvent]) {
         let mut batch: Vec<INPUT> = Vec::with_capacity(events.len() + 2);
@@ -292,11 +344,16 @@ impl InputSink for WindowsInputSink {
                         batch.push(mouse_input(0, 0, (dx * 120.0) as i32, MOUSEEVENTF_HWHEEL));
                     }
                 }
-                InputEvent::Key { code, pressed } => {
-                    if let Some(i) = key_input(code, *pressed) {
-                        batch.push(i);
-                    } else {
-                        tracing::debug!(code, "unmapped key code ignored");
+                InputEvent::Key { code, pressed, key } => {
+                    match super::plan_key(code, key.as_deref()) {
+                        super::KeyPlan::Char(ch) => batch.push(char_key_input(ch, *pressed)),
+                        super::KeyPlan::Scancode => {
+                            if let Some(i) = key_input(code, *pressed) {
+                                batch.push(i);
+                            } else {
+                                tracing::debug!(code, "unmapped key code ignored");
+                            }
+                        }
                     }
                 }
                 InputEvent::Text { text } => {

@@ -6,7 +6,7 @@
 ;   driver\  (optional signed driver package + nebula-devnode.exe)
 
 #define AppName "NebulaDisplay"
-#define AppVersion "0.2.0"
+#define AppVersion "0.5.0"
 #define AppPublisher "NebulaDisplay Project"
 
 [Setup]

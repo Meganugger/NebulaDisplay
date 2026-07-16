@@ -1,7 +1,7 @@
 //! `nebulad` — the NebulaDisplay host service binary.
 
 use clap::Parser;
-use nebulad::{capture, config, discovery, panel, server, state, util};
+use nebulad::{audio, capture, clipboard, config, discovery, panel, server, state, util};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +34,14 @@ pub struct Args {
     /// Force the synthetic test-pattern source even on Windows.
     #[arg(long)]
     pub test_pattern: bool,
+    /// Enable audio streaming (WASAPI loopback → Opus). Same as `audio =
+    /// true` in config.toml; viewers still opt in explicitly per session.
+    #[arg(long)]
+    pub audio: bool,
+    /// Use the synthetic 440 Hz tone as the audio source (testing; implies
+    /// --audio).
+    #[arg(long)]
+    pub audio_test_tone: bool,
     /// Capture size for the test pattern source, e.g. 1280x720.
     #[arg(long, default_value = "1280x720")]
     pub capture_size: String,
@@ -72,7 +80,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let cfg = config::Config::load(&(&args).into())?;
+    let mut cfg = config::Config::load(&(&args).into())?;
+    if args.audio || args.audio_test_tone {
+        cfg.file.audio = true;
+    }
     info!(name = %cfg.name, data_dir = %cfg.data_dir.display(), "starting nebulad v{}", env!("CARGO_PKG_VERSION"));
 
     let state = Arc::new(state::AppState::new(cfg).await?);
@@ -81,6 +92,25 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (w, h) = util::parse_size(&args.capture_size)?;
     let source = capture::create_source(args.test_pattern, w, h, args.display_index);
     let capture_handle = tokio::spawn(capture::run_capture_loop(state.clone(), source));
+
+    // Host clipboard → sessions (client → host runs inside each session).
+    tokio::spawn(clipboard::run_clipboard_watch(state.clone()));
+
+    // Audio pipeline (idle until the host switch is on AND a viewer opts in).
+    // Created even when config `audio = false` so the panel toggle works
+    // without a restart; costs nothing while nobody listens.
+    match audio::create_source(args.audio_test_tone) {
+        Ok(source) => {
+            tokio::spawn(audio::run_audio_pipeline(state.clone(), source));
+        }
+        Err(e) => {
+            if state.audio_enabled() {
+                error!("audio requested but unavailable: {e:#}");
+            } else {
+                info!("audio capture unavailable on this host: {e:#}");
+            }
+        }
+    }
 
     // UDP discovery responder.
     if args.discovery_port != 0 {

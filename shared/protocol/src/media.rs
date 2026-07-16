@@ -82,9 +82,94 @@ impl VideoFrame {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio framing (plaintext *inside* the encrypted audio channel, chan 3)
+// ---------------------------------------------------------------------------
+
+/// Audio frame header layout:
+///
+/// ```text
+/// [codec u8][channels u8][seq u32 BE][ts_us u64 BE][sample_rate u32 BE][payload…]
+/// ```
+///
+/// * `codec` — [`AUDIO_CODEC_OPUS`] is the only assigned id (registry is
+///   append-only, like video codec ids).
+/// * `seq` — per-session packet counter; a gap means packets were dropped
+///   under congestion (audio is latest-only-ish: late audio is worse than a
+///   short glitch).
+/// * `ts_us` — host-clock capture timestamp of the first sample, same clock
+///   as video `ts_us` (lets viewers reason about A/V skew).
+pub const AUDIO_HEADER_LEN: usize = 1 + 1 + 4 + 8 + 4;
+
+/// Opus in ordinary packets (RFC 6716), 48 kHz.
+pub const AUDIO_CODEC_OPUS: u8 = 0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioFrame {
+    pub codec: u8,
+    pub channels: u8,
+    pub seq: u32,
+    pub timestamp_us: u64,
+    pub sample_rate: u32,
+    pub payload: Vec<u8>,
+}
+
+impl AudioFrame {
+    /// Fixed header for zero-copy `seal_parts` sending (same pattern as
+    /// [`VideoFrame::header`]).
+    pub fn header(&self) -> [u8; AUDIO_HEADER_LEN] {
+        let mut h = [0u8; AUDIO_HEADER_LEN];
+        h[0] = self.codec;
+        h[1] = self.channels;
+        h[2..6].copy_from_slice(&self.seq.to_be_bytes());
+        h[6..14].copy_from_slice(&self.timestamp_us.to_be_bytes());
+        h[14..18].copy_from_slice(&self.sample_rate.to_be_bytes());
+        h
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + self.payload.len());
+        out.extend_from_slice(&self.header());
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < AUDIO_HEADER_LEN {
+            return Err(ProtocolError::Malformed("audio frame header truncated"));
+        }
+        Ok(Self {
+            codec: buf[0],
+            channels: buf[1],
+            seq: u32::from_be_bytes(buf[2..6].try_into().unwrap()),
+            timestamp_us: u64::from_be_bytes(buf[6..14].try_into().unwrap()),
+            sample_rate: u32::from_be_bytes(buf[14..18].try_into().unwrap()),
+            payload: buf[AUDIO_HEADER_LEN..].to_vec(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_frame_roundtrip() {
+        let f = AudioFrame {
+            codec: AUDIO_CODEC_OPUS,
+            channels: 2,
+            seq: 77,
+            timestamp_us: 123_456_789,
+            sample_rate: 48_000,
+            payload: vec![0xCD; 120],
+        };
+        assert_eq!(AudioFrame::decode(&f.encode()).unwrap(), f);
+    }
+
+    #[test]
+    fn audio_truncated_rejected() {
+        assert!(AudioFrame::decode(&[0u8; 10]).is_err());
+    }
 
     #[test]
     fn frame_roundtrip() {

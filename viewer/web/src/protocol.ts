@@ -51,7 +51,7 @@ export type InputEvent =
   | { kind: "mouse_move"; x: number; y: number }
   | { kind: "mouse_button"; button: number; pressed: boolean }
   | { kind: "wheel"; dx: number; dy: number }
-  | { kind: "key"; code: string; pressed: boolean }
+  | { kind: "key"; code: string; pressed: boolean; key?: string }
   | { kind: "touch"; id: number; phase: TouchPhase; x: number; y: number; pressure: number }
   | { kind: "pen"; phase: TouchPhase; x: number; y: number; pressure: number; tilt_x: number; tilt_y: number }
   | { kind: "text"; text: string };
@@ -61,9 +61,13 @@ export type ControlMsg = { type: string } & Record<string, unknown>;
 
 export const CHANNEL_CONTROL = 1;
 export const CHANNEL_VIDEO = 2;
+export const CHANNEL_AUDIO = 3;
 
 export const DIR_SERVER_TO_CLIENT = 0;
 export const DIR_CLIENT_TO_SERVER = 1;
+
+/** Hard cap for one clipboard sync payload (mirrors the Rust host). */
+export const MAX_CLIPBOARD_BYTES = 256 * 1024;
 
 export interface VideoFrame {
   codec: Codec;
@@ -89,6 +93,32 @@ export function parseVideoFrame(buf: Uint8Array): VideoFrame {
     timestampUs: readU64BE(dv, 6),
     width: dv.getUint16(14),
     height: dv.getUint16(16),
+    payload: buf.subarray(18),
+  };
+}
+
+// Audio framing (channel 3):
+// [codec u8][channels u8][seq u32 BE][ts_us u64 BE][sample_rate u32 BE][payload…]
+export const AUDIO_CODEC_OPUS = 0;
+
+export interface AudioFrame {
+  codec: number;
+  channels: number;
+  seq: number;
+  timestampUs: bigint;
+  sampleRate: number;
+  payload: Uint8Array;
+}
+
+export function parseAudioFrame(buf: Uint8Array): AudioFrame {
+  if (buf.length < 18) throw new Error("audio frame header truncated");
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    codec: buf[0]!,
+    channels: buf[1]!,
+    seq: dv.getUint32(2),
+    timestampUs: readU64BE(dv, 6),
+    sampleRate: dv.getUint32(14),
     payload: buf.subarray(18),
   };
 }

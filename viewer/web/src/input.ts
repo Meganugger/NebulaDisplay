@@ -286,7 +286,10 @@ export class InputCapture {
     // Keep browser shortcuts like F11/F12 & Escape local.
     if (["F11", "F12", "Escape"].includes(ev.code)) return;
     ev.preventDefault();
-    this.push({ kind: "key", code: ev.code, pressed }, true);
+    // Send both the physical position (`code`) and the layout-aware value
+    // (`key`): the host injects the character this keyboard actually typed
+    // for printable keys and falls back to the position otherwise.
+    this.push({ kind: "key", code: ev.code, pressed, key: ev.key }, true);
   }
 
   /**
