@@ -25,8 +25,12 @@ fn main() {
     let first: serde_json::Value =
         serde_json::from_str(&lines.next().expect("first line").expect("read")).expect("json");
     let pin = first["pin"].as_str().expect("pin");
-    let nonce = B64.decode(first["nonce"].as_str().expect("nonce")).expect("nonce b64");
-    let pa = B64.decode(first["pa"].as_str().expect("pa")).expect("pa b64");
+    let nonce = B64
+        .decode(first["nonce"].as_str().expect("nonce"))
+        .expect("nonce b64");
+    let pa = B64
+        .decode(first["pa"].as_str().expect("pa"))
+        .expect("pa b64");
 
     let server = match Spake2Server::respond(pin, &nonce, &pa) {
         Ok(s) => s,
@@ -35,12 +39,19 @@ fn main() {
             std::process::exit(1);
         }
     };
-    writeln!(out, "{}", serde_json::json!({ "pb": B64.encode(server.share()) })).unwrap();
+    writeln!(
+        out,
+        "{}",
+        serde_json::json!({ "pb": B64.encode(server.share()) })
+    )
+    .unwrap();
     out.flush().unwrap();
 
     let second: serde_json::Value =
         serde_json::from_str(&lines.next().expect("second line").expect("read")).expect("json");
-    let mac = B64.decode(second["mac"].as_str().expect("mac")).expect("mac b64");
+    let mac = B64
+        .decode(second["mac"].as_str().expect("mac"))
+        .expect("mac b64");
     let keys = server.into_keys();
     let ok = mac_equal(&mac, &keys.confirm_client);
     writeln!(
