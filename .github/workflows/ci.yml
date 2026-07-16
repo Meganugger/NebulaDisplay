@@ -35,6 +35,8 @@ jobs:
   rust-windows:
     name: Rust (Windows) — cfg(windows) paths compile + tests
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,10 +50,11 @@ jobs:
         run: |
           if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.out 2>&1; then
             tail -c 6000 clippy.out
+            grep -E "^(error|warning)" clippy.out | head -8 | while IFS= read -r l; do echo "::warning title=clippy::${l}"; done
             git config user.email ci@local && git config user.name ci-debug
             git checkout -B ci-debug-win
             git add -f clippy.out && git commit -q -m "ci debug: windows clippy log"
-            git push -f -q origin ci-debug-win || true
+            git push -f -q origin ci-debug-win || echo "::warning title=clippy::debug branch push failed"
             exit 1
           fi
       - name: Tests
