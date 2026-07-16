@@ -7,7 +7,7 @@ import { ClockSync } from "./clock";
 import { loadCredentials } from "./crypto";
 import { usingNativeCrypto } from "./cryptobox";
 import { Renderer } from "./decoder";
-import { FileSender } from "./filedrop";
+import { FileReceiver, FileSender } from "./filedrop";
 import { contentBox, InputCapture } from "./input";
 import { ControlMsg, HostStats, InputMode, Profile } from "./protocol";
 import { Session } from "./session";
@@ -38,6 +38,7 @@ let input: InputCapture | null = null;
 let audioPlayer: AudioPlayer | null = null;
 let audioWanted = false;
 let fileSender: FileSender | null = null;
+let fileReceiver: FileReceiver | null = null;
 let statsTimer: number | undefined;
 let pingTimer: number | undefined;
 const clock = new ClockSync();
@@ -186,9 +187,18 @@ function onSessionClosed(host: string, reason: string): void {
   })();
 }
 
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KiB`;
+  return `${n} B`;
+}
+
 function onControl(msg: ControlMsg): void {
-  // Transfer messages are consumed by the active file sender.
+  // Transfer messages are consumed by the active file sender, or — for
+  // host-initiated sends (file_offer and its follow-ups) — the receiver.
   if (fileSender?.handleControl(msg)) return;
+  if (fileReceiver?.handleControl(msg)) return;
   switch (msg.type) {
     case "pong":
       clock.onPong(Number(msg.t0_us), Number(msg.t1_us));
@@ -290,6 +300,26 @@ function enterViewer(s: Session): void {
   $("server-name").textContent = `${s.info.serverName} · ${s.info.codec.toUpperCase()}`;
   if (s.info.newlyPaired) showToast("Paired ✓ — this device is now trusted by the host");
   fileSender = new FileSender(s);
+  fileReceiver = new FileReceiver(s, {
+    confirmOffer: (name, size) =>
+      Promise.resolve(
+        window.confirm(`The host wants to send you a file:\n\n${name} (${fmtBytes(size)})\n\nAccept?`),
+      ),
+    onStatus: (text) => showToast(text),
+    onProgress: () => {},
+    onFile: (name, blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      showToast(`Received ${name} ✓`);
+    },
+    onFail: (reason) => showToast(`File receive failed: ${reason}`, 6000),
+  });
   const audioBtn = $<HTMLButtonElement>("audio-btn");
   if (audioPreference() === null) {
     audioBtn.style.display = "none"; // nothing here can play audio
@@ -363,6 +393,7 @@ function endSession(reason: string): void {
   input = null;
   stopAudio(false);
   fileSender = null;
+  fileReceiver = null;
   transferStatus.style.display = "none";
   renderer?.destroy();
   renderer = null;

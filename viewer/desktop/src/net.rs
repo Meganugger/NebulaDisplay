@@ -11,6 +11,7 @@ use ndsp_client::{connect, Auth, Incoming, Session};
 use ndsp_protocol::messages::{ClientInfo, Codec, ControlMsg, InputEvent, InputMode, Profile};
 
 use crate::decode::Decoder;
+use crate::receive::{FileReceiver, Handled};
 use crate::{store, Shared, UiWake};
 
 pub struct NetArgs {
@@ -18,6 +19,8 @@ pub struct NetArgs {
     pub pin: Option<String>,
     pub name: String,
     pub profile: String,
+    /// Directory host-sent files are saved into (None = decline offers).
+    pub receive_dir: Option<std::path::PathBuf>,
 }
 
 /// UI thread → network thread.
@@ -120,6 +123,7 @@ async fn session_loop(
         .await?;
 
     let mut decoder = Decoder::new();
+    let mut receiver = FileReceiver::new(args.receive_dir.clone());
     let mut last_ping = std::time::Instant::now() - Duration::from_secs(10);
     let mut input_mode = InputMode::ViewOnly;
 
@@ -169,22 +173,40 @@ async fn session_loop(
                     session.send(&ControlMsg::RequestKeyframe).await?;
                 }
             },
-            Ok(Ok(Incoming::Control(msg))) => match msg {
-                ControlMsg::InputGrant { allowed } => {
-                    shared.input_allowed.store(allowed, Ordering::Relaxed);
-                    set_status(
-                        shared,
-                        proxy,
-                        if allowed {
-                            "input granted by host"
-                        } else {
-                            "input revoked by host"
-                        },
-                    );
+            Ok(Ok(Incoming::Control(msg))) => {
+                // Host→viewer file transfers are consumed by the receiver.
+                let msg = match receiver.handle(msg) {
+                    Handled::Consumed { reply, status } => {
+                        if let Some(reply) = reply {
+                            session.send(&reply).await?;
+                        }
+                        if let Some(status) = status {
+                            set_status(shared, proxy, status);
+                        }
+                        continue;
+                    }
+                    Handled::NotMine(msg) => msg,
+                };
+                match msg {
+                    ControlMsg::InputGrant { allowed } => {
+                        shared.input_allowed.store(allowed, Ordering::Relaxed);
+                        set_status(
+                            shared,
+                            proxy,
+                            if allowed {
+                                "input granted by host"
+                            } else {
+                                "input revoked by host"
+                            },
+                        );
+                    }
+                    ControlMsg::Bye { reason } => {
+                        receiver.reset();
+                        return Ok(format!("host: {reason}"));
+                    }
+                    _ => {}
                 }
-                ControlMsg::Bye { reason } => return Ok(format!("host: {reason}")),
-                _ => {}
-            },
+            }
         }
     }
 }

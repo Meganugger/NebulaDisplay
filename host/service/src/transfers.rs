@@ -152,46 +152,7 @@ pub fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Reduce an untrusted filename to one safe path component. Path separators
-/// and traversal are stripped; control characters and Windows-reserved
-/// characters are replaced; empty results get a placeholder.
-pub fn sanitize_filename(name: &str) -> String {
-    // Take the final path component whichever separator the sender used.
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = base
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches([' ', '.']).to_string();
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "unnamed-file".to_string()
-    } else {
-        trimmed
-    }
-}
-
-/// Pick a non-clobbering destination path: `name`, `name (1)`, `name (2)`, …
-pub fn unique_destination(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.to_string(), String::new()),
-    };
-    for i in 1..10_000 {
-        let c = dir.join(format!("{stem} ({i}){ext}"));
-        if !c.exists() {
-            return c;
-        }
-    }
-    dir.join(format!("{stem} ({}){ext}", now_unix()))
-}
+pub use ndsp_protocol::files::{sanitize_filename, unique_destination};
 
 #[cfg(test)]
 mod tests {

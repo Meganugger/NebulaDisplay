@@ -70,6 +70,16 @@ pub enum SessionCommand {
         size_bytes: u64,
         sha256_hex: String,
     },
+    /// Offer a host file to this viewer (host→viewer file send, panel
+    /// initiated). `path` is the spooled copy in the outbox; the session
+    /// deletes it when the transfer completes, is declined, or aborts.
+    SendFile {
+        id: String,
+        path: std::path::PathBuf,
+        name: String,
+        size_bytes: u64,
+        sha256_hex: String,
+    },
     Kick {
         reason: String,
     },
@@ -92,6 +102,9 @@ pub struct ClientHandle {
     pub audio_active: Arc<AtomicBool>,
     /// Client advertised the "cursor" feature (renders host cursor itself).
     pub supports_cursor: bool,
+    /// A host→viewer file send to this device is in flight (panel busy
+    /// indicator + guards against concurrent sends).
+    pub sending_file: Arc<AtomicBool>,
     pub stats: Mutex<ViewerStats>,
     pub commands: mpsc::Sender<SessionCommand>,
 }

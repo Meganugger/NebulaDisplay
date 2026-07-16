@@ -966,3 +966,188 @@ async fn corrupted_file_transfer_is_rejected_and_cleaned_up() {
     session.close().await;
     host.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_to_viewer_file_send_verifies_and_cleans_up() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let host = start_host("filesend").await;
+    let pin = host.state.pins.current_pin();
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Receiver"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .unwrap();
+
+    // Spool a file the way the panel endpoint does, then command the session.
+    let content: Vec<u8> = (0..600_000u32)
+        .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+        .collect();
+    let sha = hex::encode(sha2::Sha256::digest(&content));
+    let outbox = host.state.cfg.data_dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let spool = outbox.join("send-1.spool");
+    std::fs::write(&spool, &content).unwrap();
+
+    let handle = {
+        let clients = host.state.clients.lock().unwrap();
+        clients.values().next().expect("client registered").clone()
+    };
+    handle
+        .commands
+        .send(nebulad::state::SessionCommand::SendFile {
+            id: "send-1".into(),
+            path: spool.clone(),
+            name: "from-host.bin".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: sha.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Viewer side: expect the offer, accept, receive + verify, confirm.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("no file offer")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileOffer {
+                id,
+                name,
+                size_bytes,
+                sha256,
+            }) => {
+                assert_eq!(id, "send-1");
+                assert_eq!(name, "from-host.bin");
+                assert_eq!(size_bytes, content.len() as u64);
+                assert_eq!(sha256, sha);
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert!(
+        handle
+            .sending_file
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "busy flag must be up while the offer is pending"
+    );
+    session
+        .send(&ControlMsg::FileAnswer {
+            id: "send-1".into(),
+            accept: true,
+            reason: None,
+        })
+        .await
+        .unwrap();
+
+    let mut received = Vec::new();
+    let mut next_seq = 0u32;
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("transfer stalled")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileChunk { id, seq, data }) => {
+                assert_eq!(id, "send-1");
+                assert_eq!(seq, next_seq, "chunks must arrive in order");
+                next_seq += 1;
+                received.extend_from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(&data)
+                        .expect("valid chunk"),
+                );
+            }
+            Incoming::Control(ControlMsg::FileEnd { id }) => {
+                assert_eq!(id, "send-1");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(received, content, "content must survive bit-exact");
+    session
+        .send(&ControlMsg::FileDone {
+            id: "send-1".into(),
+        })
+        .await
+        .unwrap();
+
+    // The host must clear the spool + busy flag after the confirmation.
+    let mut cleaned = false;
+    for _ in 0..100 {
+        if !spool.exists()
+            && !handle
+                .sending_file
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(cleaned, "spool file + busy flag must be cleared");
+
+    // Decline path: a second offer the viewer refuses is cleaned up too.
+    let spool2 = outbox.join("send-2.spool");
+    std::fs::write(&spool2, b"decline me").unwrap();
+    handle
+        .commands
+        .send(nebulad::state::SessionCommand::SendFile {
+            id: "send-2".into(),
+            path: spool2.clone(),
+            name: "unwanted.bin".into(),
+            size_bytes: 10,
+            sha256_hex: "00".repeat(32),
+        })
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("no second offer")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileOffer { id, .. }) => {
+                assert_eq!(id, "send-2");
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    session
+        .send(&ControlMsg::FileAnswer {
+            id: "send-2".into(),
+            accept: false,
+            reason: Some("declined on the viewer".into()),
+        })
+        .await
+        .unwrap();
+    let mut cleaned = false;
+    for _ in 0..100 {
+        if !spool2.exists()
+            && !handle
+                .sending_file
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(cleaned, "declined spool must be deleted and flag cleared");
+
+    session.close().await;
+    host.shutdown().await;
+}

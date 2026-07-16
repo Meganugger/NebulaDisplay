@@ -1437,12 +1437,15 @@ name = "nebula-viewer"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "hex",
  "ndsp-client",
  "ndsp-protocol",
  "openh264",
  "serde",
  "serde_json",
+ "sha2",
  "softbuffer",
  "tokio",
  "tracing",
