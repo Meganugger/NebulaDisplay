@@ -19,12 +19,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: |
-          rustfmt --version
-          if ! cargo fmt --all --check > /tmp/fmt.out 2>&1; then
-            head -c 4000 /tmp/fmt.out | while IFS= read -r l; do echo "::warning title=fmt::$l"; done
-            exit 1
-          fi
+        run: cargo fmt --all --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (unit + protocol + e2e over real sockets)
@@ -35,8 +30,6 @@ jobs:
   rust-windows:
     name: Rust (Windows) — cfg(windows) paths compile + tests
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,27 +37,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
-        shell: bash
-        env:
-          CARGO_TERM_COLOR: never
-        run: |
-          if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.out 2>&1; then
-            tail -c 6000 clippy.out
-            grep -E "^(error|warning)" clippy.out | head -8 | while IFS= read -r l; do echo "::warning title=clippy::${l}"; done
-            git config user.email ci@local && git config user.name ci-debug
-            git checkout -B ci-debug-win
-            git add -f clippy.out && git commit -q -m "ci debug: windows clippy log"
-            git push -f -q origin ci-debug-win || echo "::warning title=clippy::debug branch push failed"
-            exit 1
-          fi
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
-        shell: bash
-        run: |
-          if ! cargo test --workspace > tests.out 2>&1; then
-            { grep -E "FAILED|panicked|^failures:" -A 6 tests.out | head -c 2500; tail -c 1200 tests.out; } | while IFS= read -r l; do echo "::warning title=win-tests::$l"; done
-            exit 1
-          fi
-          grep "test result" tests.out
+        run: cargo test --workspace
 
   driver-syntax:
     name: IddCx driver — syntax/type check (both header models)
@@ -102,20 +77,10 @@ jobs:
         run: cargo build -p nebulad
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)
         working-directory: viewer/web
-        run: |
-          if ! node tests/web-compat.mjs > compat.out 2>&1; then
-            tail -c 2500 compat.out | while IFS= read -r l; do echo "::warning title=web-compat::$l"; done
-            exit 1
-          fi
-          tail -3 compat.out
+        run: node tests/web-compat.mjs
       - name: Cross-stack compatibility — pure-JS crypto fallback (insecure-context path)
         working-directory: viewer/web
-        run: |
-          if ! NDSP_CRYPTO=fallback node tests/web-compat.mjs > compat2.out 2>&1; then
-            tail -c 2500 compat2.out | while IFS= read -r l; do echo "::warning title=web-compat-fallback::$l"; done
-            exit 1
-          fi
-          tail -3 compat2.out
+        run: NDSP_CRYPTO=fallback node tests/web-compat.mjs
 
   browser-e2e:
     name: Browser E2E — Chromium pairing/H.264/input/panel

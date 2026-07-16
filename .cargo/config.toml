@@ -1,0 +1,8 @@
+# Workspace-wide build environment.
+[env]
+# audiopus_sys (the bundled libopus behind the `audio` feature) still declares
+# an old cmake_minimum_required; CMake >= 4 refuses those outright. This keeps
+# from-source builds working on hosts with modern CMake (e.g. windows-latest
+# CI runners) without patching the vendored opus. Remove once audiopus_sys
+# ships an updated bundled opus.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

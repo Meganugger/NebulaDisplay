@@ -4,7 +4,7 @@
 
 | Component | Needs |
 |---|---|
-| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`) |
+| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`), CMake + a C compiler (for the bundled libopus / OpenH264) |
 | Web viewer + panel | Node 22+ / npm |
 | Windows virtual display driver | Windows + VS2022 + WDK (see `host/windows-driver/README.md`) |
 | Android viewer | Android SDK 35, JDK 17 (see `viewer/android/README.md`) |
@@ -29,10 +29,16 @@ cargo run --release -p nebulad
 
 Useful flags: `--port`, `--panel-port`, `--discovery-port 0` (disable
 discovery), `--bind`, `--name`, `--data-dir`, `--web-dir`, `--capture-size`,
-`--test-pattern`.
+`--test-pattern`, `--audio` (enable system-audio streaming),
+`--audio-test-tone` (synthetic source, for testing).
 
-Feature flags: `--no-default-features` drops the OpenH264 encoder (JPEG-only,
-much faster cold build).
+Feature flags: `--no-default-features` drops both the OpenH264 encoder
+(JPEG-only) and the Opus audio pipeline — much faster cold build;
+`--no-default-features --features h264` keeps video only.
+
+Note: the bundled libopus declares an old `cmake_minimum_required`; the
+workspace `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` so it
+builds with CMake ≥ 4 too.
 
 ## Desktop viewer
 
