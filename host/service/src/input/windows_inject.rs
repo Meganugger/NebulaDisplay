@@ -153,14 +153,7 @@ impl WindowsInputSink {
     /// Inject one touch event through the synthetic touch device. Returns
     /// false when the synthetic-pointer path is unavailable (caller falls
     /// back to the single-pointer mouse mapping).
-    fn inject_touch(
-        &self,
-        id: u32,
-        phase: TouchPhase,
-        x: f32,
-        y: f32,
-        pressure: f32,
-    ) -> bool {
+    fn inject_touch(&self, id: u32, phase: TouchPhase, x: f32, y: f32, pressure: f32) -> bool {
         let mut slot = self.touch.lock().unwrap();
         let device = slot.get_or_insert_with(|| match TouchDevice::create() {
             Ok(d) => {

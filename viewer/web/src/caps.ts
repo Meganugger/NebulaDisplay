@@ -118,6 +118,17 @@ export function capabilityReport(): string {
 // --- WebCodecs H.264 decode probe --------------------------------------------
 
 let h264Probe: Promise<boolean> | null = null;
+let hevcProbe: Promise<boolean> | null = null;
+
+async function probeDecode(codec: string, assumeOnNoProbe: boolean): Promise<boolean> {
+  try {
+    if (typeof VideoDecoder.isConfigSupported !== "function") return assumeOnNoProbe;
+    const res = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
+    return res.supported === true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * True only when the engine can actually decode our H.264 stream. API
@@ -127,22 +138,25 @@ let h264Probe: Promise<boolean> | null = null;
  */
 export function probeH264Decode(): Promise<boolean> {
   if (!caps.webCodecsH264) return Promise.resolve(false);
-  if (!h264Probe) {
-    h264Probe = (async () => {
-      try {
-        if (typeof VideoDecoder.isConfigSupported !== "function") return true; // pre-probe engines
-        const res = await VideoDecoder.isConfigSupported({
-          codec: "avc1.42E01F",
-          optimizeForLatency: true,
-        });
-        return res.supported === true;
-      } catch {
-        return false;
-      }
-    })();
-  }
+  // Pre-probe engines are assumed capable (H.264 shipped before the probe).
+  h264Probe ??= probeDecode(H264_CODEC_STRING, true);
   return h264Probe;
 }
+
+/**
+ * WebCodecs HEVC decode probe (Annex-B — no `description`). Chromium exposes
+ * this only where a hardware decoder exists; Safari has it broadly. Never
+ * assumed without a positive probe (unlike H.264, absence is the norm).
+ */
+export function probeHevcDecode(): Promise<boolean> {
+  if (!caps.webCodecsH264) return Promise.resolve(false);
+  hevcProbe ??= probeDecode(HEVC_CODEC_STRING, false);
+  return hevcProbe;
+}
+
+/** Annex-B (no description) config strings shared with the decoder. */
+export const H264_CODEC_STRING = "avc1.42E01F";
+export const HEVC_CODEC_STRING = "hev1.1.6.L123.B0";
 
 // --- randomness + UUID ------------------------------------------------------
 

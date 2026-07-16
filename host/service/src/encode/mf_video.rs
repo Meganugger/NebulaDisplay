@@ -1,9 +1,12 @@
-//! Hardware H.264 encoding via Media Foundation Transforms (Windows only).
+//! Hardware H.264/HEVC encoding via Media Foundation Transforms (Windows
+//! only).
 //!
 //! `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, HARDWARE)` finds whatever the
 //! machine has — NVENC, Intel Quick Sync, AMD AMF — behind a single vendor-
 //! neutral interface, always preferring hardware over software (software
-//! MFTs are not enumerated at all; OpenH264 is our software fallback).
+//! MFTs are not enumerated at all; OpenH264 is our software fallback for
+//! H.264; HEVC has no software fallback and is only offered when a hardware
+//! MFT exists).
 //!
 //! Latency/design notes:
 //! * Hardware H.264 MFTs are **async** transforms: they must be unlocked
@@ -20,24 +23,32 @@
 //! * Keyframes: `CODECAPI_AVEncVideoForceKeyFrame`.
 //! * Input is NV12 (converted from capture BGRA with the same integer BT.601
 //!   coefficients as the OpenH264 path, single pass, dirty-row aware).
-//! * Output is Annex-B H.264 (MFT default for MFVideoFormat_H264) —
+//! * Output is Annex-B (MFT default for MFVideoFormat_H264/HEVC) —
 //!   identical downstream handling to the software encoder.
+//! * **ROI hints (ROADMAP P0.3)**: when the encoder supports
+//!   `CODECAPI_AVEncVideoROIEnabled`, the dirty-row bounds already computed
+//!   for partial color conversion are attached to each input sample as an
+//!   `MFSampleExtension_ROIRectangle` with a negative QP delta — the rate
+//!   control spends its budget on the region that actually changed instead
+//!   of re-polishing static content.
 
 use ndsp_protocol::messages::Codec;
 use windows::core::PWSTR;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
-    MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_NV12,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoROIEnabled, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFSample, IMFTransform, METransformHaveOutput,
+    METransformNeedInput, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_ROIRectangle, MFStartup, MFTEnumEx,
+    MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NONE, MF_EVENT_TYPE, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, ROI_AREA,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
@@ -69,14 +80,23 @@ fn ensure_mf_started() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Enumerate hardware H.264 encoder MFTs; returns the best (first after
-/// MFT_ENUM_FLAG_SORTANDFILTER ordering) activation and its friendly name.
-fn find_hw_encoder() -> anyhow::Result<(IMFActivate, String)> {
+/// The MF output subtype for a negotiated codec (H.264/HEVC only).
+fn subtype_of(codec: Codec) -> anyhow::Result<windows::core::GUID> {
+    match codec {
+        Codec::H264 => Ok(MFVideoFormat_H264),
+        Codec::Hevc => Ok(MFVideoFormat_HEVC),
+        other => anyhow::bail!("no Media Foundation mapping for {other:?}"),
+    }
+}
+
+/// Enumerate hardware encoder MFTs for `codec`; returns the best (first
+/// after MFT_ENUM_FLAG_SORTANDFILTER ordering) activation + friendly name.
+fn find_hw_encoder(codec: Codec) -> anyhow::Result<(IMFActivate, String)> {
     ensure_mf_started()?;
     unsafe {
         let output_type = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
+            guidSubtype: subtype_of(codec)?,
         };
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count: u32 = 0;
@@ -89,7 +109,7 @@ fn find_hw_encoder() -> anyhow::Result<(IMFActivate, String)> {
             &mut count,
         )?;
         if count == 0 || activates.is_null() {
-            anyhow::bail!("no hardware H.264 encoder MFT on this machine");
+            anyhow::bail!("no hardware {codec:?} encoder MFT on this machine");
         }
         // Take the first; free the rest (CoTaskMemFree'd array of AddRef'd
         // activates per MFTEnumEx contract).
@@ -112,23 +132,29 @@ fn find_hw_encoder() -> anyhow::Result<(IMFActivate, String)> {
             CoTaskMemFree(Some(name_ptr.as_ptr() as *const _));
             s
         } else {
-            "hardware H.264 MFT".to_string()
+            format!("hardware {codec:?} MFT")
         };
         Ok((activate, name))
     }
 }
 
-/// True if this machine has a hardware H.264 encoder (cached).
-pub fn hw_encoder_available() -> bool {
+/// True if this machine has a hardware encoder for `codec` (cached).
+pub fn hw_encoder_available(codec: Codec) -> bool {
     use std::sync::OnceLock;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| match find_hw_encoder() {
+    static H264: OnceLock<bool> = OnceLock::new();
+    static HEVC: OnceLock<bool> = OnceLock::new();
+    let cell = match codec {
+        Codec::H264 => &H264,
+        Codec::Hevc => &HEVC,
+        _ => return false,
+    };
+    *cell.get_or_init(|| match find_hw_encoder(codec) {
         Ok((_, name)) => {
-            tracing::info!(encoder = %name, "hardware H.264 encoder available");
+            tracing::info!(encoder = %name, ?codec, "hardware encoder available");
             true
         }
         Err(e) => {
-            tracing::info!("no hardware H.264 encoder ({e}); using software fallback");
+            tracing::info!("no hardware {codec:?} encoder ({e})");
             false
         }
     })
@@ -157,10 +183,14 @@ fn variant_bool(v: bool) -> VARIANT {
     var
 }
 
-pub struct MfH264Encoder {
+pub struct MfVideoEncoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
     codec_api: ICodecAPI,
+    /// Negotiated output codec (H264 or Hevc).
+    codec: Codec,
+    /// Encoder supports per-sample ROI rectangles (probed at init).
+    roi_supported: bool,
     in_stream: u32,
     out_stream: u32,
     /// NV12 staging buffer (Y plane then interleaved UV).
@@ -177,7 +207,7 @@ pub struct MfH264Encoder {
 
 // SAFETY: the encoder is owned by one session's video task and never shared;
 // MF hardware MFTs are free-threaded COM objects.
-unsafe impl Send for MfH264Encoder {}
+unsafe impl Send for MfVideoEncoder {}
 
 #[derive(Default)]
 struct Nv12Buffer {
@@ -240,9 +270,15 @@ impl Nv12Buffer {
     }
 }
 
-impl MfH264Encoder {
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> anyhow::Result<Self> {
-        let (activate, name) = find_hw_encoder()?;
+impl MfVideoEncoder {
+    pub fn new(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+    ) -> anyhow::Result<Self> {
+        let (activate, name) = find_hw_encoder(codec)?;
         unsafe {
             let mft: IMFTransform = activate.ActivateObject()?;
 
@@ -264,7 +300,7 @@ impl MfH264Encoder {
             // Output type FIRST (encoders require output before input).
             let out_type = MFCreateMediaType()?;
             out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            out_type.SetGUID(&MF_MT_SUBTYPE, &subtype_of(codec)?)?;
             out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps.max(100) * 1000)?;
             out_type.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
             out_type.SetUINT64(&MF_MT_FRAME_RATE, ((fps.max(1) as u64) << 32) | 1)?;
@@ -291,14 +327,28 @@ impl MfH264Encoder {
             let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
             let _ = codec_api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &variant_u32(0));
 
+            // ROI hints (ROADMAP P0.3): opt in when the encoder supports it;
+            // per-sample rectangles are attached in `encode`.
+            let roi_supported = codec_api
+                .IsSupported(&CODECAPI_AVEncVideoROIEnabled)
+                .is_ok()
+                && codec_api
+                    .SetValue(&CODECAPI_AVEncVideoROIEnabled, &variant_bool(true))
+                    .is_ok();
+            if roi_supported {
+                tracing::info!(encoder = %name, "encoder ROI rate-control hints enabled");
+            }
+
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
-            tracing::info!(encoder = %name, width, height, "hardware H.264 encoder initialized");
+            tracing::info!(encoder = %name, ?codec, width, height, "hardware encoder initialized");
             Ok(Self {
                 mft,
                 events,
                 codec_api,
+                codec,
+                roi_supported,
                 in_stream,
                 out_stream,
                 nv12: Nv12Buffer::default(),
@@ -315,7 +365,13 @@ impl MfH264Encoder {
 
     /// Pump the MFT's event queue until we can submit input and collect any
     /// output. Returns encoded bytes if a full output sample was produced.
-    fn submit_and_drain(&mut self, timestamp_100ns: i64) -> anyhow::Result<Option<Vec<u8>>> {
+    /// `roi` is an optional dirty-region rectangle attached as a rate-control
+    /// hint (quality budget concentrated where pixels changed).
+    fn submit_and_drain(
+        &mut self,
+        timestamp_100ns: i64,
+        roi: Option<RECT>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         unsafe {
             // Wait for a NeedInput credit (hardware encoders grant them
             // almost immediately at queue depth ≤ 1).
@@ -355,6 +411,17 @@ impl MfH264Encoder {
             sample.AddBuffer(&buf)?;
             sample.SetSampleTime(timestamp_100ns)?;
             sample.SetSampleDuration(10_000_000i64 / self.current_fps.max(1) as i64)?;
+            if let Some(rect) = roi {
+                // Spend quality on the changed region: a modest negative QP
+                // delta inside the ROI (static content is already encoded as
+                // skip blocks and costs nothing to leave alone).
+                let area = ROI_AREA { rect, QPDelta: -4 };
+                let bytes = std::slice::from_raw_parts(
+                    (&raw const area).cast::<u8>(),
+                    std::mem::size_of::<ROI_AREA>(),
+                );
+                let _ = sample.SetBlob(&MFSampleExtension_ROIRectangle, bytes);
+            }
             self.mft.ProcessInput(self.in_stream, &sample, 0)?;
             self.need_input_credits -= 1;
 
@@ -444,8 +511,8 @@ impl MfH264Encoder {
     }
 }
 
-/// H.264 Annex-B: is this access unit an IDR? (scan NAL types for 5).
-fn annexb_has_idr(data: &[u8]) -> bool {
+/// Scan Annex-B NAL unit headers, testing each first header byte with `f`.
+fn annexb_any_nal(data: &[u8], f: impl Fn(u8) -> bool) -> bool {
     let mut i = 0;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 {
@@ -457,7 +524,7 @@ fn annexb_has_idr(data: &[u8]) -> bool {
                 i += 1;
                 continue;
             };
-            if nal_at < data.len() && data[nal_at] & 0x1F == 5 {
+            if nal_at < data.len() && f(data[nal_at]) {
                 return true;
             }
             i = nal_at + step;
@@ -468,7 +535,21 @@ fn annexb_has_idr(data: &[u8]) -> bool {
     false
 }
 
-impl Encoder for MfH264Encoder {
+/// H.264 Annex-B: is this access unit an IDR? (NAL type 5).
+fn annexb_has_idr(data: &[u8]) -> bool {
+    annexb_any_nal(data, |b| b & 0x1F == 5)
+}
+
+/// H.265 Annex-B: does this access unit contain an IRAP picture?
+/// (nal_unit_type 16..=21 — BLA/IDR/CRA — all self-contained sync points.)
+fn annexb_hevc_has_irap(data: &[u8]) -> bool {
+    annexb_any_nal(data, |b| {
+        let ty = (b >> 1) & 0x3F;
+        (16..=21).contains(&ty)
+    })
+}
+
+impl Encoder for MfVideoEncoder {
     fn encode(
         &mut self,
         frame: &CapturedFrame,
@@ -490,7 +571,7 @@ impl Encoder for MfH264Encoder {
             return Ok(Encoded {
                 payload: Vec::new(),
                 keyframe: false,
-                codec: Codec::H264,
+                codec: self.codec,
                 convert_us: t_conv.elapsed().as_micros() as u32,
             });
         }
@@ -504,20 +585,37 @@ impl Encoder for MfH264Encoder {
         self.nv12.fill_from_bgra(&frame.bgra, w, h, Some(&dirty));
         let convert_us = t_conv.elapsed().as_micros() as u32;
 
+        // ROI hint: only for partial updates on delta frames (a keyframe or
+        // full-frame change has no "rest of the frame" to deprioritize).
+        let roi = if self.roi_supported && !force_keyframe && !dirty.all_dirty() {
+            dirty.row_bounds().map(|(y0, y1)| RECT {
+                left: 0,
+                top: y0 as i32,
+                right: w as i32,
+                bottom: y1 as i32,
+            })
+        } else {
+            None
+        };
+
         self.frame_index += 1;
         let ts_100ns = (self.frame_index as i64) * 10_000_000 / self.current_fps.max(1) as i64;
-        let payload = self.submit_and_drain(ts_100ns)?.unwrap_or_default();
-        let keyframe = !payload.is_empty() && annexb_has_idr(&payload);
+        let payload = self.submit_and_drain(ts_100ns, roi)?.unwrap_or_default();
+        let keyframe = !payload.is_empty()
+            && match self.codec {
+                Codec::Hevc => annexb_hevc_has_irap(&payload),
+                _ => annexb_has_idr(&payload),
+            };
         Ok(Encoded {
             payload,
             keyframe,
-            codec: Codec::H264,
+            codec: self.codec,
             convert_us,
         })
     }
 }
 
-impl Drop for MfH264Encoder {
+impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);

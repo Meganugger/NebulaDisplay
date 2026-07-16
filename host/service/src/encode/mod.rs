@@ -3,17 +3,18 @@
 //!
 //! * JPEG — always available, pure Rust; every frame is a "keyframe".
 //! * H.264 — OpenH264 (feature `h264`, on by default), screen-content tuned,
-//!   Annex-B output that WebCodecs/MediaCodec/VideoToolbox all accept.
-//!
-//! Hardware encoders (Media Foundation → NVENC/QuickSync/AMF) plug in behind
-//! the same trait; see `docs/ROADMAP.md`.
+//!   Annex-B output that WebCodecs/MediaCodec/VideoToolbox all accept; on
+//!   Windows a hardware Media Foundation MFT (NVENC/QuickSync/AMF) is
+//!   preferred when present.
+//! * HEVC — Windows hardware MFT only (no software fallback); offered to
+//!   viewers that advertise `hevc` decode support.
 
 mod dirty;
 #[cfg(feature = "h264")]
 mod h264;
 mod jpeg;
 #[cfg(windows)]
-mod mf_h264;
+mod mf_video;
 
 use ndsp_protocol::messages::Codec;
 
@@ -58,8 +59,9 @@ pub fn create(
         Codec::Jpeg => Ok(Box::new(jpeg::JpegEncoder::new())),
         Codec::H264 => {
             #[cfg(windows)]
-            if mf_h264::hw_encoder_available() {
-                match mf_h264::MfH264Encoder::new(mode.width, mode.height, 6_000, 60) {
+            if mf_video::hw_encoder_available(Codec::H264) {
+                match mf_video::MfVideoEncoder::new(Codec::H264, mode.width, mode.height, 6_000, 60)
+                {
                     Ok(enc) => return Ok(Box::new(enc)),
                     Err(e) => {
                         tracing::warn!("hardware encoder init failed ({e:#}); using software");
@@ -73,7 +75,52 @@ pub fn create(
             #[cfg(not(feature = "h264"))]
             anyhow::bail!("built without the h264 feature and no hardware encoder")
         }
+        Codec::Hevc => {
+            // Hardware-only: HEVC is never negotiated without an MFT (see
+            // `supports`), so failing here is a real error, not a fallback.
+            #[cfg(windows)]
+            {
+                let enc =
+                    mf_video::MfVideoEncoder::new(Codec::Hevc, mode.width, mode.height, 6_000, 60)?;
+                Ok(Box::new(enc))
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("HEVC encoding requires a Windows hardware encoder")
+        }
         other => anyhow::bail!("codec {other:?} not implemented yet"),
+    }
+}
+
+/// Can this host actually encode `codec`? Drives codec negotiation — a codec
+/// is only selected from the client's preference list when this holds.
+pub fn supports(codec: Codec) -> bool {
+    match codec {
+        Codec::Jpeg => true,
+        Codec::H264 => {
+            #[cfg(feature = "h264")]
+            {
+                true
+            }
+            #[cfg(all(not(feature = "h264"), windows))]
+            {
+                mf_video::hw_encoder_available(Codec::H264)
+            }
+            #[cfg(all(not(feature = "h264"), not(windows)))]
+            {
+                false
+            }
+        }
+        Codec::Hevc => {
+            #[cfg(windows)]
+            {
+                mf_video::hw_encoder_available(Codec::Hevc)
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+        Codec::Av1 => false,
     }
 }
 
