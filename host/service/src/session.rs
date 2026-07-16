@@ -90,6 +90,21 @@ impl ActiveTransfer {
     }
 }
 
+/// One in-flight host→viewer file send (panel-initiated, ROADMAP P2.15).
+/// Nothing is streamed until the *viewer* explicitly accepts the offer.
+struct OutgoingFile {
+    id: String,
+    /// Session-owned spool file. While `sending` the streaming task owns it
+    /// (and deletes it on every exit path); before that, whoever clears the
+    /// entry deletes it.
+    path: PathBuf,
+    offered_at: Instant,
+    /// The viewer accepted and the streaming task is running.
+    sending: bool,
+    /// Tells a running streaming task to stop (viewer abort / teardown).
+    cancel: Arc<AtomicBool>,
+}
+
 struct Shared {
     input_allowed: Arc<AtomicBool>,
     clipboard_allowed: Arc<AtomicBool>,
@@ -98,6 +113,8 @@ struct Shared {
     audio: Mutex<AudioCtl>,
     /// The panel-accepted transfer currently receiving chunks (max one).
     transfer: Mutex<Option<ActiveTransfer>>,
+    /// The host→viewer transfer currently offered/streaming (max one).
+    outgoing: Mutex<Option<OutgoingFile>>,
     /// An offer is pending a panel decision (rate-limits offer spam).
     offer_pending: AtomicBool,
     /// `InputMode` as u8 (see [`mode_to_u8`]).
@@ -210,6 +227,7 @@ pub async fn run(
             counted: false,
         }),
         transfer: Mutex::new(None),
+        outgoing: Mutex::new(None),
         offer_pending: AtomicBool::new(false),
         input_mode: AtomicU32::new(mode_to_u8(InputMode::ViewOnly)),
         force_keyframe: AtomicBool::new(true),
@@ -258,6 +276,10 @@ pub async fn run(
     // video, stale packets are not overwritten) but a wedged socket drops
     // rather than queues — the web jitter buffer conceals isolated gaps.
     let (aud_tx, aud_rx) = mpsc::channel::<AudioFrame>(16);
+    // Bulk file lane (host→viewer sends): lowest writer priority, tightly
+    // bounded so the streaming task paces on real socket drain instead of
+    // queueing megabytes — a file transfer never starves video or audio.
+    let (file_tx, file_rx) = mpsc::channel::<ControlMsg>(4);
 
     let writer = tokio::spawn(writer_task(
         ws_tx,
@@ -265,6 +287,7 @@ pub async fn run(
         ctl_rx,
         aud_rx,
         vid_rx,
+        file_rx,
         shared.clone(),
         consumed_seq.clone(),
     ));
@@ -274,6 +297,7 @@ pub async fn run(
         opener,
         shared.clone(),
         ctl_tx.clone(),
+        file_tx,
         input_sink,
         handle.clone(),
     ));
@@ -344,6 +368,32 @@ pub async fn run(
                     };
                     if ctl_tx.send(msg).await.is_err() { break; }
                 }
+                SessionCommand::SendFile { id, name, size_bytes, sha256_hex, path } => {
+                    // One outgoing transfer at a time (mirrors the incoming rule).
+                    let refused = {
+                        let mut out = shared.outgoing.lock().unwrap();
+                        if out.is_some() {
+                            true
+                        } else {
+                            *out = Some(OutgoingFile {
+                                id: id.clone(),
+                                path: path.clone(),
+                                offered_at: Instant::now(),
+                                sending: false,
+                                cancel: Arc::new(AtomicBool::new(false)),
+                            });
+                            false
+                        }
+                    };
+                    if refused {
+                        warn!(%id, "host→viewer send refused: another outgoing transfer is active");
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    info!(%id, %name, size_bytes, "offering file to viewer");
+                    let offer = ControlMsg::FileOffer { id, name, size_bytes, sha256: sha256_hex };
+                    if ctl_tx.send(offer).await.is_err() { break; }
+                }
                 SessionCommand::Kick { reason } => {
                     let _ = ctl_tx.send(ControlMsg::Bye { reason }).await;
                     // Give the writer a moment to flush the Bye.
@@ -402,6 +452,25 @@ pub async fn run(
                     warn!(client_id, "client unresponsive; closing");
                     break;
                 }
+                // Expire an outgoing file offer the viewer never answered.
+                let expired = {
+                    let mut out = shared.outgoing.lock().unwrap();
+                    match out.as_ref() {
+                        Some(t)
+                            if !t.sending
+                                && t.offered_at.elapsed() > crate::transfers::OFFER_TTL =>
+                        {
+                            out.take()
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(t) = expired {
+                    warn!(id = %t.id, "outgoing file offer expired without an answer");
+                    let _ = std::fs::remove_file(&t.path);
+                    let abort = ControlMsg::FileAbort { id: t.id, reason: "offer expired".into() };
+                    if ctl_tx.send(abort).await.is_err() { break; }
+                }
                 let stats = {
                     let mut hs = state.host_stats.lock().unwrap();
                     {
@@ -437,6 +506,13 @@ pub async fn run(
         warn!(id = %t.id, "session ended mid-transfer; discarding partial file");
         t.discard();
     }
+    if let Some(t) = shared.outgoing.lock().unwrap().take() {
+        t.cancel.store(true, Ordering::Relaxed);
+        if !t.sending {
+            // Not yet streaming → nobody else owns the spool file.
+            let _ = std::fs::remove_file(&t.path);
+        }
+    }
     {
         // Release our audio listener slot if we held one.
         let mut a = shared.audio.lock().unwrap();
@@ -454,14 +530,18 @@ pub async fn run(
     info!(client_id, "session ended");
 }
 
-/// Owns the socket sink. Control preempts audio preempts video; video is
-/// latest-only, audio is a short FIFO (continuity matters), control is rare.
+/// Owns the socket sink. Control preempts audio preempts video preempts
+/// bulk file chunks; video is latest-only, audio is a short FIFO
+/// (continuity matters), control is rare, and file chunks only flow when
+/// nothing latency-sensitive is waiting.
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     mut ws_tx: SplitSink<WebSocket, Message>,
     mut sealer: Sealer,
     mut ctl_rx: mpsc::Receiver<ControlMsg>,
     mut aud_rx: mpsc::Receiver<AudioFrame>,
     mut vid_rx: watch::Receiver<Option<(u64, Arc<VideoFrame>)>>,
+    mut file_rx: mpsc::Receiver<ControlMsg>,
     shared: Arc<Shared>,
     consumed_seq: Arc<AtomicU64>,
 ) {
@@ -510,6 +590,14 @@ async fn writer_task(
                 if t_send.elapsed() > budget {
                     shared.ctl.lock().unwrap().on_send_backlog();
                 }
+            }
+
+            msg = file_rx.recv() => {
+                let Some(msg) = msg else { break };
+                let json = msg.to_json().expect("file message serialization");
+                let envelope = sealer.seal(Channel::Control, json.as_bytes());
+                shared.bytes_sent.fetch_add(envelope.len() as u64, Ordering::Relaxed);
+                if ws_tx.send(Message::Binary(envelope.into())).await.is_err() { break; }
             }
         }
     }
@@ -764,12 +852,14 @@ fn open_transfer(
 /// Latency-critical handling happens *right here* — input events go straight
 /// to the injection sink and pings are answered immediately, so neither ever
 /// waits behind an encode or a video send.
+#[allow(clippy::too_many_arguments)]
 async fn incoming_pump(
     state: Arc<AppState>,
     mut ws_rx: SplitStream<WebSocket>,
     mut opener: Opener,
     shared: Arc<Shared>,
     ctl_tx: mpsc::Sender<ControlMsg>,
+    file_tx: mpsc::Sender<ControlMsg>,
     input_sink: Arc<dyn InputSink>,
     handle: Arc<ClientHandle>,
 ) {
@@ -974,12 +1064,71 @@ async fn incoming_pump(
                                 return;
                             }
                         }
+                        ControlMsg::FileAnswer { id, accept, .. } => {
+                            // The viewer's decision on a host→viewer offer.
+                            let start: Option<(PathBuf, Arc<AtomicBool>)> = {
+                                let mut guard = shared.outgoing.lock().unwrap();
+                                match guard.as_mut() {
+                                    Some(t) if t.id == id && !t.sending => {
+                                        if accept {
+                                            t.sending = true;
+                                            Some((t.path.clone(), t.cancel.clone()))
+                                        } else {
+                                            let t = guard.take().expect("matched above");
+                                            let _ = std::fs::remove_file(&t.path);
+                                            info!(%id, "viewer declined the file");
+                                            None
+                                        }
+                                    }
+                                    _ => {
+                                        debug!(%id, "file answer for unknown transfer; ignoring");
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some((path, cancel)) = start {
+                                info!(%id, "viewer accepted; streaming file");
+                                tokio::spawn(stream_outgoing(id, path, cancel, file_tx.clone()));
+                            }
+                        }
+                        ControlMsg::FileDone { id } => {
+                            // Receiver-side verification succeeded.
+                            let done = {
+                                let mut guard = shared.outgoing.lock().unwrap();
+                                match guard.as_ref() {
+                                    Some(t) if t.id == id => guard.take(),
+                                    _ => None,
+                                }
+                            };
+                            if done.is_some() {
+                                info!(%id, "viewer verified the sent file");
+                            }
+                        }
                         ControlMsg::FileAbort { id, reason } => {
-                            let mut guard = shared.transfer.lock().unwrap();
-                            if guard.as_ref().is_some_and(|t| t.id == id) {
-                                info!(%id, %reason, "viewer cancelled file transfer");
-                                if let Some(t) = guard.take() {
-                                    t.discard();
+                            // Incoming (viewer→host) transfer?
+                            {
+                                let mut guard = shared.transfer.lock().unwrap();
+                                if guard.as_ref().is_some_and(|t| t.id == id) {
+                                    info!(%id, %reason, "viewer cancelled file transfer");
+                                    if let Some(t) = guard.take() {
+                                        t.discard();
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Outgoing (host→viewer) transfer?
+                            let out = {
+                                let mut guard = shared.outgoing.lock().unwrap();
+                                match guard.as_ref() {
+                                    Some(t) if t.id == id => guard.take(),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(t) = out {
+                                info!(%id, %reason, "viewer aborted host→viewer transfer");
+                                t.cancel.store(true, Ordering::Relaxed);
+                                if !t.sending {
+                                    let _ = std::fs::remove_file(&t.path);
                                 }
                             }
                         }
@@ -1031,6 +1180,76 @@ fn apply_chunk(t: &mut ActiveTransfer, seq: u32, data_b64: &str) -> Result<(), S
     t.received += data.len() as u64;
     t.next_seq += 1;
     Ok(())
+}
+
+/// Streams an accepted host→viewer file through the writer's lowest-
+/// priority lane (bulk chunks never starve control/audio/video; the tightly
+/// bounded lane paces reads on actual socket drain). Owns the spool file
+/// from the moment the transfer entered `sending` — deletes it on every
+/// exit path (success, viewer abort, session gone, read error).
+async fn stream_outgoing(
+    id: String,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    file_tx: mpsc::Sender<ControlMsg>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let result: Result<(), String> = async {
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| format!("open failed: {e}"))?;
+        let mut buf = vec![0u8; FILE_CHUNK_BYTES];
+        let mut seq: u32 = 0;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(()); // viewer aborted / session tearing down
+            }
+            let mut filled = 0;
+            while filled < buf.len() {
+                let n = file
+                    .read(&mut buf[filled..])
+                    .await
+                    .map_err(|e| format!("read failed: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&buf[..filled]);
+            let chunk = ControlMsg::FileChunk {
+                id: id.clone(),
+                seq,
+                data,
+            };
+            file_tx
+                .send(chunk)
+                .await
+                .map_err(|_| "session closed".to_string())?;
+            seq += 1;
+            if filled < buf.len() {
+                break; // EOF reached mid-buffer
+            }
+        }
+        file_tx
+            .send(ControlMsg::FileEnd { id: id.clone() })
+            .await
+            .map_err(|_| "session closed".to_string())?;
+        Ok(())
+    }
+    .await;
+    if let Err(reason) = result {
+        warn!(%id, %reason, "host→viewer file stream failed");
+        let _ = file_tx
+            .send(ControlMsg::FileAbort {
+                id,
+                reason: "host-side read error".into(),
+            })
+            .await;
+    }
+    let _ = tokio::fs::remove_file(&path).await;
 }
 
 /// Verify a finished transfer and move it to its final destination.

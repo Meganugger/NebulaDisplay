@@ -125,10 +125,14 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
         <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td><button data-send-file="${c.id}" title="Send a file to this viewer (it must accept)">Send file…</button></td>
       </tr>`,
     )
     .join("");
   $("no-clients").style.display = st.clients.length ? "none" : "";
+  ctbody.querySelectorAll<HTMLButtonElement>("button[data-send-file]").forEach((el) => {
+    el.onclick = () => pickAndSendFile(Number(el.dataset["sendFile"]));
+  });
 
   // Trusted devices.
   const ttbody = $("trusted").querySelector("tbody")!;
@@ -218,6 +222,33 @@ function renderTransfers(pending: PendingTransfer[]): void {
   box.querySelectorAll<HTMLButtonElement>("button[data-xfer-deny]").forEach((el) => {
     el.onclick = () => answer(el.dataset["xferDeny"]!, false);
   });
+}
+
+/** Host→viewer file send: pick a local file, upload it to nebulad, which
+ * offers it to the viewer (the viewer must explicitly accept). */
+function pickAndSendFile(clientId: number): void {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.onchange = () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    const status = $("send-file-status");
+    status.textContent = `Uploading ${file.name}…`;
+    status.style.display = "";
+    void api<{ id: string }>(
+      `/api/send-file?client_id=${clientId}&name=${encodeURIComponent(file.name)}`,
+      { method: "POST", body: file },
+    )
+      .then(() => {
+        status.textContent = `Offered ${file.name} — waiting for the viewer to accept.`;
+        setTimeout(() => (status.style.display = "none"), 8000);
+      })
+      .catch((e: Error) => {
+        status.textContent = `Send failed: ${e.message}`;
+        setTimeout(() => (status.style.display = "none"), 8000);
+      });
+  };
+  input.click();
 }
 
 function line(k: string, v: string): string {

@@ -878,6 +878,246 @@ async fn file_drop_needs_panel_accept_and_verifies_hash() {
     host.shutdown().await;
 }
 
+/// Poll until exactly one live client is registered; return its id.
+async fn live_client_id(state: &std::sync::Arc<nebulad::state::AppState>) -> u64 {
+    for _ in 0..100 {
+        if let Some(id) = state.clients.lock().unwrap().keys().next().copied() {
+            return id;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("client never registered");
+}
+
+/// Spool a file the way the panel upload endpoint does, returning
+/// (path, sha256_hex).
+fn spool_file(state: &nebulad::state::AppState, content: &[u8]) -> (std::path::PathBuf, String) {
+    use sha2::Digest as _;
+    let dir = state.cfg.file_transfer_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!(".send-test-{}.tmp", std::process::id()));
+    std::fs::write(&path, content).unwrap();
+    (path, hex::encode(sha2::Sha256::digest(content)))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_to_viewer_file_send_streams_and_cleans_up() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let host = start_host("filesend").await;
+    let pin = host.state.pins.current_pin();
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Receiver"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .unwrap();
+    let client_id = live_client_id(&host.state).await;
+
+    // Unknown client ids must be refused up front.
+    assert!(host
+        .state
+        .send_file_to_client(
+            client_id + 999,
+            "x.bin",
+            1,
+            &"00".repeat(32),
+            "/nonexistent".into()
+        )
+        .is_err());
+
+    // Spool a file exactly like the panel upload does, then offer it.
+    let content: Vec<u8> = (0..700_001u32)
+        .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+        .collect();
+    let (spool, sha) = spool_file(&host.state, &content);
+    let id = host
+        .state
+        .send_file_to_client(
+            client_id,
+            "../../evil/../report v2.bin", // sanitizer bait
+            content.len() as u64,
+            &sha,
+            spool.clone(),
+        )
+        .expect("send_file_to_client");
+
+    // The viewer receives the offer with a sanitized name + exact metadata.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (offer_name, offer_size, offer_sha) = loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("no file offer")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileOffer {
+                id: rid,
+                name,
+                size_bytes,
+                sha256,
+            }) if rid == id => break (name, size_bytes, sha256),
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        offer_name, "report v2.bin",
+        "path components must be stripped"
+    );
+    assert_eq!(offer_size, content.len() as u64);
+    assert_eq!(offer_sha, sha);
+
+    // Nothing may be streamed before the viewer accepts.
+    let until = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout_at(until, session.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::FileChunk { .. }))) => {
+                panic!("chunk sent before the viewer accepted")
+            }
+            Ok(Ok(Incoming::Closed)) => panic!("closed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("recv: {e:#}"),
+            Err(_) => break, // quiet until accept — good
+        }
+    }
+
+    session
+        .send(&ControlMsg::FileAnswer {
+            id: id.clone(),
+            accept: true,
+            reason: None,
+        })
+        .await
+        .unwrap();
+
+    // Chunks arrive in order; FileEnd closes the stream.
+    let mut received: Vec<u8> = Vec::new();
+    let mut next_seq = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("transfer stalled")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileChunk { id: rid, seq, data }) if rid == id => {
+                assert_eq!(seq, next_seq, "chunks must arrive in order");
+                next_seq += 1;
+                received.extend_from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .expect("valid base64"),
+                );
+            }
+            Incoming::Control(ControlMsg::FileEnd { id: rid }) if rid == id => break,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    assert_eq!(received.len(), content.len());
+    assert_eq!(received, content, "content must survive bit-exact");
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&received)),
+        sha,
+        "receiver-side hash must verify"
+    );
+    session
+        .send(&ControlMsg::FileDone { id: id.clone() })
+        .await
+        .unwrap();
+
+    // The spool file must be cleaned up once the stream finished.
+    for _ in 0..100 {
+        if !spool.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!spool.exists(), "spool file must be deleted after the send");
+
+    session.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_to_viewer_file_send_decline_stops_everything() {
+    let host = start_host("filesend-deny").await;
+    let pin = host.state.pins.current_pin();
+    let mut session = connect(
+        "127.0.0.1",
+        host.port,
+        client_info("Decliner"),
+        Auth::Pin(&pin),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .unwrap();
+    let client_id = live_client_id(&host.state).await;
+
+    let content = b"do not want".to_vec();
+    let (spool, sha) = spool_file(&host.state, &content);
+    let id = host
+        .state
+        .send_file_to_client(
+            client_id,
+            "unwanted.txt",
+            content.len() as u64,
+            &sha,
+            spool.clone(),
+        )
+        .unwrap();
+
+    // Receive the offer, decline it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("no file offer")
+            .unwrap()
+        {
+            Incoming::Control(ControlMsg::FileOffer { id: rid, .. }) if rid == id => break,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+    session
+        .send(&ControlMsg::FileAnswer {
+            id: id.clone(),
+            accept: false,
+            reason: Some("no thanks".into()),
+        })
+        .await
+        .unwrap();
+
+    // The spool file goes away and no chunk ever arrives.
+    for _ in 0..100 {
+        if !spool.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!spool.exists(), "declined spool file must be deleted");
+    let until = tokio::time::Instant::now() + Duration::from_millis(700);
+    loop {
+        match tokio::time::timeout_at(until, session.recv()).await {
+            Ok(Ok(Incoming::Control(ControlMsg::FileChunk { .. }))) => {
+                panic!("no chunk may follow a decline")
+            }
+            Ok(Ok(Incoming::Closed)) => panic!("closed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("recv: {e:#}"),
+            Err(_) => break, // quiet — good
+        }
+    }
+
+    session.close().await;
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn corrupted_file_transfer_is_rejected_and_cleaned_up() {
     use base64::Engine as _;

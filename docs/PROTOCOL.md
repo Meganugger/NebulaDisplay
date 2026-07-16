@@ -143,11 +143,11 @@ viewers on insecure origins, which have no WebCodecs Opus decoder
 | `audio_grant {allowed}` | S→C | live audio-permission change from the panel (mute) |
 | `clipboard {text}` | both | clipboard sync; only honored with the device's clipboard grant; ≤ 256 KiB |
 | `clipboard_grant {allowed}` | S→C | live clipboard-permission change |
-| `file_offer {id,name,size_bytes,sha256}` | C→S | offer a file; host queues an explicit panel accept |
-| `file_answer {id,accept,reason?}` | S→C | the user's panel decision |
-| `file_chunk {id,seq,data}` | C→S | in-order b64 chunk, ≤ 256 KiB raw |
-| `file_end {id}` | C→S | sender done → host verifies size + sha256 |
-| `file_done {id}` | S→C | verified, moved into the receive directory |
+| `file_offer {id,name,size_bytes,sha256}` | both | offer a file; the receiver gates it on an explicit human decision (host: panel accept; viewer: on-screen prompt) |
+| `file_answer {id,accept,reason?}` | both | the receiving side's decision |
+| `file_chunk {id,seq,data}` | both | in-order b64 chunk, ≤ 256 KiB raw; host→viewer chunks ride the writer's lowest-priority lane so they never starve video/audio/control |
+| `file_end {id}` | both | sender done → receiver verifies size + sha256 |
+| `file_done {id}` | both | verified (host: moved into the receive directory; viewer: handed to the browser as a download) |
 | `file_abort {id,reason}` | both | cancel / verification failure (partial file deleted) |
 | `bye {reason}` | both | graceful close |
 | `error {code,message}` | both | non-fatal report |

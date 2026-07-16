@@ -70,6 +70,18 @@ pub enum SessionCommand {
         size_bytes: u64,
         sha256_hex: String,
     },
+    /// Host→viewer file send (panel-initiated). `path` is a host-owned
+    /// spool file (already size-capped and hashed by the initiator); the
+    /// session offers it to the viewer and streams it only after the
+    /// viewer explicitly accepts. The session owns `path` from here on
+    /// (deletes it when the transfer ends, whatever the outcome).
+    SendFile {
+        id: String,
+        name: String,
+        size_bytes: u64,
+        sha256_hex: String,
+        path: std::path::PathBuf,
+    },
     Kick {
         reason: String,
     },
@@ -323,6 +335,39 @@ impl AppState {
     }
     pub fn audio_listener_count(&self) -> usize {
         self.audio_listeners.load(Ordering::Relaxed)
+    }
+
+    /// Offer a spooled file to a connected client (host→viewer send,
+    /// ROADMAP P2.15). The session takes ownership of `path`. Returns the
+    /// transfer id, or an error when the client is unknown / its command
+    /// queue is full (callers must then delete the spool file themselves).
+    pub fn send_file_to_client(
+        &self,
+        client_id: u64,
+        name: &str,
+        size_bytes: u64,
+        sha256_hex: &str,
+        path: std::path::PathBuf,
+    ) -> anyhow::Result<String> {
+        let commands = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(&client_id)
+            .map(|c| c.commands.clone())
+            .ok_or_else(|| anyhow::anyhow!("no connected client with id {client_id}"))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let cmd = SessionCommand::SendFile {
+            id: id.clone(),
+            name: crate::transfers::sanitize_filename(name),
+            size_bytes,
+            sha256_hex: sha256_hex.to_ascii_lowercase(),
+            path,
+        };
+        commands
+            .try_send(cmd)
+            .map_err(|_| anyhow::anyhow!("client session is busy"))?;
+        Ok(id)
     }
 
     /// Revoke trust and kick any live session for that device.

@@ -27,9 +27,10 @@ Windows PC (host)                            any device (viewer)
   you allow it**; optional `--https` with a pinned self-signed cert.
 - **Audio**: hear the PC on the viewer (WASAPI loopback → Opus) — strictly
   opt-in, per-device mutable, with a live "listening" indicator.
-- **Clipboard sync & file drop** — both permission-gated: clipboard is
+- **Clipboard sync & file transfer** — both permission-gated: clipboard is
   deny-by-default per device; every file transfer needs an explicit accept
-  in the panel.
+  by a human on the *receiving* side (host panel for drops onto the PC,
+  on-screen prompt for files sent to a viewer).
 - **Adaptive**: AIMD bitrate/FPS driven by real congestion signals; profiles
   for Office / Video / Drawing / Gaming.
 - **Local-first**: LAN, hotspot, or USB (`adb reverse`) — internet never
@@ -68,10 +69,11 @@ Open the printed URL on the other device, enter the PIN — done. Panel:
 
 ## Status (honest)
 
-Verified by automated tests (82 Rust tests + Node cross-stack compat + full
+Verified by automated tests (95 Rust tests + Node cross-stack compat + full
 Chromium E2E in CI): protocol/crypto, **SPAKE2 + legacy pairing**,
 trust/grants, H.264+JPEG streaming, **Opus/PCM audio (channel 3)**,
-**clipboard sync**, **file drop with panel approval**, web viewer,
+**clipboard sync**, **file transfer in both directions with an explicit
+accept on the receiving side**, web viewer,
 adaptation, discovery, panel, **HTTPS/WSS serving**. Written but **needing a
 Windows/WDK/SDK machine to build & validate at runtime**: the IddCx driver
 (extend mode), DXGI mirror/SendInput/**WASAPI loopback**/DPAPI runtime

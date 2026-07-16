@@ -79,6 +79,14 @@ Shipped in v0.5 (no longer roadmap items):
   pinch-zoom and multi-finger gestures reach the host; where the API is
   missing, the first finger falls back to mouse press-drag and additional
   fingers are ignored instead of fighting over the cursor.
+* **Host→viewer file send (was P2.15, file part)** — initiated from the
+  panel (the panel browser uploads the picked file — the service
+  deliberately exposes no "send an arbitrary host path" primitive to other
+  local processes), offered to the viewer, which must **explicitly accept**
+  before any bytes flow; chunks ride a dedicated lowest-priority writer
+  lane (control > audio > video > file — a bulk transfer never adds
+  latency), sha256-verified by the receiver, delivered as a browser
+  download.
 * **At-rest key protection (was P1.6, Windows part)** — DPAPI wrapping of
   the trust store, identity key, and TLS key with transparent migration
   from plaintext stores. (Android already uses the platform Keystore; a
@@ -109,8 +117,8 @@ Shipped in v0.5 (no longer roadmap items):
     assignment, video-wall spanning mode.
 12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
     clean-room scope; use Windows.Gaming.Input injection when available).
-15. Host→viewer file send (viewer→host shipped in v0.5); audio for the
-    desktop/mobile viewers (web shipped).
+15. Audio playback for the desktop/mobile viewers (web shipped; the frames
+    already arrive — they need platform audio output backends).
 
 ## P3 — platform breadth
 

@@ -77,7 +77,7 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 | Input abuse | Input **denied by default** per device; grants are live-revocable; sessions enforce grant server-side on every event batch |
 | Clipboard theft/poisoning | Clipboard sync **denied by default** per device; 256 KiB cap both ways; host→viewer flow only polls the OS clipboard while a granted device is connected, and never ships pre-session clipboard content |
 | Covert listening | Audio is **per-viewer opt-in** (never streams unrequested); the panel shows a live "🔊 listening" indicator per device and can mute any device instantly; capture stops (device released) at zero listeners |
-| Malicious file drop | Every transfer needs an **explicit per-file accept in the panel**; filenames sanitized to one path component; size caps; sha256 verified; partial/failed transfers deleted; offers expire in 120 s |
+| Malicious file drop | Every transfer needs an **explicit per-file accept by a human on the receiving side** (host panel for viewer→host, on-screen viewer prompt for host→viewer); filenames sanitized to one path component; size caps; sha256 verified; partial/failed transfers deleted; offers expire in 120 s |
 | Replay/reorder injection | Envelope counters + GCM |
 | Panel exposure | Panel binds 127.0.0.1 only; contains PIN/grants; never reachable from LAN |
 | Driver attack surface | Driver has no network code; validates geometry; ring is `Local\` namespace |
@@ -105,6 +105,11 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
   never ships clipboard content that predates the session.
 * File drop (v0.5) writes nothing without an explicit per-transfer accept in
   the panel. Nothing is shared implicitly.
+* Host→viewer file send is panel-initiated by **uploading the picked file's
+  bytes** — the service deliberately exposes no "send an arbitrary host
+  path to a viewer" API that another local process could abuse for
+  exfiltration — and the viewer must explicitly accept before any bytes
+  flow (sha256-verified on arrival).
 
 ## Reporting
 
