@@ -46,8 +46,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_YVIRTUALSCREEN, TOUCH_MASK_PRESSURE, XBUTTON1, XBUTTON2,
 };
 
+use windows::Gaming::Input::GamepadButtons;
+use windows::UI::Input::Preview::Injection::{InjectedInputGamepadInfo, InputInjector};
+
 use super::touch_frame::{self, Action, Contact, TouchTracker};
-use super::{pen_pressure_1024, pen_tilt_deg, InputSink};
+use super::{gamepad_buttons_to_windows, pen_pressure_1024, pen_tilt_deg, InputSink};
 use crate::state::AppState;
 
 pub struct WindowsInputSink {
@@ -63,6 +66,8 @@ pub struct WindowsInputSink {
     pen: Mutex<Option<Option<PenDevice>>>,
     /// Lazily-created synthetic touch device (same tri-state as `pen`).
     touch: Mutex<Option<Option<TouchDevice>>>,
+    /// Lazily-created WinRT gamepad injector (same tri-state as `pen`).
+    gamepad: Mutex<Option<Option<GamepadInjector>>>,
 }
 
 impl WindowsInputSink {
@@ -73,6 +78,7 @@ impl WindowsInputSink {
             modifiers: Mutex::new(0),
             pen: Mutex::new(None),
             touch: Mutex::new(None),
+            gamepad: Mutex::new(None),
         }
     }
 
@@ -184,6 +190,30 @@ impl WindowsInputSink {
             return false;
         }
         true
+    }
+
+    /// Inject one gamepad state snapshot (ROADMAP P2.12). The injected pad
+    /// is visible to `Windows.Gaming.Input` consumers (UWP / GDK titles);
+    /// XInput-only Win32 games need a bus driver, which is out of
+    /// clean-room scope — documented in docs/ROADMAP.md.
+    #[allow(clippy::too_many_arguments)]
+    fn inject_gamepad(&self, buttons: u32, lt: f32, rt: f32, lx: f32, ly: f32, rx: f32, ry: f32) {
+        let mut slot = self.gamepad.lock().unwrap();
+        let device = slot.get_or_insert_with(|| match GamepadInjector::create() {
+            Ok(d) => {
+                tracing::info!("gamepad injection active (Windows.Gaming.Input)");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::info!("gamepad injection unavailable ({e:#}); dropping gamepad input");
+                None
+            }
+        });
+        let Some(device) = device else { return };
+        if let Err(e) = device.inject(buttons, lt, rt, lx, ly, rx, ry) {
+            tracing::warn!("gamepad injection failed ({e:#}); disabling");
+            *slot = Some(None);
+        }
     }
 
     /// Map a normalized (0..1) point on the streamed monitor to the 0..65535
@@ -518,6 +548,56 @@ impl Drop for TouchDevice {
     }
 }
 
+/// WinRT gamepad injector: the injected state appears as a
+/// `Windows.Gaming.Input` gamepad.
+struct GamepadInjector {
+    injector: InputInjector,
+    info: InjectedInputGamepadInfo,
+}
+
+// SAFETY: only used under the sink's mutex; the WinRT objects are agile.
+unsafe impl Send for GamepadInjector {}
+
+impl GamepadInjector {
+    fn create() -> windows::core::Result<Self> {
+        let injector = InputInjector::TryCreate()?;
+        injector.InitializeGamepadInjection()?;
+        Ok(Self {
+            injector,
+            info: InjectedInputGamepadInfo::new()?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inject(
+        &self,
+        buttons_w3c: u32,
+        lt: f32,
+        rt: f32,
+        lx: f32,
+        ly: f32,
+        rx: f32,
+        ry: f32,
+    ) -> windows::core::Result<()> {
+        let info = &self.info;
+        info.SetButtons(GamepadButtons(gamepad_buttons_to_windows(buttons_w3c)))?;
+        info.SetLeftTrigger(lt.clamp(0.0, 1.0) as f64)?;
+        info.SetRightTrigger(rt.clamp(0.0, 1.0) as f64)?;
+        info.SetLeftThumbstickX(lx.clamp(-1.0, 1.0) as f64)?;
+        // W3C stick Y is down-positive; Windows.Gaming.Input is up-positive.
+        info.SetLeftThumbstickY((-ly).clamp(-1.0, 1.0) as f64)?;
+        info.SetRightThumbstickX(rx.clamp(-1.0, 1.0) as f64)?;
+        info.SetRightThumbstickY((-ry).clamp(-1.0, 1.0) as f64)?;
+        self.injector.InjectGamepadInput(info)
+    }
+}
+
+impl Drop for GamepadInjector {
+    fn drop(&mut self) {
+        let _ = self.injector.UninitializeGamepadInjection();
+    }
+}
+
 /// Build the OS pointer record for one contact of an injection frame.
 fn touch_pointer_info(c: &Contact, pos: POINT) -> POINTER_TYPE_INFO {
     let (flags, in_contact) = match c.action {
@@ -651,6 +731,12 @@ impl InputSink for WindowsInputSink {
                 }
             }
         }
+        // Neutral gamepad state (no stuck buttons/sticks after disconnect).
+        if let Some(Some(device)) = self.gamepad.lock().unwrap().as_ref() {
+            if let Err(e) = device.inject(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) {
+                tracing::warn!("gamepad neutral-state injection failed: {e:#}");
+            }
+        }
         // Stuck left button from the touch/pen mouse fallback.
         let mut down = self.touch_down.lock().unwrap();
         if *down {
@@ -760,6 +846,29 @@ impl InputSink for WindowsInputSink {
                     }
                     // Fallback: same single-pointer mouse mapping as touch.
                     self.pointer_as_mouse(&mut batch, *phase, *x, *y);
+                }
+                InputEvent::Gamepad {
+                    buttons,
+                    left_trigger,
+                    right_trigger,
+                    lx,
+                    ly,
+                    rx,
+                    ry,
+                    ..
+                } => {
+                    // Ordering: flush queued SendInput first, like pen/touch.
+                    self.send(&batch);
+                    batch.clear();
+                    self.inject_gamepad(
+                        *buttons,
+                        *left_trigger,
+                        *right_trigger,
+                        *lx,
+                        *ly,
+                        *rx,
+                        *ry,
+                    );
                 }
                 InputEvent::Touch {
                     id,
