@@ -2,6 +2,16 @@
 //!
 //! ## Pairing (first contact)
 //!
+//! Two pairing key derivations exist; both prove PIN knowledge by sealing a
+//! confirmation under the derived key:
+//!
+//! * **SPAKE2 (default, v0.5+)** — see [`crate::pake`]. The transcript is
+//!   not offline-grindable; an active MITM gets one online guess per run.
+//! * **Legacy (below, config-gated on the host)** — PIN-bound HKDF over the
+//!   ECDH secret. A *passive* recorder can offline-brute-force the short
+//!   PIN against `pair_confirm`, which is why PINs are single-use,
+//!   short-lived, and rate-limited, and why SPAKE2 replaced this path.
+//!
 //! ```text
 //! client                                server (displays PIN)
 //!   | PairStart(eph pubkey C)             |
@@ -9,19 +19,13 @@
 //!   |            PairChallenge(eph S, salt)|
 //!   |<------------------------------------|
 //!   shared = ECDH(c, S) = ECDH(s, C)
-//!   pair_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-pair-v1"||PIN||nonce)
+//!   pair_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-pair-v1"||PIN||nonce)   (legacy)
 //!   | PairConfirm(GCM_seal(pair_key, "ndsp-confirm-v1"||nonce))
 //!   |------------------------------------>|  server verifies → client knew PIN
 //!   |     PairResult(GCM_seal(pair_key, trust_token))
 //!   |<------------------------------------|
 //! session_key = HKDF-SHA256(ikm=shared, salt, info="ndsp-session-v1"||nonce)
 //! ```
-//!
-//! The PIN never crosses the wire. A passive attacker recording the exchange
-//! can offline-brute-force the (short) PIN, which is why PINs are single-use,
-//! short-lived, and rate-limited; a PAKE (SPAKE2/OPAQUE) upgrade is planned —
-//! see `docs/SECURITY.md`. An *active* MITM without the PIN cannot complete
-//! `PairConfirm` and is rejected before any screen data flows.
 //!
 //! ## Returning devices
 //!

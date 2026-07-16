@@ -70,6 +70,9 @@ jobs:
       - name: Letterbox coordinate-mapping unit tests
         working-directory: viewer/web
         run: node tests/mapping.mjs
+      - name: SPAKE2 cross-stack vectors (TS vs Rust fixed vector)
+        working-directory: viewer/web
+        run: node tests/pake-vectors.mjs
       - name: Build host for compat test
         run: cargo build -p nebulad
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)

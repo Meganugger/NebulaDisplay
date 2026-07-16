@@ -56,6 +56,7 @@ const host = spawn(
       : join(repoRoot, "target", "debug", "nebulad")),
   [
     "--test-pattern",
+    "--audio-test-tone",
     "--port", String(port),
     "--panel-port", "41998",
     "--discovery-port", "0",
@@ -90,10 +91,12 @@ console.log(`host up, pin=${pin}`);
 
 // ---- 1. pair with PIN using the real web session code ----------------------
 let frames = [];
+let audioFrames = [];
 let controls = [];
 let closed = null;
 const events = {
   onVideo: (f) => frames.push(f),
+  onAudio: (f) => audioFrames.push(f),
   onControl: (m) => controls.push(m),
   onClose: (r) => (closed = r),
 };
@@ -120,6 +123,28 @@ const pong = controls.find((c) => c.type === "pong");
 if (!pong || pong.t0_us !== 424242) fail("no matching pong");
 console.log("encrypted ping/pong OK");
 if (new Set(frames.map((f) => f.seq)).size !== frames.length) fail("duplicate seq");
+
+// ---- 1b. audio: nothing before opt-in, Opus after --------------------------
+if (!s1.info.audioAvailable) fail("host started with --audio-test-tone must advertise audio");
+if (audioFrames.length > 0) fail("audio arrived before opt-in");
+await s1.send({ type: "set_audio", enabled: true });
+for (let i = 0; i < 100 && audioFrames.length < 10; i++) await sleep(100);
+if (audioFrames.length < 10) fail(`only ${audioFrames.length} audio frames after opt-in`);
+const a0 = audioFrames[0];
+if (a0.codec !== 0 || a0.sampleRate !== 48000 || a0.channels !== 2) {
+  fail(`bad audio params: codec=${a0.codec} rate=${a0.sampleRate} ch=${a0.channels}`);
+}
+// Opus TOC sanity: payload non-empty, small (20 ms @ 96 kbps ≈ ≤ 400 B).
+if (!a0.payload.length || a0.payload.length > 1500) fail(`odd opus packet size ${a0.payload.length}`);
+console.log(`audio OK: ${audioFrames.length} opus packets, first ${a0.payload.length}B`);
+await s1.send({ type: "set_audio", enabled: false });
+
+// ---- 1c. clipboard: denied by default (host must not echo anything) --------
+controls = [];
+await s1.send({ type: "clipboard", text: "should be dropped (no grant)" });
+await sleep(400);
+if (controls.some((c) => c.type === "clipboard")) fail("clipboard echoed without grant");
+console.log("clipboard denied-by-default OK");
 
 s1.close();
 await sleep(300);

@@ -11,6 +11,9 @@ interface ClientView {
   addr: string;
   connected_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
+  audio_active: boolean;
+  audio_muted: boolean;
   stats: ViewerStats;
 }
 
@@ -21,6 +24,7 @@ interface TrustedView {
   created_unix: number;
   last_seen_unix: number;
   input_allowed: boolean;
+  clipboard_allowed: boolean;
   online: boolean;
 }
 
@@ -33,6 +37,8 @@ interface Status {
   viewer_urls: string[];
   mode: { width: number; height: number; refresh_hz: number };
   host_stats: HostStats;
+  audio_enabled: boolean;
+  audio_available: boolean;
   clients: ClientView[];
   trusted: TrustedView[];
 }
@@ -92,6 +98,18 @@ async function refresh(): Promise<void> {
     line("Viewers", String(hs.clients)),
   ].join("");
 
+  // Audio switch + privacy indicator.
+  const audioToggle = $("audio-toggle") as HTMLInputElement;
+  if (document.activeElement !== audioToggle) audioToggle.checked = st.audio_enabled;
+  const listeners = st.clients.filter((c) => c.audio_active && !c.audio_muted);
+  $("audio-indicator").style.display = st.audio_available && listeners.length ? "" : "none";
+  $("audio-listeners").textContent = listeners.map((c) => c.name).join(", ");
+  $("audio-note").textContent = st.audio_available
+    ? "System audio streaming (viewers still opt in)"
+    : st.audio_enabled
+      ? "Audio switch is on, but no capture source is available on this host"
+      : "System audio streaming (viewers still opt in)";
+
   // Connected clients.
   const ctbody = $("clients").querySelector("tbody")!;
   ctbody.innerHTML = st.clients
@@ -103,10 +121,21 @@ async function refresh(): Promise<void> {
         <td class="mono">${c.stats.e2e_latency_ms ? c.stats.e2e_latency_ms.toFixed(0) + " ms" : "—"}</td>
         <td class="mono">${c.stats.rtt_ms ? c.stats.rtt_ms.toFixed(0) + " ms" : "—"}</td>
         <td><span class="tag ${c.input_allowed ? "on" : "off"}">${c.input_allowed ? "granted" : "view-only"}</span></td>
+        <td>${audioCell(c)}</td>
       </tr>`,
     )
     .join("");
   $("no-clients").style.display = st.clients.length ? "none" : "";
+  ctbody.querySelectorAll<HTMLButtonElement>("button[data-mute]").forEach((el) => {
+    el.onclick = () =>
+      void api("/api/audio-mute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device_id: el.dataset["mute"], muted: el.dataset["muted"] !== "true" }),
+      })
+        .then(refresh)
+        .catch(console.error);
+  });
 
   // Trusted devices.
   const ttbody = $("trusted").querySelector("tbody")!;
@@ -119,6 +148,9 @@ async function refresh(): Promise<void> {
         <td>
           <label class="switch"><input type="checkbox" data-grant="${esc(d.device_id)}" ${d.input_allowed ? "checked" : ""}><span></span></label>
         </td>
+        <td>
+          <label class="switch"><input type="checkbox" data-clipgrant="${esc(d.device_id)}" ${d.clipboard_allowed ? "checked" : ""}><span></span></label>
+        </td>
         <td><button class="danger" data-revoke="${esc(d.device_id)}">Revoke</button></td>
       </tr>`,
     )
@@ -130,7 +162,15 @@ async function refresh(): Promise<void> {
       void api("/api/grant", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked }),
+        body: JSON.stringify({ device_id: el.dataset["grant"], allowed: el.checked, capability: "input" }),
+      }).catch(console.error);
+  });
+  ttbody.querySelectorAll<HTMLInputElement>("input[data-clipgrant]").forEach((el) => {
+    el.onchange = () =>
+      void api("/api/grant", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device_id: el.dataset["clipgrant"], allowed: el.checked, capability: "clipboard" }),
       }).catch(console.error);
   });
   ttbody.querySelectorAll<HTMLButtonElement>("button[data-revoke]").forEach((el) => {
@@ -147,9 +187,27 @@ async function refresh(): Promise<void> {
   });
 }
 
+function audioCell(c: ClientView): string {
+  if (!c.audio_active) return `<span class="tag off">off</span>`;
+  const state = c.audio_muted
+    ? `<span class="tag off">muted</span>`
+    : `<span class="tag on">listening</span>`;
+  const btn = `<button data-mute="${esc(c.device_id)}" data-muted="${c.audio_muted}">${c.audio_muted ? "Unmute" : "Mute"}</button>`;
+  return `${state} ${btn}`;
+}
+
 function line(k: string, v: string): string {
   return `<div class="statline"><span>${k}</span><span class="v">${v}</span></div>`;
 }
+
+($("audio-toggle") as HTMLInputElement).onchange = (ev) =>
+  void api("/api/audio", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enabled: (ev.target as HTMLInputElement).checked }),
+  })
+    .then(refresh)
+    .catch(console.error);
 
 $("rotate").onclick = () =>
   void api<{ pin: string }>("/api/pin/rotate", { method: "POST" }).then(refresh).catch(console.error);

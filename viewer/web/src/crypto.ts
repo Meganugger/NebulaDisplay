@@ -18,7 +18,6 @@ import {
 import { b64decode, b64encode, te } from "./protocol";
 
 export const CONFIRM_CONTEXT = te.encode("ndsp-confirm-v1");
-const PAIR_INFO = te.encode("ndsp-pair-v1");
 const SESSION_INFO = te.encode("ndsp-session-v1");
 
 export interface HandshakeKeys {
@@ -44,15 +43,6 @@ function concat(...parts: Uint8Array[]): Uint8Array {
     o += p.length;
   }
   return out;
-}
-
-export async function pairingKey(
-  shared: Uint8Array,
-  salt: Uint8Array,
-  pin: string,
-  nonce: Uint8Array,
-): Promise<Uint8Array> {
-  return hkdfSha256(shared, salt, concat(PAIR_INFO, te.encode(pin), nonce));
 }
 
 export async function sessionKeyBytes(

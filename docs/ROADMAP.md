@@ -24,6 +24,20 @@ QueryDisplayConfig extend-mode input mapping, multi-monitor & multi-GPU &
 HDR-capable IddCx driver with CI syntax gate, reproducible benchmark
 harness (`viewer/web/tests/bench.mjs`).
 
+Shipped since (v0.5 security & features — no longer roadmap items):
+**SPAKE2 PAKE pairing** (P-256, RFC 9382 constants; removes the offline
+PIN-grinding caveat; web + Rust clients use it always, legacy PIN-HKDF kept
+behind `legacy_pin_pairing` for current mobile apps, cross-stack test
+vectors), **audio streaming** (WASAPI loopback → 48 kHz stereo Opus on
+channel 3; off by default, per-viewer opt-in, panel indicator + per-client
+mute, WebCodecs playback with jitter buffer, test-tone source keeps the
+whole path CI-verified), **clipboard sync** (per-device grant, deny by
+default, 256 KiB caps, echo suppression, live grant push, panel toggle,
+Windows CF_UNICODETEXT backend + testable memory backend), **DPAPI-wrapped
+trust store** on Windows (transparent migration; 0600 JSON elsewhere),
+**layout-aware keyboard mapping** (viewers send `key` next to `code`; host
+injects the character via `VkKeyScanW` with Unicode fallback).
+
 ## P0 — performance & the driver
 
 1. **Driver bring-up** (needs a WDK machine): compile
@@ -45,9 +59,10 @@ harness (`viewer/web/tests/bench.mjs`).
 
 ## P1 — security & transports
 
-4. **PAKE pairing** (CPace or SPAKE2) replacing PIN-bound HKDF: removes the
-   offline-grinding caveat in SECURITY.md; wire format has room (new
-   `auth.method`).
+4. **PAKE pairing — SHIPPED v0.5** (SPAKE2, see above). Remaining: implement
+   SPAKE2 in the Kotlin/Swift viewers so `legacy_pin_pairing = false` can
+   become the default (needs P-256 point arithmetic there + on-device
+   validation; the wire format is already negotiated per-connection).
 5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
    video, streams for control; WebTransport for the web viewer where
    available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
@@ -57,23 +72,30 @@ harness (`viewer/web/tests/bench.mjs`).
    Kept at P1: real, but smaller than hardware encoders (P0.2). Browser
    WebTransport additionally requires TLS certs (serverCertificateHashes =
    Chromium-only today), so the web path stays WS regardless.*
-6. OS keystore for trust tokens (DPAPI / Keychain / Keystore).
+6. OS keystore for trust material — **host side SHIPPED v0.5** (DPAPI).
+   Remaining: client-side Keychain/Keystore in the mobile apps.
 7. Optional HTTPS with self-signed cert + fingerprint pinning for the web
    viewer's *code* integrity on hostile LANs.
 
 ## P2 — features
 
-8. **Audio**: WASAPI loopback → Opus (channel 3 is reserved); per-client
-   mute/volume; off by default with a visible indicator.
-9. **Clipboard sync** with explicit per-device permission + per-event size
-   caps (protocol slot: control messages).
+8. **Audio — SHIPPED v0.5** (WASAPI loopback → Opus on channel 3, per-client
+   opt-in/mute, indicator). Remaining runtime validation of the WASAPI
+   capture path needs a real Windows audio device (the sandbox/CI validates
+   the full pipeline with the tone source and compile-checks WASAPI); the
+   desktop/mobile viewers still need playback paths (web has one).
+9. **Clipboard sync — SHIPPED v0.5** (explicit per-device permission +
+   per-event size caps). Remaining: image clipboard (text only today);
+   mobile viewer UI.
 10. **File drop** with explicit accept dialog per transfer.
 11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
     already parameterized by `MaxMonitorsSupported`), per-client monitor
     assignment, video-wall spanning mode.
 12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
     clean-room scope; use Windows.Gaming.Input injection when available).
-13. Layout-aware keyboard mapping (send both `code` and `key`, host picks).
+13. **Layout-aware keyboard mapping — SHIPPED v0.5** (`key` alongside `code`;
+    host prefers the typed character for printable keys via VkKeyScanW,
+    Unicode injection fallback). Remaining: same for the mobile viewers.
 14. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
     (current fallback maps pen to mouse).
 

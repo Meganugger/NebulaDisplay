@@ -5,7 +5,9 @@
 //! fresh AES-256-GCM key:
 //!
 //! * **Pair** (first contact) — client must prove knowledge of the on-screen
-//!   PIN by sealing a confirmation under the PIN-bound pairing key.
+//!   PIN. Preferred: **SPAKE2** (`pair_start.pake = true`; transcript is not
+//!   offline-grindable). Legacy PIN-bound-HKDF is accepted only while
+//!   `legacy_pin_pairing = true` (pre-v0.5 mobile viewers).
 //! * **Token** (returning device) — client proves possession of its trust
 //!   token via a hash bound to the full handshake transcript.
 

@@ -25,9 +25,14 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 * Handshake: ephemeral **ECDH P-256** per connection → **HKDF-SHA256** →
   **AES-256-GCM** session key. Forward secrecy: recording traffic and later
   stealing the trust store does not decrypt past sessions.
-* Pairing: the session is bound to a **single-use, TTL-limited PIN** via
-  `pair_key = HKDF(shared, salt, "ndsp-pair-v1"‖PIN‖nonce)`. The PIN never
-  crosses the wire; an active MITM without it cannot complete pairing.
+* Pairing: **SPAKE2** (P-256, RFC 9382 constants) binds the session to the
+  **single-use, TTL-limited PIN**. The PIN never crosses the wire, a
+  recorded pairing transcript is **not offline-grindable** (shares are
+  uniformly random points; testing a guess requires solving CDH), and the
+  transcript hash binds both ephemeral ECDH keys, so an active MITM
+  substituting keys fails too. An active attacker gets exactly one online
+  guess per connection — answered with a PIN rotation and per-IP lockout.
+  Cross-stack byte compatibility (Rust ↔ web) is locked by shared vectors.
 * Reconnect: 256-bit per-device token; proof = SHA-256 over token + nonce +
   both ephemeral keys (transcript binding defeats key-substitution MITM).
   Clients pin the host fingerprint and refuse proofs to a changed host.
@@ -36,19 +41,28 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 ### Known cryptographic limitations (honest)
 
-1. **Offline PIN grinding**: a passive attacker who records a *pairing*
-   exchange can brute-force the 6-digit PIN offline against `pair_confirm`.
-   Mitigations today: PINs are single-use, expire in 5 min, rotate on every
-   failure, and pairing is rare. Fix planned: **PAKE (SPAKE2/CPace)** so the
-   transcript is un-grindable (ROADMAP P1).
+1. **Legacy PIN pairing** (pre-v0.5 clients — currently the Android/iOS
+   apps): the old `HKDF(shared, salt, PIN‖nonce)` scheme lets a *passive*
+   recorder of a pairing exchange brute-force the 6-digit PIN offline.
+   The host still accepts it while `legacy_pin_pairing = true` (the default,
+   for mobile-viewer compatibility); set it to `false` in `config.toml` to
+   require SPAKE2. First-party web/desktop viewers always use SPAKE2 and
+   **never silently fall back** (a downgrade requires an explicit
+   `PinLegacy` opt-in in the client SDK), so an active MITM cannot strip
+   PAKE from an up-to-date viewer. Mitigations for the legacy path remain:
+   PINs are single-use, expire in 5 min, rotate on every failure, and
+   pairing is rare.
 2. **No TLS layer**: HTTP serving the web viewer JS is plaintext on the LAN —
    an active LAN attacker could tamper the *viewer code* before crypto starts
    (native viewers are immune). Documented trade-off; mitigations: QR/manual
    fingerprint display, native clients, planned self-signed-cert + fingerprint
    pinning option.
-3. Trust tokens are stored **raw** at rest (0600) on host and clients: proofs
-   are keyed hashes, so the verifier needs the key. Host compromise already
-   means screen compromise; still, an OS-keystore upgrade is planned.
+3. Trust tokens are stored raw-at-rest on Unix hosts (0600) because proofs
+   are keyed hashes, so the verifier needs the key. On **Windows the store
+   is DPAPI-wrapped** (`CryptProtectData`, user scope) — unreadable to other
+   accounts and to offline disk access; legacy plaintext stores are migrated
+   on first write. Host compromise already means screen compromise; client-
+   side OS keystores (Keychain/Keystore) remain planned for the mobile apps.
 
 ## Controls by threat
 
@@ -59,6 +73,8 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 | Stolen trust token file (client) | Token useless without matching device_id? No — token is the credential: **revoke from the panel**; tokens are per-device so revocation is surgical |
 | Rogue host at same IP | Client-side fingerprint pinning (tested) |
 | Input abuse | Input **denied by default** per device; grants are live-revocable; sessions enforce grant server-side on every event batch |
+| Clipboard exfiltration | Clipboard sync **denied by default** per device (separate grant from input); 256 KiB size cap both directions; only text is synced; the viewer additionally has its own local on/off switch |
+| Covert listening | Audio is **off by default** at three levels (host config, panel switch, per-viewer opt-in); the panel shows a live "audio is being streamed" indicator naming the listeners, with per-client mute |
 | Replay/reorder injection | Envelope counters + GCM |
 | Panel exposure | Panel binds 127.0.0.1 only; contains PIN/grants; never reachable from LAN |
 | Driver attack surface | Driver has no network code; validates geometry; ring is `Local\` namespace |
@@ -78,10 +94,13 @@ Principles: **local-first** (no cloud, no accounts), **encrypted by default**,
 
 * No telemetry, no crash uploads, no update phone-home. Nothing leaves the LAN
   unless the user configures it.
-* Audio capture is **off** and unimplemented until the WASAPI feature lands —
-  it will be opt-in per device with a visible indicator (ROADMAP).
-* Clipboard/file transfer: designed permission-gated, not yet implemented —
-  the protocol reserves message space; nothing is shared implicitly.
+* Audio capture is **off by default** (config `audio = false`); even when the
+  host enables it, nothing is sent until a viewer explicitly opts in, the
+  panel shows a live indicator whenever anyone is listening, and each client
+  can be muted from the panel.
+* Clipboard sync is **permission-gated per device and off by default** —
+  exactly like input. Nothing is shared implicitly; payloads are capped and
+  text-only. File transfer remains unimplemented (protocol space reserved).
 
 ## Reporting
 

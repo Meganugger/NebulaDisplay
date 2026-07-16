@@ -12,13 +12,15 @@ import {
   importAesKey,
   loadCredentials,
   open,
-  pairingKey,
   saveCredentials,
   seal,
   sessionKeyBytes,
   tokenProof,
 } from "./crypto";
+import { startPake } from "./pake";
 import {
+  AudioFrame,
+  CHANNEL_AUDIO,
   CHANNEL_CONTROL,
   CHANNEL_VIDEO,
   ControlMsg,
@@ -30,6 +32,7 @@ import {
   Sealer,
   VideoFrame,
   WS_PATH,
+  parseAudioFrame,
   parseVideoFrame,
   td,
   te,
@@ -37,6 +40,7 @@ import {
 
 export interface SessionEvents {
   onVideo(frame: VideoFrame): void;
+  onAudio(frame: AudioFrame): void;
   onControl(msg: ControlMsg): void;
   onClose(reason: string): void;
 }
@@ -45,6 +49,8 @@ export interface SessionInfo {
   codec: string;
   mode: DisplayMode;
   inputAllowed: boolean;
+  clipboardAllowed: boolean;
+  audioAvailable: boolean;
   serverName: string;
   fingerprint: string;
   newlyPaired: boolean;
@@ -92,10 +98,11 @@ export class Session {
         device_id: deviceId(),
         name: clientName,
         platform: "web",
-        app_version: "0.2.0",
-        // This viewer renders the host cursor from the dedicated cursor
-        // channel (CursorShape/CursorPos) — never baked into video frames.
-        features: ["cursor"],
+        app_version: "0.5.0",
+        // cursor: renders the host cursor from the dedicated cursor channel.
+        // clipboard: understands Clipboard/ClipboardGrant messages (still
+        // gated by the per-device grant on the host).
+        features: ["cursor", "clipboard"],
       },
       auth: useToken ? { method: "token", device_id: stored.deviceId } : { method: "pair" },
       codecs: await supportedCodecs(),
@@ -113,9 +120,9 @@ export class Session {
       );
     }
 
-    // Ephemeral ECDH.
+    // Ephemeral ECDH (+ PAKE request when pairing).
     const keys = await generateHandshakeKeys();
-    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw) });
+    send({ type: "pair_start", client_pubkey: b64encode(keys.publicRaw), pake: !useToken });
     const challenge = await nextText();
     if (challenge.type === "auth_err") throw new Error(String(challenge.error));
     if (challenge.type !== "pair_challenge") throw protoErr("pair_challenge", challenge);
@@ -129,18 +136,32 @@ export class Session {
       const proof = await tokenProof(b64decode(stored.tokenB64), nonce, keys.publicRaw, serverPub);
       send({ type: "token_proof", proof: b64encode(proof) });
     } else {
-      const pairKey = await pairingKey(shared, salt, pin!, nonce);
+      // SPAKE2 pairing: the PIN is never grindable from the transcript. No
+      // silent fallback to the legacy PIN-HKDF scheme — the web viewer is
+      // served by the host itself, so a host that doesn't offer PAKE means
+      // something is off (or the page came from an old host build).
+      if (typeof challenge.pake_share !== "string") {
+        throw new Error(
+          "Host did not offer PAKE pairing — it looks older than this viewer. Update the host.",
+        );
+      }
+      const pake = startPake(pin!, salt, nonce);
+      const pairKey = pake.finish(b64decode(challenge.pake_share), keys.publicRaw, serverPub);
       const confirm = new Uint8Array(CONFIRM_CONTEXT.length + nonce.length);
       confirm.set(CONFIRM_CONTEXT, 0);
       confirm.set(nonce, CONFIRM_CONTEXT.length);
       const sealed = await seal(pairKey, confirm, new Uint8Array(0));
-      send({ type: "pair_confirm", sealed: b64encode(sealed) });
+      send({
+        type: "pair_confirm",
+        sealed: b64encode(sealed),
+        pake_share: b64encode(pake.share),
+      });
       const result = await nextText();
       if (result.type !== "pair_result" || !result.ok) {
         throw new Error(`Pairing failed: ${String(result.error ?? "unknown error")}`);
       }
       const token = await open(
-        await pairingKey(shared, salt, pin!, nonce),
+        pairKey,
         b64decode(result.sealed_token as string),
         te.encode("token"),
       );
@@ -171,6 +192,8 @@ export class Session {
       codec: authOk.codec as string,
       mode: authOk.mode as DisplayMode,
       inputAllowed: Boolean(authOk.input_allowed),
+      clipboardAllowed: Boolean(authOk.clipboard_allowed),
+      audioAvailable: Boolean(authOk.audio_available),
       serverName: server.name,
       fingerprint: server.fingerprint,
       newlyPaired,
@@ -189,6 +212,8 @@ export class Session {
             events.onVideo(parseVideoFrame(plaintext));
           } else if (chan === CHANNEL_CONTROL) {
             events.onControl(JSON.parse(td.decode(plaintext)) as ControlMsg);
+          } else if (chan === CHANNEL_AUDIO) {
+            events.onAudio(parseAudioFrame(plaintext));
           }
         } catch (e) {
           console.error("envelope error", e);

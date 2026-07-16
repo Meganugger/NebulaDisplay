@@ -105,9 +105,9 @@ pub async fn run_audio_pipeline(state: Arc<AppState>, mut source: Box<dyn AudioS
                 let frame: Vec<f32> = acc.drain(..frame_len).collect();
                 let ts = acc_started_us;
                 acc_started_us += (FRAME_MS as u64) * 1000;
-                // Nobody listening (host switch off or zero subscribers)?
+                // Nobody listening (host switch off, or no client opted in)?
                 // Keep consuming the source but skip the encode entirely.
-                if !state.audio_available() || state.audio_tx.receiver_count() == 0 {
+                if !state.audio_available() || !state.audio_has_listeners() {
                     seq = seq.wrapping_add(1);
                     continue;
                 }

@@ -4,9 +4,10 @@
 //! streaming. Design goals:
 //!
 //! * **Local-first**: no cloud, no accounts. Discovery is separate from trust.
-//! * **Encrypted by default**: an ECDH(P-256) + PIN-bound HKDF handshake
-//!   establishes an AES-256-GCM session key. Everything after authentication
-//!   travels inside encrypted envelopes, even on plain WebSocket transports.
+//! * **Encrypted by default**: an ECDH(P-256) handshake with SPAKE2
+//!   PIN-bound pairing establishes an AES-256-GCM session key. Everything
+//!   after authentication travels inside encrypted envelopes, even on plain
+//!   WebSocket transports.
 //! * **Versioned**: every `Hello` carries `PROTOCOL_VERSION`; peers negotiate
 //!   down to the highest common version. v1 is the baseline described in
 //!   `docs/PROTOCOL.md`.
@@ -16,7 +17,7 @@
 //! ```text
 //! transport   WebSocket (binary) — QUIC/WebTransport planned
 //! envelope    [chan u8][counter u64 BE][AES-256-GCM ciphertext+tag]
-//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (reserved)
+//! channels    1 = control (JSON ControlMsg)   2 = video   3 = audio (Opus)
 //! ```
 
 pub mod crypto;
