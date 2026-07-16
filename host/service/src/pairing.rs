@@ -98,17 +98,13 @@ impl ServerHandshake {
     }
 
     /// Codec the server will actually stream, honoring client preference
-    /// order among codecs the build supports.
+    /// order among codecs this host can encode (build features + hardware).
     fn select_codec(&self) -> Codec {
-        for c in &self.client_codecs {
-            match c {
-                Codec::Jpeg => return Codec::Jpeg,
-                #[cfg(feature = "h264")]
-                Codec::H264 => return Codec::H264,
-                _ => continue,
-            }
-        }
-        Codec::Jpeg
+        self.client_codecs
+            .iter()
+            .copied()
+            .find(|c| crate::encode::supports(*c))
+            .unwrap_or(Codec::Jpeg)
     }
 
     fn auth_ok(&self, input_allowed: bool) -> ControlMsg {

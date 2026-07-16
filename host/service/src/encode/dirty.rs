@@ -43,6 +43,17 @@ impl DirtyMap {
     pub fn is_static(&self) -> bool {
         self.dirty_pairs == 0
     }
+
+    /// Pixel-row bounds of the dirty region: `Some((y0, y1))` with `y0`
+    /// inclusive / `y1` exclusive, or `None` for a static frame. Drives the
+    /// encoder ROI rate-control hint (ROADMAP P0.3).
+    // Consumed by the Windows MF encoder only.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn row_bounds(&self) -> Option<(usize, usize)> {
+        let first = self.pairs.iter().position(|d| *d)?;
+        let last = self.pairs.iter().rposition(|d| *d)?;
+        Some((first * 2, (last + 1) * 2))
+    }
 }
 
 #[derive(Default)]
@@ -146,5 +157,21 @@ mod tests {
         let b = vec![1u8; 16 * 4 * 4];
         let d = t.update(&b, 16, 4);
         assert!(d.all_dirty());
+    }
+
+    #[test]
+    fn row_bounds_cover_the_dirty_span() {
+        let (w, h) = (8usize, 8usize);
+        let mut frame = vec![7u8; w * h * 4];
+        let mut t = DirtyTracker::default();
+        let d = t.update(&frame, w, h);
+        assert_eq!(d.row_bounds(), Some((0, 8)), "first frame is fully dirty");
+        let d = t.update(&frame, w, h);
+        assert_eq!(d.row_bounds(), None, "static frame has no bounds");
+        // Rows 2 and 5 changed → pairs 1 and 2 → pixel rows 2..6.
+        frame[(2 * w) * 4] = 1;
+        frame[(5 * w) * 4] = 2;
+        let d = t.update(&frame, w, h);
+        assert_eq!(d.row_bounds(), Some((2, 6)));
     }
 }
