@@ -41,6 +41,10 @@ pub struct FileConfig {
     pub file_transfer_dir: Option<PathBuf>,
     /// Hard cap on a single incoming file transfer, in MiB.
     pub max_file_mb: u64,
+    /// Also accept viewers over QUIC (UDP, same port number). Native
+    /// viewers opt in with `--quic`; the security model is identical to
+    /// the WebSocket path (NDSP-layer auth + encryption).
+    pub quic_enabled: bool,
 }
 
 impl Default for FileConfig {
@@ -56,6 +60,7 @@ impl Default for FileConfig {
             audio_enabled: true,
             file_transfer_dir: None,
             max_file_mb: 2048,
+            quic_enabled: true,
         }
     }
 }

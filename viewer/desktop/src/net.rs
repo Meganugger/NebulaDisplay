@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use winit::event_loop::EventLoopProxy;
 
-use ndsp_client::{connect, Auth, Incoming, Session};
+use ndsp_client::{connect, connect_quic, Auth, Incoming, Session};
 use ndsp_protocol::messages::{
     AudioWireCodec, ClientInfo, Codec, ControlMsg, InputEvent, InputMode, Profile,
 };
@@ -23,6 +23,8 @@ pub struct NetArgs {
     pub profile: String,
     /// Directory host-sent files are saved into (None = decline offers).
     pub receive_dir: Option<std::path::PathBuf>,
+    /// Connect over QUIC instead of WebSocket.
+    pub quic: bool,
 }
 
 /// UI thread → network thread.
@@ -88,26 +90,48 @@ async fn session_loop(
         features: Vec::new(),
     };
 
-    set_status(shared, proxy, format!("connecting to {host_key}…"));
-    let stored = store::load(&host_key);
-    let mut session: Session = match (&stored, &args.pin) {
-        (Some(creds), _) => {
-            match connect(&host, port, client.clone(), Auth::Token(creds), codecs()).await {
-                Ok(s) => s,
-                Err(e) if format!("{e:#}").contains("pair") => {
-                    // Token stale → try PIN if we have one, else tell the user.
-                    store::clear(&host_key);
-                    let Some(pin) = &args.pin else {
-                        anyhow::bail!(
-                            "stored trust was rejected by the host — run again with --pin <PIN>"
-                        );
-                    };
-                    connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?
-                }
-                Err(e) => return Err(e),
+    set_status(
+        shared,
+        proxy,
+        format!(
+            "connecting to {host_key}{}…",
+            if args.quic { " (quic)" } else { "" }
+        ),
+    );
+    let dial = |auth_pin: Option<String>, token: Option<ndsp_client::Credentials>| {
+        let client = client.clone();
+        let host = host.clone();
+        let quic = args.quic;
+        async move {
+            let auth = match (&auth_pin, &token) {
+                (_, Some(creds)) => Auth::Token(creds),
+                (Some(pin), _) => Auth::Pin(pin),
+                _ => unreachable!("caller always passes one"),
+            };
+            if quic {
+                connect_quic(&host, port, client, auth, codecs()).await
+            } else {
+                connect(&host, port, client, auth, codecs()).await
             }
         }
-        (None, Some(pin)) => connect(&host, port, client.clone(), Auth::Pin(pin), codecs()).await?,
+    };
+    let stored = store::load(&host_key);
+    let mut session: Session = match (&stored, &args.pin) {
+        (Some(creds), _) => match dial(None, Some(creds.clone())).await {
+            Ok(s) => s,
+            Err(e) if format!("{e:#}").contains("pair") => {
+                // Token stale → try PIN if we have one, else tell the user.
+                store::clear(&host_key);
+                let Some(pin) = &args.pin else {
+                    anyhow::bail!(
+                        "stored trust was rejected by the host — run again with --pin <PIN>"
+                    );
+                };
+                dial(Some(pin.clone()), None).await?
+            }
+            Err(e) => return Err(e),
+        },
+        (None, Some(pin)) => dial(Some(pin.clone()), None).await?,
         (None, None) => anyhow::bail!("first connection needs --pin <PIN shown on the host>"),
     };
 

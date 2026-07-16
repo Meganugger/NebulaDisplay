@@ -1151,3 +1151,136 @@ async fn host_to_viewer_file_send_verifies_and_cleans_up() {
     session.close().await;
     host.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_transport_streams_video_and_reconnects() {
+    let host = start_host("quic").await;
+    let pin = host.state.pins.current_pin();
+
+    // First contact: SPAKE2 pairing over QUIC.
+    let mut session = ndsp_client::connect_quic(
+        "127.0.0.1",
+        host.port,
+        client_info("QUIC viewer"),
+        Auth::Pin(&pin),
+        vec![Codec::H264, Codec::Jpeg],
+    )
+    .await
+    .expect("QUIC pairing succeeds");
+    let creds = session
+        .new_credentials
+        .clone()
+        .expect("pairing must issue credentials");
+    assert_eq!(session.mode.width, 320);
+
+    // Video must flow on per-frame unidirectional streams; ping/pong and
+    // input ride the control stream.
+    session
+        .send(&ControlMsg::Ping { t0_us: 777 })
+        .await
+        .unwrap();
+    session
+        .send(&ControlMsg::Input {
+            events: vec![InputEvent::MouseMove { x: 0.5, y: 0.5 }],
+        })
+        .await
+        .unwrap();
+    let mut frames = 0;
+    let mut got_pong = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while frames < 5 || !got_pong {
+        match tokio::time::timeout_at(deadline, session.recv())
+            .await
+            .expect("timed out waiting for QUIC frames")
+            .expect("recv ok")
+        {
+            Incoming::Video(f) => {
+                assert!(f.width == 320 && f.height == 240);
+                frames += 1;
+            }
+            Incoming::Control(ControlMsg::Pong { t0_us, .. }) => {
+                assert_eq!(t0_us, 777);
+                got_pong = true;
+            }
+            Incoming::Closed => panic!("closed early"),
+            _ => {}
+        }
+    }
+    session.close().await;
+
+    // Returning device: token reconnect over QUIC.
+    let mut session2 = ndsp_client::connect_quic(
+        "127.0.0.1",
+        host.port,
+        client_info("QUIC viewer"),
+        Auth::Token(&creds),
+        vec![Codec::Jpeg],
+    )
+    .await
+    .expect("QUIC token reconnect succeeds");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, session2.recv())
+            .await
+            .expect("no frames after reconnect")
+            .unwrap()
+        {
+            Incoming::Video(_) => break,
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    // Audio over QUIC rides its own ordered unidirectional stream.
+    session2
+        .send(&ControlMsg::SetAudio {
+            enabled: true,
+            codec: Some(ndsp_protocol::messages::AudioWireCodec::Opus),
+        })
+        .await
+        .unwrap();
+    host.state
+        .set_audio_grant(&creds.device_id, true)
+        .expect("grant audio");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, session2.recv())
+            .await
+            .expect("no audio over QUIC")
+            .unwrap()
+        {
+            Incoming::Audio(af) => {
+                assert_eq!(af.sample_rate, 48_000);
+                assert!(!af.payload.is_empty());
+                break;
+            }
+            Incoming::Closed => panic!("closed"),
+            _ => {}
+        }
+    }
+
+    session2.close().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_wrong_pin_rejected() {
+    let host = start_host("quic-badpin").await;
+    let e = must_fail(
+        ndsp_client::connect_quic(
+            "127.0.0.1",
+            host.port,
+            client_info("Mallory"),
+            Auth::Pin("000000"),
+            vec![Codec::Jpeg],
+        )
+        .await,
+        "QUIC pairing with a wrong PIN",
+    );
+    let msg = format!("{e:#}");
+    assert!(
+        !msg.contains("panic"),
+        "must fail cleanly, not crash: {msg}"
+    );
+    host.shutdown().await;
+}
