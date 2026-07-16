@@ -69,6 +69,10 @@ Shipped in v0.5 (no longer roadmap items):
 * **Optional HTTPS (was P1.7)** — `--https` with a persistent self-signed
   cert; fingerprint pinned in panel + banner; unlocks secure-context
   browser features (WebCodecs H.264/Opus, clipboard API) on LAN addresses.
+* **Stylus injection (was P2.14)** — Windows Ink synthetic pen
+  (`CreateSyntheticPointerDevice`/`InjectSyntheticPointerInput`): remote pen
+  strokes carry real pressure + tilt into ink-aware apps, with hover
+  support and automatic mouse fallback where the API is unavailable.
 * **At-rest key protection (was P1.6, Windows part)** — DPAPI wrapping of
   the trust store, identity key, and TLS key with transparent migration
   from plaintext stores. (Android already uses the platform Keystore; a
@@ -99,8 +103,9 @@ Shipped in v0.5 (no longer roadmap items):
     assignment, video-wall spanning mode.
 12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
     clean-room scope; use Windows.Gaming.Input injection when available).
-14. Stylus: Windows Ink `InjectSyntheticPointerInput` for true pressure/tilt
-    (current fallback maps pen to mouse).
+14. Touch: multi-touch injection via the same synthetic-pointer API
+    (single-finger touch currently maps to mouse; the pen path shipped in
+    v0.5 provides the plumbing pattern).
 15. Host→viewer file send (viewer→host shipped in v0.5); audio for the
     desktop/mobile viewers (web shipped).
 

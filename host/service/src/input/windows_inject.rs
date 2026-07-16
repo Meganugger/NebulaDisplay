@@ -1,13 +1,24 @@
-//! Windows input injection via `SendInput`.
+//! Windows input injection: `SendInput` for mouse/keyboard/touch-as-mouse,
+//! and **Windows Ink synthetic pointers** for the stylus
+//! (`CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput`,
+//! Win10 1809+) so remote pen strokes carry real **pressure and tilt** into
+//! ink-aware apps (ROADMAP P2.14). If the synthetic-pointer API is
+//! unavailable or fails, pen events fall back to the mouse mapping.
 //!
 //! Coordinates arrive normalized (0..1) relative to the *streamed monitor*.
 //! They are mapped through the captured output's desktop rectangle into the
-//! full virtual-desktop space (`MOUSEEVENTF_VIRTUALDESK`), so taps land on
-//! the correct pixel even when the captured monitor is not the primary one
-//! or sits at a non-zero desktop offset in a multi-monitor layout.
+//! full virtual-desktop space (`MOUSEEVENTF_VIRTUALDESK` for mouse; desktop
+//! pixels for pen), so taps land on the correct pixel even when the captured
+//! monitor is not the primary one or sits at a non-zero desktop offset in a
+//! multi-monitor layout.
 
 use ndsp_protocol::messages::{InputEvent, TouchPhase};
 use std::sync::{Arc, Mutex};
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::Controls::{
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
+    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
@@ -16,12 +27,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
     MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
+use windows::Win32::UI::Input::Pointer::{
+    InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT,
+    POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     XBUTTON1, XBUTTON2,
 };
 
-use super::InputSink;
+use super::{pen_pressure_1024, pen_tilt_deg, InputSink};
 use crate::state::AppState;
 
 pub struct WindowsInputSink {
@@ -32,6 +48,9 @@ pub struct WindowsInputSink {
     /// 2 = Alt, 4 = Meta). While any is down, printable keys go through the
     /// scancode path — Ctrl+C must be a *position*, not a character.
     modifiers: Mutex<u8>,
+    /// Lazily-created Windows Ink synthetic pen (None = untried, Some(None)
+    /// = unavailable on this system → mouse fallback).
+    pen: Mutex<Option<Option<PenDevice>>>,
 }
 
 impl WindowsInputSink {
@@ -40,7 +59,82 @@ impl WindowsInputSink {
             state,
             touch_down: Mutex::new(false),
             modifiers: Mutex::new(0),
+            pen: Mutex::new(None),
         }
+    }
+
+    /// Map a normalized (0..1) point on the streamed monitor to desktop
+    /// pixel coordinates (what synthetic pointer injection expects).
+    fn desktop_pixel(&self, x: f32, y: f32) -> POINT {
+        let x = x.clamp(0.0, 1.0) as f64;
+        let y = y.clamp(0.0, 1.0) as f64;
+        if let Some((l, t, r, b)) = *self.state.capture_rect.lock().unwrap() {
+            if r > l && b > t {
+                return POINT {
+                    x: (l as f64 + x * (r - l - 1) as f64).round() as i32,
+                    y: (t as f64 + y * (b - t - 1) as f64).round() as i32,
+                };
+            }
+        }
+        // SAFETY: GetSystemMetrics is always safe to call.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        POINT {
+            x: (x * (w.max(1) - 1) as f64).round() as i32,
+            y: (y * (h.max(1) - 1) as f64).round() as i32,
+        }
+    }
+
+    /// Single-pointer press/drag/release mapped to mouse events (touch, and
+    /// pen when the synthetic-pointer API is unavailable).
+    fn pointer_as_mouse(&self, batch: &mut Vec<INPUT>, phase: TouchPhase, x: f32, y: f32) {
+        let (ax, ay, flags) = self.map_coords(x, y);
+        batch.push(mouse_input(ax, ay, 0, flags));
+        let mut down = self.touch_down.lock().unwrap();
+        match phase {
+            TouchPhase::Start if !*down => {
+                *down = true;
+                batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN));
+            }
+            TouchPhase::End | TouchPhase::Cancel if *down => {
+                *down = false;
+                batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP));
+            }
+            _ => {}
+        }
+    }
+
+    /// Inject one pen event through Windows Ink. Returns false when the
+    /// synthetic-pointer path is unavailable (caller falls back to mouse).
+    fn inject_pen(
+        &self,
+        phase: TouchPhase,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+    ) -> bool {
+        let mut slot = self.pen.lock().unwrap();
+        let device = slot.get_or_insert_with(|| match PenDevice::create() {
+            Ok(d) => {
+                tracing::info!("Windows Ink synthetic pen active (pressure/tilt enabled)");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::info!("synthetic pen unavailable ({e:#}); pen maps to mouse");
+                None
+            }
+        });
+        let Some(device) = device else { return false };
+        let pos = self.desktop_pixel(x, y);
+        if let Err(e) = device.inject(phase, pos, pressure, tilt_x, tilt_y) {
+            // A failing injection (session switch, device loss) downgrades
+            // to the mouse path permanently rather than erroring per event.
+            tracing::warn!("pen injection failed ({e:#}); falling back to mouse");
+            *slot = Some(None);
+            return false;
+        }
+        true
     }
 
     /// Map a normalized (0..1) point on the streamed monitor to the 0..65535
@@ -342,6 +436,87 @@ fn key_input(code: &str, pressed: bool) -> Option<INPUT> {
     })
 }
 
+/// Owned Windows Ink synthetic pen device.
+struct PenDevice {
+    handle: HSYNTHETICPOINTERDEVICE,
+    in_contact: bool,
+}
+
+// SAFETY: the device handle is only used under the sink's mutex.
+unsafe impl Send for PenDevice {}
+
+impl PenDevice {
+    fn create() -> windows::core::Result<Self> {
+        // SAFETY: plain API call; the returned handle is owned by us.
+        let handle = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }?;
+        Ok(Self {
+            handle,
+            in_contact: false,
+        })
+    }
+
+    fn inject(
+        &mut self,
+        phase: TouchPhase,
+        pos: POINT,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+    ) -> windows::core::Result<()> {
+        let (flags, contact) = match phase {
+            // A Start while already down (missed End) is treated as a move.
+            TouchPhase::Start if !self.in_contact => (
+                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
+                true,
+            ),
+            TouchPhase::Start | TouchPhase::Move => (
+                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
+                true,
+            ),
+            TouchPhase::End => (POINTER_FLAG_INRANGE | POINTER_FLAG_UP, false),
+            TouchPhase::Cancel => (POINTER_FLAG_UP | POINTER_FLAG_CANCELED, false),
+        };
+        // Moves without a preceding down are hover updates (in range, no
+        // contact) — real tablets emit these and apps show hover cursors.
+        let (flags, contact) = if matches!(phase, TouchPhase::Move) && !self.in_contact {
+            (POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE, false)
+        } else {
+            (flags, contact)
+        };
+        self.in_contact = contact;
+
+        let info = POINTER_TYPE_INFO {
+            r#type: PT_PEN,
+            Anonymous: POINTER_TYPE_INFO_0 {
+                penInfo: POINTER_PEN_INFO {
+                    pointerInfo: POINTER_INFO {
+                        pointerType: PT_PEN,
+                        pointerId: 0,
+                        pointerFlags: flags,
+                        ptPixelLocation: pos,
+                        ..Default::default()
+                    },
+                    penFlags: 0,
+                    penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+                    pressure: pen_pressure_1024(pressure, contact),
+                    rotation: 0,
+                    tiltX: pen_tilt_deg(tilt_x),
+                    tiltY: pen_tilt_deg(tilt_y),
+                },
+            },
+        };
+        // SAFETY: `info` is fully initialized; the handle is live.
+        unsafe { InjectSyntheticPointerInput(self.handle, &[info]) }
+    }
+}
+
+impl Drop for PenDevice {
+    fn drop(&mut self) {
+        // SAFETY: handle owned by this struct, dropped exactly once.
+        unsafe { DestroySyntheticPointerDevice(self.handle) };
+    }
+}
+
 impl InputSink for WindowsInputSink {
     fn apply(&self, events: &[InputEvent]) {
         let mut batch: Vec<INPUT> = Vec::with_capacity(events.len() + 2);
@@ -425,23 +600,28 @@ impl InputSink for WindowsInputSink {
                         }
                     }
                 }
-                InputEvent::Touch { phase, x, y, .. } | InputEvent::Pen { phase, x, y, .. } => {
+                InputEvent::Pen {
+                    phase,
+                    x,
+                    y,
+                    pressure,
+                    tilt_x,
+                    tilt_y,
+                } => {
+                    // Preserve ordering: anything already queued for
+                    // SendInput must land before the pen frame.
+                    self.send(&batch);
+                    batch.clear();
+                    if self.inject_pen(*phase, *x, *y, *pressure, *tilt_x, *tilt_y) {
+                        continue;
+                    }
+                    // Fallback: same single-pointer mouse mapping as touch.
+                    self.pointer_as_mouse(&mut batch, *phase, *x, *y);
+                }
+                InputEvent::Touch { phase, x, y, .. } => {
                     // Single-pointer mapping to mouse until InjectTouchInput
                     // integration (see docs/ROADMAP.md).
-                    let (ax, ay, flags) = self.map_coords(*x, *y);
-                    batch.push(mouse_input(ax, ay, 0, flags));
-                    let mut down = self.touch_down.lock().unwrap();
-                    match phase {
-                        TouchPhase::Start if !*down => {
-                            *down = true;
-                            batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN));
-                        }
-                        TouchPhase::End | TouchPhase::Cancel if *down => {
-                            *down = false;
-                            batch.push(mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP));
-                        }
-                        _ => {}
-                    }
+                    self.pointer_as_mouse(&mut batch, *phase, *x, *y);
                 }
             }
         }

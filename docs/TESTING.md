@@ -12,7 +12,7 @@
 | Browser E2E (Chromium) | UI pairing (SPAKE2), streaming 1280×720 with changing canvas pixels (H.264 or JPEG matching the browser's *probed* decode capability), stats overlay showing *measured* per-stage latency, input grant flow reaching the host input sink, panel PIN/QR/client list, profile switch, **cursor channel** (shape delivery + live overlay movement), **audio** (real Opus decode via WebCodecs + panel listening indicator on/off), **clipboard** (deny-by-default → grant → viewer→host sync), **file drop** (offer visible in panel, nothing written pre-accept, bit-exact delivery) |
 | Compat E2E (Chromium, 6 envs) | pairing + full handshake + moving video on: secure localhost, **insecure LAN origin** (no `crypto.subtle`/`randomUUID`/WebCodecs — the real Windows/iOS/Android deployment), iOS-Safari-like (no PointerEvent/createImageBitmap/BigInt DataView/fullscreen, touch), Android-Chrome-like (touch), storage-blocked WebView, and a regression guard for the `crypto.randomUUID` crash — see `docs/BROWSER-COMPAT.md` |
 | Reconnect E2E (Chromium) | host SIGKILLed mid-stream and restarted: the viewer auto-recovers by itself via token reconnect and video provably resumes (canvas pixels change) |
-| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing + cursor-only readback skip, IddCx multi-ring consumer, QueryDisplayConfig input mapping, SendInput multi-monitor + layout-aware keys, **WASAPI loopback**, **DPAPI keystore — roundtrip test executes for real there**, tray) |
+| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing + cursor-only readback skip, IddCx multi-ring consumer, QueryDisplayConfig input mapping, SendInput multi-monitor + layout-aware keys, **Windows Ink synthetic pen**, **WASAPI loopback**, **DPAPI keystore — roundtrip test executes for real there**, tray) |
 | Driver syntax check | `host/windows-driver/tests/syntax-check.sh`: full clang syntax/type check of the IddCx driver against stub WDK headers modeled from public docs, under **both** the IddCx 1.10 and 1.4 header models |
 
 ## Benchmarks (reproducible)
@@ -76,8 +76,13 @@ notes:
 - [ ] wrong PIN ×5 locks the IP; PIN visibly rotates in the panel
 - [ ] revoked device cannot reconnect
 - [ ] second host on same IP:port is refused by paired clients (fingerprint)
-- [ ] touch, multi-touch scroll, stylus pressure (Drawing mode), keyboard incl.
-      modifiers, wheel + horizontal wheel
+- [ ] touch, multi-touch scroll, keyboard incl. modifiers, wheel +
+      horizontal wheel
+- [ ] stylus in Drawing mode on an ink app (e.g. Whiteboard): pressure
+      varies stroke width, tilt registers, hover shows a cursor; on
+      pre-1809 Windows the pen falls back to mouse strokes
+- [ ] AZERTY/QWERTZ viewer typing into a US-layout host produces the
+      viewer's characters; Ctrl/Alt shortcuts still act by key position
 
 ### Soak
 - [ ] 4-hour continuous stream: no memory growth in nebulad (watch working
