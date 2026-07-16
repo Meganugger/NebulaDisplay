@@ -42,7 +42,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (deny warnings) — validates DXGI/SendInput/IDD-ring/tray code
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        shell: bash
+        run: |
+          if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.out 2>&1; then
+            grep -E "^(error|warning)" -B1 -A4 clippy.out | head -c 3500 | while IFS= read -r l; do echo "::warning title=clippy::$l"; done
+            tail -c 1500 clippy.out | while IFS= read -r l; do echo "::warning title=clippy-tail::$l"; done
+            exit 1
+          fi
       - name: Tests
         run: cargo test --workspace
 

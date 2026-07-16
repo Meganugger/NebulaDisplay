@@ -297,11 +297,9 @@ impl AppState {
     /// Someone is actually listening (opted in and not muted) — the encode
     /// gate, so an enabled-but-unused audio pipeline costs ~nothing.
     pub fn audio_has_listeners(&self) -> bool {
-        self.clients
-            .lock()
-            .unwrap()
-            .values()
-            .any(|c| c.audio_active.load(Ordering::Relaxed) && !c.audio_muted.load(Ordering::Relaxed))
+        self.clients.lock().unwrap().values().any(|c| {
+            c.audio_active.load(Ordering::Relaxed) && !c.audio_muted.load(Ordering::Relaxed)
+        })
     }
 
     /// Revoke trust and kick any live session for that device.
