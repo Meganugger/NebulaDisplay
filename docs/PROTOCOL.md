@@ -157,7 +157,10 @@ Input events (coordinates normalized 0..1 on the streamed surface):
 `wheel{dx,dy}`, `key{code,pressed,key?}` (W3C `KeyboardEvent.code` position
 plus the optional layout-resolved `KeyboardEvent.key` character — hosts
 prefer `key` for printables so viewer keyboard layouts survive the trip),
-`touch{id,phase,x,y,pressure}`, `pen{phase,x,y,pressure,tilt_x,tilt_y}`
+`touch{id,phase,x,y,pressure}` (`id` is a per-finger contact id, stable from
+`start` through `end`/`cancel` — hosts with synthetic pointers inject every
+finger as a real touch contact, so pinch/multi-finger gestures work; others
+map the first finger to the mouse), `pen{phase,x,y,pressure,tilt_x,tilt_y}`
 (pressure 0..1; tilts normalized -1..1 = ±90° — injected as true Windows Ink
 pen input with pressure/tilt on hosts that support synthetic pointers),
 `text{text}`.

@@ -78,6 +78,10 @@ notes:
 - [ ] second host on same IP:port is refused by paired clients (fingerprint)
 - [ ] touch, multi-touch scroll, keyboard incl. modifiers, wheel +
       horizontal wheel
+- [ ] multi-touch injection: two-finger pinch-zoom in Maps/Photos and a
+      two-finger scroll register as real touch gestures; on systems
+      without synthetic pointers the first finger falls back to mouse
+      press-drag and a second finger is ignored (no cursor fighting)
 - [ ] stylus in Drawing mode on an ink app (e.g. Whiteboard): pressure
       varies stroke width, tilt registers, hover shows a cursor; on
       pre-1809 Windows the pen falls back to mouse strokes
