@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
-use crate::clipboard::{ClipboardBackend, ClipboardUpdate};
+use crate::clipboard::{ClipboardBackend, ClipboardUpdate, MemoryClipboard};
 use crate::config::Config;
 use crate::pin::PinManager;
 use crate::trust::TrustStore;
@@ -134,6 +134,11 @@ impl AppState {
         // client-side via seq gaps — always better than growing latency).
         let (audio_tx, _) = tokio::sync::broadcast::channel(32);
         let audio_enabled = cfg.file.audio;
+        let clipboard: Arc<dyn ClipboardBackend> = if cfg.memory_clipboard {
+            Arc::new(MemoryClipboard::default())
+        } else {
+            crate::clipboard::create_backend()
+        };
         Ok(Self {
             cfg,
             fingerprint,
@@ -141,7 +146,7 @@ impl AppState {
             trust: Mutex::new(trust),
             frame_tx,
             cursor_tx,
-            clipboard: crate::clipboard::create_backend(),
+            clipboard,
             clipboard_tx,
             audio_tx,
             audio_ready: AtomicBool::new(false),

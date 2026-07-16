@@ -71,6 +71,9 @@ impl EmbeddedHost {
                 legacy_pin_pairing: opts.legacy_pin_pairing,
                 ..Default::default()
             },
+            // Tests must never touch (or race on) the machine's real
+            // clipboard — Windows CI runs them against a shared desktop.
+            memory_clipboard: true,
         };
         let state = Arc::new(AppState::new(cfg).await?);
 

@@ -88,10 +88,20 @@ jobs:
         run: cargo build -p nebulad
       - name: Cross-stack crypto/protocol compatibility (Node WebCrypto vs Rust host)
         working-directory: viewer/web
-        run: node tests/web-compat.mjs
+        run: |
+          if ! node tests/web-compat.mjs > compat.out 2>&1; then
+            tail -c 2500 compat.out | while IFS= read -r l; do echo "::warning title=web-compat::$l"; done
+            exit 1
+          fi
+          tail -3 compat.out
       - name: Cross-stack compatibility — pure-JS crypto fallback (insecure-context path)
         working-directory: viewer/web
-        run: NDSP_CRYPTO=fallback node tests/web-compat.mjs
+        run: |
+          if ! NDSP_CRYPTO=fallback node tests/web-compat.mjs > compat2.out 2>&1; then
+            tail -c 2500 compat2.out | while IFS= read -r l; do echo "::warning title=web-compat-fallback::$l"; done
+            exit 1
+          fi
+          tail -3 compat2.out
 
   browser-e2e:
     name: Browser E2E — Chromium pairing/H.264/input/panel

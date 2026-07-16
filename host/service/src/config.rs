@@ -62,6 +62,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub web_dir: Option<PathBuf>,
     pub file: FileConfig,
+    /// Use the in-memory clipboard backend instead of the OS one. Set by
+    /// embedded/test hosts so tests never touch (or race on) the machine's
+    /// real clipboard.
+    pub memory_clipboard: bool,
 }
 
 impl Config {
@@ -98,6 +102,7 @@ impl Config {
             data_dir,
             web_dir,
             file,
+            memory_clipboard: false,
         })
     }
 }
