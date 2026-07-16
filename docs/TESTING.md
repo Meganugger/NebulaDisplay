@@ -4,15 +4,18 @@
 
 | Layer | What is actually verified |
 |---|---|
-| `ndsp-protocol` unit tests (28) | message serde + stable tags + forward-compat (incl. pre-v0.5 `key`-less input events), ECDH key agreement, **SPAKE2** (M/N stability, agreement, wrong-PIN divergence, nonce binding, invalid/degenerate shares, per-exchange freshness, constant-time MAC compare), wrong-PIN key mismatch, AEAD tamper rejection, envelope replay/direction/AAD attacks, video **and audio** framing, beacon parsing |
-| `nebulad` unit tests (40) | JPEG/H264 encoders produce valid decodable bitstreams (SOI/Annex-B, keyframes), **runtime bitrate/fps changes without stream reset**, resolution change rebuild+IDR, BGRA→I420 byte-exact vs reference, adaptive controller (backlog cut, decrease cooldown/hysteresis, sticky fps + floor-only fps drop, sustained-RTT bufferbloat, recovery, fps restore), PIN single-use/rotation/lockout, trust store enroll/verify/revoke/persistence/transcript-MITM + **pre-v0.5 store migration with safe grant defaults**, audio resampler/downmix/test-tone, clipboard echo-suppression + baseline-no-leak + size caps, file-name sanitization + non-clobbering destinations + offer expiry/routing, TLS cert persistence with stable fingerprint, keystore roundtrip (real DPAPI on the Windows job), test-pattern motion, size parsing |
-| Rust e2e (13, real sockets) | full **SPAKE2** pairing → H.264 streaming (seq order, changing payloads, keyframe first), encrypted ping/pong, wrong PIN rejected + PIN rotation (both schemes), **legacy pairing accepted by default and refused under `allow_legacy_pairing=false`**, token reconnect, input-grant live flow, revocation kick + token invalidation, client-side fingerprint pinning, **audio**: off-by-default, Opus format contract, panel mute stops the stream + listener count, PCM variant, **clipboard**: deny-by-default, grant notify, both directions, **file drop**: panel deny leaves no bytes, accept delivers bit-exact with sanitized name, corrupted transfer rejected + cleaned up, **video keeps full rate under a 240 Hz input flood** (pipeline-independence regression guard) |
+| `ndsp-protocol` unit tests (30) | message serde + stable tags + forward-compat (incl. pre-v0.5 `key`-less input events), ECDH key agreement, **SPAKE2** (M/N stability, agreement, wrong-PIN divergence, nonce binding, invalid/degenerate shares, per-exchange freshness, constant-time MAC compare), wrong-PIN key mismatch, AEAD tamper rejection, envelope replay/direction/AAD attacks, video **and audio** framing (incl. the gamepad input event), filename sanitization/no-clobber helpers, beacon parsing |
+| `nebulad` unit tests (54) | JPEG/H264 encoders produce valid decodable bitstreams (SOI/Annex-B, keyframes), **runtime bitrate/fps changes without stream reset**, resolution change rebuild+IDR, BGRA→I420 byte-exact vs reference, adaptive controller (backlog cut, decrease cooldown/hysteresis, sticky fps + floor-only fps drop, sustained-RTT bufferbloat, recovery, fps restore), PIN single-use/rotation/lockout, trust store enroll/verify/revoke/persistence/transcript-MITM + **pre-v0.5 store migration with safe grant defaults**, audio resampler/downmix/test-tone, clipboard echo-suppression + baseline-no-leak + size caps, file-name sanitization + non-clobbering destinations + offer expiry/routing, TLS cert persistence with stable fingerprint, keystore roundtrip (real DPAPI on the Windows job), test-pattern motion, size parsing, **multi-touch contact-frame tracker** (full-frame re-injection, slot reuse, overflow, cancel-all, imperfect sequences), **dirty-row ROI bounds**, **gamepad W3C→Windows button mapping**, **keychain seal/open with tamper + wrong-key rejection** |
+| Rust e2e (17, real sockets) | full **SPAKE2** pairing → H.264 streaming (seq order, changing payloads, keyframe first), encrypted ping/pong, wrong PIN rejected + PIN rotation (both schemes), **legacy pairing accepted by default and refused under `allow_legacy_pairing=false`**, token reconnect, input-grant live flow, revocation kick + token invalidation, client-side fingerprint pinning, **audio**: off-by-default, Opus format contract, panel mute stops the stream + listener count, PCM variant, **clipboard**: deny-by-default, grant notify, both directions, **file drop**: panel deny leaves no bytes, accept delivers bit-exact with sanitized name, corrupted transfer rejected + cleaned up, **video keeps full rate under a 240 Hz input flood** (pipeline-independence regression guard), **host→viewer file send** (offer → viewer accept/decline → bit-exact verified delivery → spool + busy-flag cleanup), **QUIC**: SPAKE2 pairing, video on per-frame uni streams, control ping/pong + input, token reconnect, Opus audio lane, wrong-PIN rejection |
 | Mapping unit tests (Node) | letterbox/pillarbox coordinate math (`mapToContent`): content-box normalization, black-bar clamping, offsets, aspect mismatches |
 | Node compat test (×2) | the **actual web-viewer session code** (esbuild-bundled) against the real host: **SPAKE2 pair** (proves the TS implementation is byte-compatible with the Rust one), decrypt frames, JPEG magic, encrypted ping/pong, **audio channel opt-in/format/off-switch**, token reconnect, wrong PIN — run on **both** crypto backends (native WebCrypto, and `NDSP_CRYPTO=fallback` pure-JS as in insecure browser contexts) |
 | Browser E2E (Chromium) | UI pairing (SPAKE2), streaming 1280×720 with changing canvas pixels (H.264 or JPEG matching the browser's *probed* decode capability), stats overlay showing *measured* per-stage latency, input grant flow reaching the host input sink, panel PIN/QR/client list, profile switch, **cursor channel** (shape delivery + live overlay movement), **audio** (real Opus decode via WebCodecs + panel listening indicator on/off), **clipboard** (deny-by-default → grant → viewer→host sync), **file drop** (offer visible in panel, nothing written pre-accept, bit-exact delivery) |
 | Compat E2E (Chromium, 6 envs) | pairing + full handshake + moving video on: secure localhost, **insecure LAN origin** (no `crypto.subtle`/`randomUUID`/WebCodecs — the real Windows/iOS/Android deployment), iOS-Safari-like (no PointerEvent/createImageBitmap/BigInt DataView/fullscreen, touch), Android-Chrome-like (touch), storage-blocked WebView, and a regression guard for the `crypto.randomUUID` crash — see `docs/BROWSER-COMPAT.md` |
 | Reconnect E2E (Chromium) | host SIGKILLed mid-stream and restarted: the viewer auto-recovers by itself via token reconnect and video provably resumes (canvas pixels change) |
-| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing + cursor-only readback skip, IddCx multi-ring consumer, QueryDisplayConfig input mapping, SendInput multi-monitor + layout-aware keys, **Windows Ink synthetic pen**, **WASAPI loopback**, **DPAPI keystore — roundtrip test executes for real there**, tray) |
+| Windows CI job | compiles + clippy-gates all `cfg(windows)` code (DXGI incl. cursor compositing + cursor-only readback skip, IddCx multi-ring consumer, QueryDisplayConfig input mapping, SendInput multi-monitor + layout-aware keys, **Windows Ink synthetic pen + multi-touch**, **gamepad injection**, **Media Foundation H.264/HEVC + ROI**, **WASAPI loopback**, **DPAPI keystore — roundtrip test executes for real there**, tray) |
+| macOS CI job | compiles + clippy-gates and runs the test suite on macOS — validates the keyring (macOS Keychain) and cpal (CoreAudio) code paths |
+| SPAKE2 interop job | compiles the Android app's **real** `Spake2.kt`/`NdspCrypto.kt` on the JVM and runs 25 full exchanges + negative cases against `shared/protocol/examples/spake2_interop.rs`, asserting MACs/session keys/token keys agree **byte-for-byte** (`viewer/android/interop/`) |
+| Mobile jobs (advisory) | Android `assembleDebug` (Gradle) and iOS Swift type-check against the iphonesimulator SDK; promoted to gating once proven stable on runners |
 | Driver syntax check | `host/windows-driver/tests/syntax-check.sh`: full clang syntax/type check of the IddCx driver against stub WDK headers modeled from public docs, under **both** the IddCx 1.10 and 1.4 header models |
 
 ## Benchmarks (reproducible)
@@ -56,6 +59,29 @@ notes:
 - [ ] H.264 on: Chrome, Edge, Safari 16.4+, Firefox (JPEG fallback where
       WebCodecs H.264 is unavailable), Android MediaCodec, iOS VideoToolbox,
       desktop viewer OpenH264
+
+### Features (v0.6)
+- [ ] HEVC negotiation on a machine with an HEVC MFT + a Safari/Chromium
+      viewer that probes HEVC: session shows HEVC, quality ≥ H.264 at the
+      same bitrate; hosts without the MFT fall back to H.264
+- [ ] Encoder ROI: partial-screen motion (typing) shows no quality loss vs
+      v0.5 at equal bitrate (ROI concentrates budget on the changed rows)
+- [ ] QUIC: `nebula-viewer --quic` streams; on 5% loss QUIC shows fewer
+      frame stalls than WS (per-frame streams vs TCP HoL)
+- [ ] Multi-touch: two-finger pinch/rotate in Maps/Photos acts as a real
+      gesture (not a mouse drag); >2 fingers tracked; abrupt disconnect
+      mid-gesture leaves nothing stuck
+- [ ] Gamepad: standard-mapping pad drives a Windows.Gaming.Input consumer
+      (e.g. UWP game); sticks/triggers analog; unplug mid-press releases
+- [ ] Host→viewer file send: panel → send to a web viewer (accept dialog,
+      verified download) and to `nebula-viewer --receive-dir`
+- [ ] Desktop viewer audio: F9 toggles host audio, stays in sync, no
+      runaway latency after suspending the viewer briefly
+- [ ] Linux/macOS keychain: first run stores the wrapping key (check
+      Seahorse/Keychain Access); `devices.json` starts with `NDPK1`;
+      copying the files to another account fails to load
+- [ ] Android SPAKE2: fresh pairing from the Android app against a v0.6
+      host with `allow_legacy_pairing = false` succeeds
 
 ### Features (v0.5)
 - [ ] WASAPI loopback audio on real hardware: music plays on the viewer,

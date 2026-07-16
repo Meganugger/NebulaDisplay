@@ -4,7 +4,7 @@
 
 | Component | Needs |
 |---|---|
-| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`), CMake (libopus build — preinstalled on GitHub runners; `apt install cmake` / `brew install cmake` / VS Build Tools otherwise) |
+| Host service, protocol, desktop viewer, tray | Rust 1.80+ (`rustup`), CMake (libopus build — preinstalled on GitHub runners; `apt install cmake` / `brew install cmake` / VS Build Tools otherwise). Linux additionally: `libasound2-dev` (cpal/ALSA) and `libdbus-1-dev` (OS-keychain keystore) |
 | Web viewer + panel | Node 22+ / npm |
 | Windows virtual display driver | Windows + VS2022 + WDK (see `host/windows-driver/README.md`) |
 | Android viewer | Android SDK 35, JDK 17 (see `viewer/android/README.md`) |
@@ -41,6 +41,11 @@ cargo run --release -p nebula-viewer -- --host 192.168.1.20:41800 --pin 123456
 # afterwards (trusted):  cargo run --release -p nebula-viewer -- --host 192.168.1.20:41800
 ```
 
+Flags: `--quic` (QUIC transport instead of WebSocket), `--receive-dir <dir>`
+(accept host-sent files into that directory; declined otherwise),
+`--profile office|video|drawing|gaming`. In the window: `I` toggles input
+control, `F9` toggles listening to the host's audio.
+
 ## Tests & checks (what CI runs)
 
 ```bash
@@ -51,6 +56,10 @@ cd viewer/web
 npm run build                              # strict tsc + vite
 node tests/web-compat.mjs                  # web crypto vs Rust host, real WS
 node tests/browser-e2e.mjs                 # full Chromium E2E (needs playwright chromium)
+
+# SPAKE2 Android↔Rust interop (JDK 21 + Gradle):
+cargo build -p ndsp-protocol --example spake2_interop
+gradle -p viewer/android/interop run --args="$PWD/target/debug/examples/spake2_interop"
 ```
 
 ## Windows packaging

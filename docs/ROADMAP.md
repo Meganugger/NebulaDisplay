@@ -24,24 +24,49 @@ QueryDisplayConfig extend-mode input mapping, multi-monitor & multi-GPU &
 HDR-capable IddCx driver with CI syntax gate, reproducible benchmark
 harness (`viewer/web/tests/bench.mjs`).
 
+Shipped in v0.6 (no longer roadmap items):
+
+* **HEVC hardware encode (was P0.2 remainder)** — the MF encoder
+  (`encode/mf_video.rs`) now produces H.264 *or* HEVC from the same
+  async-MFT plumbing; HEVC is hardware-only and only negotiated when an
+  MFT exists and the viewer probes real WebCodecs HEVC decode.
+* **Encoder ROI hints (was P0.3)** — dirty-row bounds ride each MF input
+  sample as `MFSampleExtension_ROIRectangle` (QPΔ −4) when the encoder
+  supports `CODECAPI_AVEncVideoROIEnabled`: rate control spends its budget
+  where pixels changed.
+* **QUIC transport (was P1.5)** — quinn endpoint on the same port (UDP,
+  ALPN `ndsp/1`); control on a bidi stream, audio on an ordered uni
+  stream, one uni stream per video frame (no cross-frame head-of-line
+  blocking on lossy Wi-Fi; stale frames dropped by the envelope
+  counters). Native viewers opt in with `--quic`. Full loopback E2E.
+* **Keychain at rest on Linux/macOS (was P1.6 remainder)** — keystore
+  files sealed with AES-256-GCM under a wrapping key in Secret Service /
+  macOS Keychain; plaintext-0600 fallback on headless systems.
+* **SPAKE2 on Android (was P1.4, Android half)** — BouncyCastle P-256
+  implementation, byte-compatibility with the Rust reference proven by a
+  25-round cross-stack exchange in CI (`viewer/android/interop/`).
+* **Multi-touch injection (was P2 item 14)** — up to 10 contacts through
+  synthetic pointer devices with a unit-tested full-frame tracker;
+  pinch/rotate reach apps as real gestures; mouse fallback preserved.
+* **Gamepad forwarding (was P2.12)** — web Gamepad API snapshots →
+  `Windows.Gaming.Input` injection (UWP/GDK titles). XInput-only Win32
+  games would need a bus driver — deliberately out of clean-room scope.
+* **Host→viewer file send + desktop viewer audio (was P2.15)** — panel
+  upload → explicit viewer accept → verified transfer (sha256), web +
+  desktop receivers; desktop viewer plays host audio (Opus/cpal, F9).
+* **Mobile CI gates (was P3.16, partial)** — Android `assembleDebug` and
+  iOS Swift type-check jobs (advisory until proven on runners), plus the
+  gating SPAKE2 interop job.
+
 ## P0 — performance & the driver
 
 1. **Driver bring-up** (needs a WDK machine): compile
    `host/windows-driver`, test-sign, validate extend mode end-to-end, measure
    ring throughput at 4K, add driver health reporting into the panel
    ("extend/mirror/pattern" badge exists server-side already).
-2. **Hardware encoders — H.264 SHIPPED** (`encode/mf_h264.rs`): MFTEnumEx
-   hardware enumeration (NVENC/QuickSync/AMF), async-MFT event loop at queue
-   depth ≤1, MF_LOW_LATENCY + CBR + zero B-frames, runtime ICodecAPI bitrate,
-   NV12 dirty-row conversion, static-frame elision, automatic software
-   fallback. Compile-verified by the Windows CI job; **runtime validation
-   needs a real Windows GPU machine** (this sandbox has none — see
-   docs/TESTING.md release gate). Remaining: HEVC output type (trivial
-   variant of the same MFT plumbing) once decoder support is negotiated.
-3. **Encoder ROI from DXGI dirty/move rects**: the pixel-exact row-pair diff
-   already elides static frames and limits color conversion; the remaining
-   step is feeding rectangle hints into encoder rate control (needs the
-   MF/NVENC encoders — OpenH264's ROI support is too limited to matter).
+2. **Hardware-encoder runtime validation** (needs a real Windows GPU
+   machine): the MF H.264/HEVC paths and ROI hints are compile-verified by
+   the Windows CI job; docs/TESTING.md lists the release-gate checklist.
 
 Shipped in v0.5 (no longer roadmap items):
 
@@ -80,39 +105,31 @@ Shipped in v0.5 (no longer roadmap items):
 
 ## P1 — security & transports
 
-4. **SPAKE2 on Android/iOS**, then flip `allow_legacy_pairing` default to
-   off — removes the last offline-grinding caveat in SECURITY.md. Requires
-   EC group arithmetic on the platforms (BouncyCastle / swift-crypto HPKE
-   primitives or a small vetted implementation).
-5. **QUIC transport** (quinn) with the same envelopes; datagram mode for
-   video, streams for control; WebTransport for the web viewer where
-   available; WS stays as fallback. *Assessed 2026-07: on wired/strong-Wi-Fi
-   LAN (sub-ms RTT, ~zero loss) TCP_NODELAY + latest-only send slots already
-   avoid the queueing QUIC would remove, so it does not materially cut
-   latency there; the win is head-of-line-blocking removal on lossy Wi-Fi.
-   Kept at P1: real, but smaller than hardware encoders (P0.2). Browser
-   WebTransport additionally requires TLS certs (serverCertificateHashes =
-   Chromium-only today), so the web path stays WS regardless.*
-6. Keychain/keyring backends for trust tokens on macOS/Linux hosts (Windows
-   DPAPI + Android Keystore shipped).
+4. **SPAKE2 on iOS** (Android shipped in v0.6), then flip
+   `allow_legacy_pairing` default to off — removes the last
+   offline-grinding caveat in SECURITY.md. Needs P-256 group arithmetic in
+   Swift (CryptoKit exposes none): a vetted Swift EC library or a small
+   audited implementation, verified against
+   `shared/protocol/examples/spake2_interop.rs` the way the Kotlin one is.
+5. **WebTransport for the web viewer** — blocked on browser support
+   (`serverCertificateHashes` is Chromium-only); WS stays the web path.
+   Native QUIC shipped in v0.6.
 
 ## P2 — features
 
 11. **Multi-monitor / multi-client layout**: several virtual monitors (driver
     already parameterized by `MaxMonitorsSupported`), per-client monitor
-    assignment, video-wall spanning mode.
-12. **Gamepad forwarding** (Gamepad API → ViGEm-style injection is out of
-    clean-room scope; use Windows.Gaming.Input injection when available).
-14. Touch: multi-touch injection via the same synthetic-pointer API
-    (single-finger touch currently maps to mouse; the pen path shipped in
-    v0.5 provides the plumbing pattern).
-15. Host→viewer file send (viewer→host shipped in v0.5); audio for the
-    desktop/mobile viewers (web shipped).
+    assignment, video-wall spanning mode. (Host-wide monitor selection
+    already exists via `--display-index`; per-client assignment needs a
+    capture hub with per-monitor channels — a deliberate, separate change
+    to the hottest path.)
+15. Audio for the **mobile** viewers (web + desktop shipped); host→viewer
+    file send for the mobile viewers.
 
 ## P3 — platform breadth
 
-16. Android/iOS CI builds (Gradle + xcodebuild GitHub runners) and store
-    packaging docs.
+16. Promote the Android build / iOS type-check CI jobs from advisory to
+    gating once proven on runners; store packaging docs.
 17. Linux/macOS *hosts* (wlroots screencopy / ScreenCaptureKit) — the
     protocol and viewers are already host-OS-agnostic.
 18. Opt-in remote rendezvous: end-to-end-encrypted, relay-blind (relay sees

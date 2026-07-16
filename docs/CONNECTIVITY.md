@@ -10,6 +10,10 @@ Host and viewer on the same network. Discovery (UDP 41799 broadcast) fills the
 host list automatically; otherwise type `ip:41800` or scan the panel QR.
 Recommendation for 1080p60: wired host + 5 GHz viewer, or both wired.
 
+On lossy Wi-Fi, native viewers can switch to QUIC (`nebula-viewer --quic`,
+UDP on the same port number) — per-frame streams remove video
+head-of-line blocking after a packet loss. Firewalls must allow UDP 41800.
+
 ## Wi-Fi Direct / hotspot
 
 No router? Make one:

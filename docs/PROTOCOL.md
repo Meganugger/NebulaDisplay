@@ -7,10 +7,31 @@ Authority: `shared/protocol` — this document describes what that code does.
 
 * WebSocket (`ws://host:41800/ndsp`), binary subprotocol described below.
 * Plain HTTP serves the web viewer statics on the same port.
+* **QUIC** (UDP, same port number, ALPN `ndsp/1`) — identical handshake and
+  envelopes for native viewers (`--quic`); see *NDSP over QUIC* below.
 * Discovery: UDP port 41799 — datagram `NDSP-DISCOVER/1` → JSON beacon
   `{service:"ndsp", protocol, name, port, fingerprint}`. **Discovery conveys
   location only, never trust.**
-* Planned: QUIC/WebTransport with identical envelopes (`docs/ROADMAP.md`).
+* Browser WebTransport is not offered (`serverCertificateHashes` is
+  Chromium-only today); the web path stays WebSocket.
+
+### NDSP over QUIC
+
+The QUIC TLS certificate is the host's persistent self-signed cert and is
+**not** part of the trust model — clients skip verification; exactly like
+`ws://`, all authenticity/confidentiality come from the NDSP layer
+(SPAKE2/token handshake + envelopes). Mapping:
+
+* **Control** — the client opens one bidirectional stream and speaks
+  `[type u8][len u32 BE][payload]` frames: type 0 = plaintext handshake
+  JSON, type 1 = encrypted envelope. After `auth_ok`, only type 1 is legal.
+* **Audio** — one server-opened unidirectional stream, first byte `'A'`,
+  then `[len u32 BE][envelope]` frames in order.
+* **Video** — a fresh server-opened unidirectional stream per frame:
+  `'V'`, one `[len u32 BE][envelope]`, FIN. A lost packet delays only its
+  own frame (no cross-frame head-of-line blocking); a frame overtaken by a
+  newer one trips the envelope counter check below and is dropped as stale
+  — the latest-only contract, end to end.
 
 ## Phases
 
@@ -104,7 +125,7 @@ Channels: `1` control (JSON), `2` video, `3` audio.
 
 ```
 [codec u8][flags u8][seq u32][ts_us u64][w u16][h u16][payload…]
-codec: 0 jpeg, 1 h264 (Annex-B), 2 hevc*, 3 av1*      (*negotiated, not emitted yet)
+codec: 0 jpeg, 1 h264 (Annex-B), 2 hevc (Annex-B), 3 av1*   (*not emitted yet)
 flags: bit0 = keyframe
 ts_us: host-clock capture timestamp (for measured e2e latency)
 ```
@@ -143,11 +164,11 @@ viewers on insecure origins, which have no WebCodecs Opus decoder
 | `audio_grant {allowed}` | S→C | live audio-permission change from the panel (mute) |
 | `clipboard {text}` | both | clipboard sync; only honored with the device's clipboard grant; ≤ 256 KiB |
 | `clipboard_grant {allowed}` | S→C | live clipboard-permission change |
-| `file_offer {id,name,size_bytes,sha256}` | C→S | offer a file; host queues an explicit panel accept |
-| `file_answer {id,accept,reason?}` | S→C | the user's panel decision |
-| `file_chunk {id,seq,data}` | C→S | in-order b64 chunk, ≤ 256 KiB raw |
-| `file_end {id}` | C→S | sender done → host verifies size + sha256 |
-| `file_done {id}` | S→C | verified, moved into the receive directory |
+| `file_offer {id,name,size_bytes,sha256}` | both | offer a file (viewer→host, or host→viewer panel-initiated); the receiver must explicitly accept |
+| `file_answer {id,accept,reason?}` | both | the receiving side's decision (host: panel; viewer: dialog / `--receive-dir` opt-in) |
+| `file_chunk {id,seq,data}` | both | in-order b64 chunk, ≤ 256 KiB raw |
+| `file_end {id}` | both | sender done → receiver verifies size + sha256 |
+| `file_done {id}` | both | verified and stored |
 | `file_abort {id,reason}` | both | cancel / verification failure (partial file deleted) |
 | `bye {reason}` | both | graceful close |
 | `error {code,message}` | both | non-fatal report |
@@ -157,10 +178,17 @@ Input events (coordinates normalized 0..1 on the streamed surface):
 `wheel{dx,dy}`, `key{code,pressed,key?}` (W3C `KeyboardEvent.code` position
 plus the optional layout-resolved `KeyboardEvent.key` character — hosts
 prefer `key` for printables so viewer keyboard layouts survive the trip),
-`touch{id,phase,x,y,pressure}`, `pen{phase,x,y,pressure,tilt_x,tilt_y}`
+`touch{id,phase,x,y,pressure}` (up to 10 concurrent ids — injected as true
+multi-touch frames on hosts with synthetic pointer devices, so pinch/rotate
+reach apps as real gestures), `pen{phase,x,y,pressure,tilt_x,tilt_y}`
 (pressure 0..1; tilts normalized -1..1 = ±90° — injected as true Windows Ink
 pen input with pressure/tilt on hosts that support synthetic pointers),
-`text{text}`.
+`text{text}`, and
+`gamepad{id,buttons,left_trigger,right_trigger,lx,ly,rx,ry}` — a full
+state snapshot of a W3C *standard mapping* pad, sent on change: `buttons`
+is a bitmask over standard indices (bit 0 = A … bit 15 = dpad-right),
+triggers are analog 0..1, sticks -1..1 with Y down-positive (hosts flip to
+their convention).
 
 ## Versioning & compatibility
 
